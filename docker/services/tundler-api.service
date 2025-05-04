@@ -1,0 +1,17 @@
+[Unit]
+After=network-online.target
+Description=Tundler REST API
+
+[Service]
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/tundler-api
+ExecStartPre=/usr/local/bin/tundler-configure.sh
+PassEnvironment=EXPRESSVPN_ACTIVATION_CODE NORDVPN_TOKEN
+Restart=always
+StandardError=journal+console
+StandardOutput=journal+console
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
