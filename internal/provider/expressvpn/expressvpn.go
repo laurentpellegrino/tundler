@@ -116,6 +116,7 @@ func (e ExpressVPN) Status(ctx context.Context) provider.Status {
 		return provider.Status{
 			Connected: true,
 			IP:        shared.FirstIPv4(get(ctx, "vpnip")),
+			Location:  e.ActiveLocation(ctx),
 			Provider:  name,
 		}
 	}

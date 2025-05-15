@@ -12,6 +12,7 @@ import "context"
 type Status struct {
 	Connected bool   `json:"connected"`
 	IP        string `json:"ip,omitempty"`
+	Location  string `json:"location,omitempty"`
 	Provider  string `json:"provider,omitempty"`
 }
 

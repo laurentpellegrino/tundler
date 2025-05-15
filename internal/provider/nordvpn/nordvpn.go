@@ -86,6 +86,7 @@ func (n NordVPN) Status(ctx context.Context) provider.Status {
 	return provider.Status{
 		Connected: true,
 		IP:        shared.FirstIPv4(out),
+		Location:  n.ActiveLocation(ctx),
 		Provider:  name,
 	}
 }
