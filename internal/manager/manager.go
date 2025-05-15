@@ -132,14 +132,20 @@ func (m *Manager) Logout(ctx context.Context, name string) error {
 
 // Status reports VPN status.
 func (m *Manager) Status(ctx context.Context) (provider.Status, error) {
+	// If a tunnel is active, just return its status.
 	if _, p := m.connectedProvider(ctx); p != nil {
 		return p.Status(ctx), nil
 	}
+
+	// Otherwise look for a logged-in provider.
 	if name, p := m.loggedInProvider(ctx); p != nil {
 		st := p.Status(ctx)
-		st.Provider = name
+		if st.Connected {
+			st.Provider = name
+		}
 		return st, nil
 	}
+
 	return provider.Status{}, shared.ErrNoLoggedInProviders
 }
 
