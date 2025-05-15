@@ -19,6 +19,17 @@ func init() { provider.Registry[name] = NordVPN{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+func (n NordVPN) ActiveLocation(ctx context.Context) string {
+	out, _ := shared.RunCmd(ctx, bin, "status")
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "Hostname:") {
+			return strings.TrimSpace(strings.TrimPrefix(ln, "Hostname:"))
+		}
+	}
+	return ""
+}
+
 func (n NordVPN) Connect(ctx context.Context, location string) provider.Status {
 	args := []string{"connect"}
 	if location != "" {

@@ -25,6 +25,10 @@ func get(ctx context.Context, key string) string {
 	return strings.TrimSpace(out)
 }
 
+func (e ExpressVPN) ActiveLocation(ctx context.Context) string {
+	return strings.TrimSpace(get(ctx, "region"))
+}
+
 func (e ExpressVPN) Connect(ctx context.Context, location string) provider.Status {
 	// 1. kick off the connection
 	if location == "" {

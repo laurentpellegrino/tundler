@@ -32,6 +32,10 @@ type Status struct {
 //   - Connect must start a tunnel (or switch location) and immediately
 //     return the resulting Status. An empty *location* means “provider default”.
 type VPNProvider interface {
+	// ActiveLocation returns the location the tunnel is currently using
+	// (empty when disconnected)
+	ActiveLocation(ctx context.Context) string
+
 	// Connect starts or switches a VPN tunnel.
 	Connect(ctx context.Context, location string) Status
 
