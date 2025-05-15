@@ -68,6 +68,11 @@ func (e ExpressVPN) Disconnect(ctx context.Context) error {
 	return err
 }
 
+func (e ExpressVPN) Locations(ctx context.Context) []string {
+	out, _ := shared.RunCmd(ctx, bin, "get", "regions")
+	return strings.Fields(out)
+}
+
 func (e ExpressVPN) Login(ctx context.Context) error {
 	token := os.Getenv("EXPRESSVPN_ACTIVATION_CODE")
 	if token == "" {

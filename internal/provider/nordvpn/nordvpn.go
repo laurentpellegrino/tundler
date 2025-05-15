@@ -38,6 +38,11 @@ func (n NordVPN) Disconnect(ctx context.Context) error {
 	return err
 }
 
+func (n NordVPN) Locations(ctx context.Context) []string {
+	out, _ := shared.RunCmd(ctx, bin, "countries")
+	return strings.Fields(out)
+}
+
 func (n NordVPN) LoggedIn(ctx context.Context) bool {
 	out, _ := shared.RunCmd(ctx, bin, "login")
 	return strings.Contains(out, "You are already logged in.")

@@ -41,6 +41,9 @@ type VPNProvider interface {
 	// Disconnect tears down the VPN tunnel (no-op if not connected).
 	Disconnect(ctx context.Context) error
 
+	// Locations returns the list of locations understood by the CLI.
+	Locations(ctx context.Context) []string
+
 	// LoggedIn reports whether the CLI is authenticated.
 	LoggedIn(ctx context.Context) bool
 

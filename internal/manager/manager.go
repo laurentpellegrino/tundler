@@ -51,6 +51,15 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 			return provider.Status{}, err
 		}
 	}
+
+	if location == "" {
+		locs := p.Locations(ctx)
+		if len(locs) > 0 {
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			location = locs[r.Intn(len(locs))]
+		}
+	}
+
 	return p.Connect(ctx, location), nil
 }
 
