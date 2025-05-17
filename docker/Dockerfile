@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags "-s -w" \
     -o tundler-api ./cmd/tundler-api
 
-# Runtime stage building the tunbler
+# Runtime stage building the tundler
 FROM ubuntu:24.10
 
 ARG INSTALL_EXPRESSVPN=true
