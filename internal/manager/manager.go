@@ -64,12 +64,14 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 		}
 	}
 
+	shared.Debugf("[manager] connect %s location=%s", providerName, location)
 	return p.Connect(ctx, location), nil
 }
 
 // Disconnect terminates any active tunnel.
 func (m *Manager) Disconnect(ctx context.Context) error {
 	if _, p := m.connectedProvider(ctx); p != nil {
+		shared.Debugf("[manager] disconnect")
 		return p.Disconnect(ctx)
 	}
 	return nil
@@ -77,6 +79,7 @@ func (m *Manager) Disconnect(ctx context.Context) error {
 
 // List returns every provider with its version and login state.
 func (m *Manager) List(ctx context.Context) map[string]any {
+	shared.Debugf("[manager] list providers")
 	return map[string]any{"providers": m.providerInfos(ctx)}
 }
 
@@ -87,6 +90,7 @@ func (m *Manager) Login(ctx context.Context, name string) error {
 		if !ok {
 			return shared.ErrUnknownProvider
 		}
+		shared.Debugf("[manager] login %s", name)
 		return p.Login(ctx)
 	}
 
@@ -127,6 +131,7 @@ func (m *Manager) Logout(ctx context.Context, name string) error {
 
 	var firstErr error
 	for _, n := range names {
+		shared.Debugf("[manager] logout %s", name)
 		if err := m.providers[n].Logout(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -136,6 +141,7 @@ func (m *Manager) Logout(ctx context.Context, name string) error {
 
 // Status reports VPN status.
 func (m *Manager) Status(ctx context.Context) (provider.Status, error) {
+	shared.Debugf("[manager] status")
 	// If a tunnel is active, just return its status.
 	if _, p := m.connectedProvider(ctx); p != nil {
 		return p.Status(ctx), nil

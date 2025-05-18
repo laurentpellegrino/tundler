@@ -37,7 +37,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("tundler-api listening on %s (debug=%v)", addr, *debug)
+	log.Printf("tundler-api listening on %s (debug=%v)", addr, debug)
 	log.Fatal(srv.ListenAndServe())
 }
 
