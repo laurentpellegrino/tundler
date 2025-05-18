@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/config"
@@ -16,15 +18,25 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load("/home/tundler/tundler.yaml")
+	home, _ := os.UserHomeDir()
+	cfgPath := filepath.Join(home, ".config", "tundler", "tundler.yaml")
+
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.StringVar(&cfgPath, "c", cfgPath, "configuration file path")
+	fs.StringVar(&cfgPath, "config", cfgPath, "configuration file path (long)")
+	_ = fs.Parse(os.Args[1:])
+
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Fatalf("cannot load config: %v", err)
 	}
 
+	port := flag.String("l", "4242", "listen port")
+	flag.StringVar(&cfgPath, "c", cfgPath, "configuration file path")
+	flag.StringVar(&cfgPath, "config", cfgPath, "configuration file path (long)")
 	debug := cfg.Debug
 	flag.BoolVar(&debug, "d", debug, "enable debug logging")
 	flag.BoolVar(&debug, "debug", debug, "enable debug logging (long)")
-	port := flag.String("l", "4242", "listen port")
 	flag.Parse()
 
 	mgr := manager.New(debug, providerLocations(cfg))
