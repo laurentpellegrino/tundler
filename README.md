@@ -18,16 +18,14 @@ See `docker/build.sh` and `docker/run.sh`.
 
 ## REST API
 
-| Endpoint      | Method | Query params             | Description                                                  |
-|---------------|--------|--------------------------|--------------------------------------------------------------|
-| `/`           | GET    | –                        | Lists **providers** (installed) and **active** (logged‑in)   |
-| `/login`      | POST   | `provider` *(optional)*  | Logs in one provider, or **all** when omitted                |
-| `/connect`    | POST   | `country` *(optional)*   | Disconnects current → connects **random authenticated** provider |
-| `/disconnect` | POST   | –                        | Tears down tunnel (idempotent)                               |
-| `/roll`       | POST   | –                        | Switches exit server within active provider                  |
-| `/status`     | GET    | –                        | `{ "connected": bool, "ip": "...", "provider": "..." }`      |
-| `/logout`     | POST   | –                        | Logs out current provider; keeps it selected                 |
-| `/version`    | GET    | –                        | Prints provider CLI version                                  |
+| Endpoint      | Method | Query params                      | Description                                         |
+|---------------|--------|-----------------------------------|-----------------------------------------------------|
+| `/`           | GET    | –                                 | Lists **providers** supported along with login state |
+| `/connect`    | POST   | `location, provider` *(optional)* | Connect to a new location, either random or provided |
+| `/disconnect` | POST   | –                                 | Tears down tunnel (idempotent)                      |
+| `/login`      | POST   | `provider` *(optional)*           | Logs in one provider, or **all** when omitted       |
+| `/logout`     | POST   | `provider` *(optional)*           | Logs out one provider, or **all** when omitted      |
+| `/status`     | GET    | –                                 | Returns connection state, IP and provider in use    |
 
 ---
 
