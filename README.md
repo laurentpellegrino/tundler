@@ -14,6 +14,26 @@ See `docker/build.sh` and `docker/run.sh`.
 | ExpressVPN | `EXPRESSVPN_ACTIVATION_CODE` |
 | NordVPN    | `NORDVPN_TOKEN`              |
 
+### Configuration file
+
+When present, `/home/tundler/tundler.yaml` is loaded at startup. Example:
+
+```yaml
+debug: true
+providers:
+  - nordvpn:
+      locations:
+        - FR
+        - DE
+```
+
+The optional `locations` list restricts the random locations used when the
+`location` query parameter is omitted. Invalid providers or locations are
+ignored with a warning at startup.
+
+The `debug` value enables debug logging. It is overridden by the `-d`/`--debug`
+command-line flag when provided.
+
 ---
 
 ## REST API

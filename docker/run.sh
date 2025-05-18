@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
+CONFIG_FILE="$HOME/.config/tundler/tundler.yaml"
+CFG_MOUNT=""
+if [[ -f "$CONFIG_FILE" ]]; then
+  echo "[run.sh] Using config file $CONFIG_FILE"
+  CFG_MOUNT="-v $CONFIG_FILE:/home/tundler/tundler.yaml:ro"
+fi
 CONTAINER_NAME="tundler"
 IMAGE_NAME="tundler"
 
@@ -15,6 +21,7 @@ echo "[run.sh] Running $IMAGE_NAME container in background..."
 
 docker run -it -d \
   --name "$CONTAINER_NAME" \
+  $CFG_MOUNT \
   --privileged \
   --cap-add=NET_ADMIN \
   --device=/dev/net/tun \

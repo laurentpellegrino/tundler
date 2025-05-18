@@ -14,12 +14,13 @@ import (
 // -----------------------------------------------------------------------------
 
 type Manager struct {
+	locations map[string][]string
 	providers map[string]provider.VPNProvider
 }
 
-func New(debug bool) *Manager {
+func New(debug bool, locs map[string][]string) *Manager {
 	shared.SetDebug(debug)
-	return &Manager{providers: provider.Registry}
+	return &Manager{locations: locs, providers: provider.Registry}
 }
 
 // -----------------------------------------------------------------------------
@@ -53,7 +54,10 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 	}
 
 	if location == "" {
-		locs := p.Locations(ctx)
+		locs := m.locations[providerName]
+		if len(locs) == 0 {
+			locs = p.Locations(ctx)
+		}
 		if len(locs) > 0 {
 			r := rand.New(rand.NewSource(time.Now().UnixNano()))
 			location = locs[r.Intn(len(locs))]
