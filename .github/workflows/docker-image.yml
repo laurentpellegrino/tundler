@@ -1,0 +1,39 @@
+name: Build and publish Docker image
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:  
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/tundler:latest
+            ghcr.io/${{ github.repository_owner }}/tundler:${{ github.sha }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler:latest
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler:${{ github.sha }}
