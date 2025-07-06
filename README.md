@@ -3,6 +3,8 @@
 Tundler ("tunnel bundler") packages a small REST API in a Docker image to manage multiple VPN providers.
 It can rotate tunnels on demand and optionally expose an HTTP proxy routed through the active VPN.
 
+Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries to minimise breakage.
+
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
