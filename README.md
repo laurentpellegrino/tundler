@@ -8,7 +8,7 @@ Unlike other solutions, it depends as much as possible on the VPN providers’ o
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
-- ExpressVPN and NordVPN support out of the box.
+- ExpressVPN, Mullvad and NordVPN support out of the box.
 - Optional HTTP proxy on port `8484`.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
@@ -25,6 +25,7 @@ docker/build.sh
 
 ```bash
 EXPRESSVPN_ACTIVATION_CODE=<code> \
+MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
 docker/run.sh
 ```
@@ -36,6 +37,7 @@ The API will be reachable on port `4242` and the HTTP proxy on `8484`.
 | Provider   | Variables                     |
 |-----------|-------------------------------|
 | ExpressVPN | `EXPRESSVPN_ACTIVATION_CODE` |
+| Mullvad    | `MULLVAD_ACCOUNT_NUMBER`     |
 | NordVPN    | `NORDVPN_TOKEN`              |
 
 ### Configuration
