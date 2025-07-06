@@ -18,6 +18,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 FROM ubuntu:24.10
 
 ARG INSTALL_EXPRESSVPN=true
+ARG INSTALL_MULLVAD=true
 ARG INSTALL_NORDVPN=true
 ARG INSTALL_TUNDLER_PROXY=true
 
@@ -27,7 +28,7 @@ ENV HOME=/root
 # Install packages needed
 RUN apt-get -y update && \
     apt-get -y upgrade && \
-    apt-get install -y curl dbus sudo systemd unzip wget zip && \
+    apt-get install -y curl dbus sudo systemd unzip wget zip gpg && \
     apt-get install -y --no-install-recommends apt-transport-https ca-certificates
 
 # Create non-root user `tundler` with sudo privileges
