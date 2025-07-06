@@ -79,14 +79,19 @@ func (m Mullvad) Locations(ctx context.Context) []string {
 	out, _ := shared.RunCmd(ctx, bin, "relay", "list")
 	var cc []string
 	for _, ln := range strings.Split(out, "\n") {
-		ln = strings.TrimSpace(ln)
-		if strings.Contains(ln, "(") && strings.Contains(ln, ")") && !strings.HasPrefix(ln, "\t") {
-			start := strings.Index(ln, "(")
-			end := strings.Index(ln, ")")
-			if start >= 0 && end > start {
-				cc = append(cc, strings.TrimSpace(ln[start+1:end]))
-			}
+		if strings.HasPrefix(ln, "\t") || strings.HasPrefix(ln, " ") {
+			continue // skip server entries
 		}
+		line := strings.TrimSpace(ln)
+		if line == "" || !strings.Contains(line, "(") || !strings.Contains(line, ")") {
+			continue
+		}
+		start := strings.Index(line, "(")
+		end := strings.Index(line[start+1:], ")")
+		if end < 0 {
+			continue
+		}
+		cc = append(cc, strings.TrimSpace(line[start+1:start+1+end]))
 	}
 	return cc
 }

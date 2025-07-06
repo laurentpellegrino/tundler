@@ -73,6 +73,7 @@ providers:
 | `/login`      | POST   | `providers` *(optional)*          | Login comma-separated providers or all when omitted |
 | `/logout`     | POST   | `provider` *(optional)*           | Logout one provider or all when omitted |
 | `/status`     | GET    | –                                 | Return tunnel state, IP and provider in use |
+| `/locations`  | GET    | –                                 | List supported locations per logged-in provider |
 
 ## Extending Tundler
 

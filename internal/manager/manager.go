@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
@@ -81,6 +82,21 @@ func (m *Manager) Disconnect(ctx context.Context) error {
 func (m *Manager) List(ctx context.Context) map[string]any {
 	shared.Debugf("[manager] list providers")
 	return map[string]any{"providers": m.providerInfos(ctx)}
+}
+
+// Locations returns every provider with its supported locations sorted
+// lexicographically.
+func (m *Manager) Locations(ctx context.Context) map[string][]string {
+	shared.Debugf("[manager] list locations")
+	names := m.loggedInProviders(ctx)
+	out := make(map[string][]string, len(names))
+	for _, name := range names {
+		p := m.providers[name]
+		locs := append([]string(nil), p.Locations(ctx)...)
+		sort.Strings(locs)
+		out[name] = locs
+	}
+	return out
 }
 
 // Login authenticates one provider (name ≠ "") or all providers (name == "").
