@@ -41,8 +41,7 @@ COPY docker/config/tinyproxy.conf /tmp/tinyproxy.conf
 RUN if [ "$INSTALL_TUNDLER_PROXY" = "true" ]; then \
       apt-get update && \
       apt-get install -y tinyproxy && \
-      mv /tmp/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf && \
-      systemctl enable tinyproxy.service; \
+      mv /tmp/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf; \
     else \
       rm -f /tmp/tinyproxy.conf; \
     fi

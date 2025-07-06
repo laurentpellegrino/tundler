@@ -32,6 +32,11 @@ docker/run.sh
 
 The API will be reachable on port `4242` and the HTTP proxy on `8484`.
 
+By default, the VPN and HTTP proxy run inside their own network namespace.
+The `TUNDLER_NETNS` environment variable specifies the namespace name
+(defaults to `vpnns`).  The REST API stays in the main namespace so it
+remains reachable even when the VPN changes routing.
+
 #### Environment variables
 
 | Provider   | Variables                     |

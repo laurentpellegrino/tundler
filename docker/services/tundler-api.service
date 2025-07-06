@@ -7,6 +7,8 @@ Environment=HOME=/root
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/tundler-api -c /home/tundler/tundler.yaml
 ExecStartPre=/usr/local/bin/tundler-configure.sh
+ExecStartPre=/usr/local/bin/setup-netns.sh
+Environment=TUNDLER_NETNS=vpnns
 PassEnvironment=EXPRESSVPN_ACTIVATION_CODE MULLVAD_ACCOUNT_NUMBER NORDVPN_TOKEN
 Restart=always
 StandardError=journal+console
