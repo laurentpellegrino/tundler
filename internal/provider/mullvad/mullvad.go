@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
 
 const bin = "mullvad"
-const name = "mullvad"
+const name = bin
 
 type Mullvad struct{}
 
@@ -32,37 +31,12 @@ func (m Mullvad) ActiveLocation(ctx context.Context) string {
 }
 
 func (m Mullvad) Connect(ctx context.Context, location string) provider.Status {
-	// 1. set the desired location if provided
 	if location != "" {
 		quiet(ctx, "relay", "set", "location", location)
 	}
 
-	// 2. start the connection asynchronously
-	_ = shared.RunAsync(ctx, bin, "connect")
-
-	// 3. wait for the tunnel to be ready (or ctx/timeout is hit)
-	const (
-		pollEvery = 250 * time.Millisecond // how often to poll
-		maxWait   = 30 * time.Second       // safety cap
-	)
-	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
-	defer cancel()
-
-	ticker := time.NewTicker(pollEvery)
-	defer ticker.Stop()
-
-	for {
-		st := m.Status(ctx)
-		if st.Connected && st.IP != "" {
-			return st
-		}
-
-		select {
-		case <-waitCtx.Done():
-			return st
-		case <-ticker.C:
-		}
-	}
+	quiet(ctx, "connect", "--wait")
+	return m.Status(ctx)
 }
 
 func (m Mullvad) Connected(ctx context.Context) bool {
