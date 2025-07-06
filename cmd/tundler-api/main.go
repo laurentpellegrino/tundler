@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/config"
@@ -32,6 +33,7 @@ func main() {
 	}
 
 	port := flag.String("l", "4242", "listen port")
+	login := flag.String("login", "", "comma-separated providers to login at startup (\"all\" for every provider)")
 	flag.StringVar(&cfgPath, "c", cfgPath, "configuration file path")
 	flag.StringVar(&cfgPath, "config", cfgPath, "configuration file path (long)")
 	debug := cfg.Debug
@@ -40,6 +42,26 @@ func main() {
 	flag.Parse()
 
 	mgr := manager.New(debug, providerLocations(cfg))
+
+	if *login != "" {
+		ctx := context.Background()
+		if *login == "all" {
+			if err := mgr.Login(ctx, ""); err != nil {
+				log.Printf("login all providers failed: %v", err)
+			}
+		} else {
+			for _, name := range strings.Split(*login, ",") {
+				name = strings.TrimSpace(name)
+				if name == "" {
+					continue
+				}
+				if err := mgr.Login(ctx, name); err != nil {
+					log.Printf("login %s failed: %v", name, err)
+				}
+			}
+		}
+	}
+
 	mux := httpapi.Router(mgr)
 	addr := fmt.Sprintf(":%s", *port)
 
