@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/laurentpellegrino/tundler/internal/manager"
 	"github.com/laurentpellegrino/tundler/internal/shared"
@@ -17,10 +18,25 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		prov := r.URL.Query().Get("provider")
-		if err := mgr.Login(r.Context(), prov); err != nil {
-			writeErr(w, err)
+		provs := r.URL.Query().Get("providers")
+		if provs == "" {
+			if err := mgr.Login(r.Context(), ""); err != nil {
+				writeErr(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+
+		for _, name := range strings.Split(provs, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if err := mgr.Login(r.Context(), name); err != nil {
+				writeErr(w, err)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
