@@ -17,6 +17,10 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 		writeJSON(w, mgr.List(r.Context()))
 	})
 
+	mux.HandleFunc("/locations", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, mgr.Locations(r.Context()))
+	})
+
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		provs := r.URL.Query().Get("providers")
 		if provs == "" {
