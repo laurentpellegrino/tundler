@@ -28,7 +28,8 @@ ENV HOME=/root
 # Install packages needed
 RUN apt-get -y update && \
     apt-get -y upgrade && \
-    apt-get install -y curl dbus sudo systemd unzip wget zip gpg && \
+    apt-get install -y curl dbus sudo systemd unzip wget zip gpg \
+                       iproute2 iptables && \
     apt-get install -y --no-install-recommends apt-transport-https ca-certificates
 
 # Create non-root user `tundler` with sudo privileges
@@ -41,8 +42,7 @@ COPY docker/config/tinyproxy.conf /tmp/tinyproxy.conf
 RUN if [ "$INSTALL_TUNDLER_PROXY" = "true" ]; then \
       apt-get update && \
       apt-get install -y tinyproxy && \
-      mv /tmp/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf && \
-      systemctl enable tinyproxy.service; \
+      mv /tmp/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf; \
     else \
       rm -f /tmp/tinyproxy.conf; \
     fi
@@ -72,10 +72,11 @@ COPY --from=builder /build/tundler-api /usr/local/bin/tundler-api
 
 # Copy custom scripts and services
 COPY docker/services/tundler-configure.sh /usr/local/bin/tundler-configure.sh
+COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
 COPY docker/services/tundler-api.service /etc/systemd/system/
 
 # Make script executable
-RUN chmod +x /usr/local/bin/tundler-configure.sh && \
+RUN chmod +x /usr/local/bin/tundler-configure.sh /usr/local/bin/setup-netns.sh && \
     systemctl enable tundler-api.service && \
     systemctl set-default multi-user.target && \
     systemctl mask getty@tty1.service console-getty.service
