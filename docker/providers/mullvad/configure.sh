@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 set -e
 
-systemctl enable mullvad-daemon --now
-systemctl restart mullvad-daemon
+NETNS=${TUNDLER_NETNS:-vpnns}
+SERVICE=mullvad-daemon
+
+mkdir -p "/etc/systemd/system/${SERVICE}.d"
+cat <<EOF >"/etc/systemd/system/${SERVICE}.d/netns.conf"
+[Service]
+NetworkNamespacePath=/var/run/netns/${NETNS}
+EOF
+systemctl daemon-reload
+systemctl enable "${SERVICE}" --now
 
 mullvad auto-connect set off
 mullvad lan set allow
 
-systemctl restart mullvad-daemon
+systemctl restart "${SERVICE}"
