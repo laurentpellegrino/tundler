@@ -19,6 +19,44 @@ func init() { provider.Registry[name] = Mullvad{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+// deviceKey returns the WireGuard public key of the current device.
+func deviceKey(ctx context.Context) string {
+	out, _ := shared.RunCmd(ctx, bin, "tunnel", "get")
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "Public key:") {
+			return strings.TrimSpace(strings.TrimPrefix(ln, "Public key:"))
+		}
+	}
+	return ""
+}
+
+// deviceID returns the account device identifier matching pubKey.
+func deviceID(ctx context.Context, pubKey string) string {
+	if pubKey == "" {
+		return ""
+	}
+	out, _ := shared.RunCmd(ctx, bin, "account", "list-devices", "-v")
+	var id string
+	var currentID string
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "Id") {
+			parts := strings.SplitN(ln, ":", 2)
+			if len(parts) == 2 {
+				currentID = strings.TrimSpace(parts[1])
+			}
+		} else if strings.HasPrefix(ln, "Public key:") {
+			parts := strings.SplitN(ln, ":", 2)
+			if len(parts) == 2 && strings.TrimSpace(parts[1]) == pubKey {
+				id = currentID
+				break
+			}
+		}
+	}
+	return id
+}
+
 func (m Mullvad) ActiveLocation(ctx context.Context) string {
 	out, _ := shared.RunCmd(ctx, bin, "status")
 	for _, ln := range strings.Split(out, "\n") {
@@ -90,6 +128,10 @@ func (m Mullvad) Login(ctx context.Context) error {
 }
 
 func (m Mullvad) Logout(ctx context.Context) error {
+	key := deviceKey(ctx)
+	if id := deviceID(ctx, key); id != "" {
+		quiet(ctx, "account", "revoke-device", id)
+	}
 	_, err := shared.RunCmd(ctx, bin, "account", "logout")
 	return err
 }
