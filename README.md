@@ -51,6 +51,7 @@ providers:
 
 - `debug` enables verbose logging and may also be set with `-d/--debug`.
 - `providers.<name>.locations` restricts the random locations used when `location` is omitted in API calls.
+- `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
 
 ## REST API
 
@@ -59,7 +60,7 @@ providers:
 | `/`           | GET    | –                                 | List providers and login state          |
 | `/connect`    | POST   | `location`, `provider` *(optional)* | Connect to a new location or provider   |
 | `/disconnect` | POST   | –                                 | Tear down the current tunnel            |
-| `/login`      | POST   | `provider` *(optional)*           | Login one provider or all when omitted  |
+| `/login`      | POST   | `providers` *(optional)*          | Login comma-separated providers or all when omitted |
 | `/logout`     | POST   | `provider` *(optional)*           | Logout one provider or all when omitted |
 | `/status`     | GET    | –                                 | Return tunnel state, IP and provider in use |
 
