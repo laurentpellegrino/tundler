@@ -19,6 +19,23 @@ func init() { provider.Registry[name] = Mullvad{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+// revokeAllDevices revokes every device registered on the account.
+func revokeAllDevices(ctx context.Context) {
+	out, _ := shared.RunCmd(ctx, bin, "account", "list-devices", "-v")
+	for _, ln := range strings.Split(out, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "Id") {
+			parts := strings.SplitN(ln, ":", 2)
+			if len(parts) == 2 {
+				id := strings.TrimSpace(parts[1])
+				if id != "" {
+					quiet(ctx, "account", "revoke-device", id)
+				}
+			}
+		}
+	}
+}
+
 // deviceKey returns the WireGuard public key of the current device.
 func deviceKey(ctx context.Context) string {
 	out, _ := shared.RunCmd(ctx, bin, "tunnel", "get")
@@ -121,8 +138,16 @@ func (m Mullvad) Login(ctx context.Context) error {
 	if m.LoggedIn(ctx) {
 		return nil
 	}
-	if _, err := shared.RunCmd(ctx, bin, "account", "login", acct); err != nil {
-		return fmt.Errorf("mullvad account login failed: %w", err)
+	out, err := shared.RunCmd(ctx, bin, "account", "login", acct)
+	if err != nil {
+		lower := strings.ToLower(out)
+		if strings.Contains(lower, "too many devices") || strings.Contains(lower, "device limit") {
+			revokeAllDevices(ctx)
+			out, err = shared.RunCmd(ctx, bin, "account", "login", acct)
+		}
+		if err != nil {
+			return fmt.Errorf("mullvad account login failed: %w", err)
+		}
 	}
 	return nil
 }
