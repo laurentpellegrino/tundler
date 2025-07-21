@@ -3,12 +3,13 @@
 Tundler ("tunnel bundler") packages a small REST API in a Docker image to manage multiple VPN providers.
 It can rotate tunnels on demand and optionally expose an HTTP proxy routed through the active VPN.
 
-Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries to minimise breakage.
+Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries 
+to minimise breakage and remains stateless on its own.
 
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
-- ExpressVPN, Mullvad and NordVPN support out of the box.
+- ExpressVPN, Mullvad, NordVPN and Private Internet Access (PIA) support out of the box.
 - Optional HTTP proxy on port `8484`.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
@@ -27,6 +28,8 @@ docker/build.sh
 EXPRESSVPN_ACTIVATION_CODE=<code> \
 MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
+PRIVATEINTERNETACCESS_USERNAME=<username> \
+PRIVATEINTERNETACCESS_PASSWORD=<password> \
 docker/run.sh
 ```
 
@@ -34,17 +37,18 @@ The API will be reachable on port `4242` and the HTTP proxy on `8484`.
 
 By default, the VPN and HTTP proxy run inside their own network namespace.
 The `TUNDLER_NETNS` environment variable specifies the namespace name
-(defaults to `vpnns`).  VPN daemons are launched in that namespace using
+(defaults to `vpnns`). VPN daemons are launched in that namespace using
 systemd overrides, while the REST API stays in the main namespace so it
 remains reachable even when the VPN changes routing.
 
 #### Environment variables
 
-| Provider   | Variables                     |
-|-----------|-------------------------------|
-| ExpressVPN | `EXPRESSVPN_ACTIVATION_CODE` |
-| Mullvad    | `MULLVAD_ACCOUNT_NUMBER`     |
-| NordVPN    | `NORDVPN_TOKEN`              |
+| Provider                      | Variables                                                          |
+|-------------------------------|--------------------------------------------------------------------|
+| ExpressVPN                    | `EXPRESSVPN_ACTIVATION_CODE`                                       |
+| Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
+| NordVPN                       | `NORDVPN_TOKEN`                                                    |
+| Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
 
 ### Configuration
 
