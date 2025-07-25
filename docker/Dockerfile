@@ -29,7 +29,7 @@ ENV HOME=/root
 # Install packages needed
 RUN apt-get -y update && \
     apt-get -y upgrade && \
-    apt-get install -y curl dbus sudo systemd unzip wget zip gpg \
+    apt-get install -y curl dbus gpg lsb-release sudo systemd unzip wget zip \
                        iproute2 iptables && \
     apt-get install -y --no-install-recommends apt-transport-https ca-certificates
 
@@ -38,14 +38,16 @@ RUN useradd -m -s /bin/bash tundler \
     && echo "tundler ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
     && chown tundler:tundler /root
 
-# Install tinyproxy
-COPY docker/config/tinyproxy.conf /tmp/tinyproxy.conf
+# Install Envoy proxy
+COPY docker/config/envoy.yaml /tmp/envoy.yaml
 RUN if [ "$INSTALL_TUNDLER_PROXY" = "true" ]; then \
-      apt-get update && \
-      apt-get install -y tinyproxy && \
-      mv /tmp/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf; \
+      ENVOY_VERSION="1.34.4" && \
+      curl -L "https://github.com/envoyproxy/envoy/releases/download/v${ENVOY_VERSION}/envoy-${ENVOY_VERSION}-linux-x86_64" -o /usr/local/bin/envoy && \
+      chmod +x /usr/local/bin/envoy && \
+      mkdir -p /etc/envoy && \
+      mv /tmp/envoy.yaml /etc/envoy/envoy.yaml; \
     else \
-      rm -f /tmp/tinyproxy.conf; \
+      rm -f /tmp/envoy.yaml; \
     fi
 
 
