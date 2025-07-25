@@ -31,6 +31,8 @@ func (n NordVPN) ActiveLocation(ctx context.Context) string {
 }
 
 func (n NordVPN) Connect(ctx context.Context, location string) provider.Status {
+	// Disable firewall before connection to prevent API blocking
+	quiet(ctx, "set", "firewall", "disabled")
 	args := []string{"connect"}
 	if location != "" {
 		args = append(args, location)

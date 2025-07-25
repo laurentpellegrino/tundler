@@ -14,6 +14,7 @@ systemctl enable "${SERVICE}" --now
 
 nordvpn set analytics disabled
 nordvpn set autoconnect disabled
+nordvpn set firewall disabled
 nordvpn set lan-discovery enable
 nordvpn set pq on
 nordvpn set technology NordLynx
