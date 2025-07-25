@@ -1,18 +1,83 @@
 # Tundler
 
 Tundler ("tunnel bundler") packages a small REST API in a Docker image to manage multiple VPN providers.
-It can rotate tunnels on demand and optionally expose an HTTP proxy routed through the active VPN.
+It can rotate tunnels on demand and exposes an HTTP proxy routed through the active VPN.
 
-Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries 
+Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries
 to minimise breakage and remains stateless on its own.
 
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
 - ExpressVPN, Mullvad, NordVPN and Private Internet Access (PIA) support out of the box.
-- Optional HTTP proxy on port `8484`.
+- Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
+
+## Architecture
+
+Tundler uses Linux network namespaces to provide VPN proxy functionality while maintaining API accessibility.
+The system consists of two isolated network environments within a Docker container:
+
+### Network Architecture Diagram
+
+```
+                                 HOST SYSTEM
+        ┌────────────────────────────────────────────────────────────┐
+        │  curl --proxy localhost:8484 example.com                   │
+        └──────────────────────┬─────────────────────────────────────┘
+                               │ HTTP/HTTPS requests
+                               ▼
+    ┌────────────────────────────────────────────────────────────────────┐
+    │                           DOCKER CONTAINER                         │
+    │                                                                    │
+    │   ┌───────────────── DEFAULT NAMESPACE ────────────────────────┐   │
+    │   │                                                            │   │
+    │   │  ┌─────────────┐      ┌─────────────────┐                  │   │
+    │   │  │ Tundler API │      │   Envoy Proxy   │                  │   │
+    │   │  │    :4242    │      │     :8484       │                  │   │
+    │   │  └─────────────┘      └─────────────────┘                  │   │
+    │   │                                │                           │   │
+    │   │                                │ fwmark 200                │   │
+    │   │                                │ (policy routing)          │   │
+    │   │                                ▼                           │   │
+    │   │        ┌─────────────────────────────────────┐             │   │
+    │   │        │             vpn-host                │             │   │
+    │   │        │          172.18.0.1/30              │             │   │
+    │   │        │        (veth interface)             │             │   │
+    │   │        └─────────────────┬───────────────────┘             │   │
+    │   └──────────────────────────┼─────────────────────────────────┘   │
+    │                              │ virtual ethernet pair               │
+    │                              ▼                                     │
+    │   ┌──────────────── VPN NAMESPACE (vpnns) ─────────────────────┐   │
+    │   │                                                            │   │
+    │   │        ┌─────────────────────────────────────┐             │   │
+    │   │        │              vpn-ns                 │             │   │
+    │   │        │           172.18.0.2/30             │             │   │
+    │   │        │         (veth interface)            │             │   │
+    │   │        └─────────────────────────────────────┘             │   │
+    │   │                                                            │   │
+    │   │  ┌──────────────┐   ┌────────────┐   ┌──────────────┐      │   │
+    │   │  │  ExpressVPN  │   │    ...     │   │   NordVPN    │      │   │
+    │   │  │   Service    │   │            │   │   Service    │      │   │
+    │   │  │              │   │            │   │              │      │   │
+    │   │  │  ┌────────┐  │   │            │   │  ┌────────┐  │      │   │
+    │   │  │  │  tun0  │  │   │            │   │  │nordlynx│  │      │   │
+    │   │  │  │   IF   │  │   │            │   │  │   IF   │  │      │   │
+    │   │  │  └────────┘  │   │            │   │  └────────┘  │      │   │
+    │   │  └──────────────┘   └────────────┘   └──────────────┘      │   │
+    │   │                                │                           │   │
+    │   └────────────────────────────────┼───────────────────────────┘   │
+    │                                    │ VPN tunnel to internet        │
+    │                                    ▼                               │
+    └────────────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼
+                                ┌─────────────────┐
+                                │    INTERNET     │
+                                │   (VPN Server)  │
+                                └─────────────────┘
+```
 
 ## Getting Started
 
@@ -35,11 +100,11 @@ docker/run.sh
 
 The API will be reachable on port `4242` and the HTTP proxy on `8484`.
 
-By default, the VPN and HTTP proxy run inside their own network namespace.
+By default, VPN providers run inside their own network namespace.
 The `TUNDLER_NETNS` environment variable specifies the namespace name
 (defaults to `vpnns`). VPN daemons are launched in that namespace using
-systemd overrides, while the REST API stays in the main namespace so it
-remains reachable even when the VPN changes routing.
+systemd overrides, while the REST API and proxy stay in the main namespace so they 
+remain reachable even when the VPN changes routing.
 
 #### Environment variables
 
