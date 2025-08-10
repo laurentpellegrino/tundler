@@ -3,8 +3,9 @@ static_resources:
   - name: forward_proxy_listener
     address:
       socket_address:
-        address: 0.0.0.0
+        address: "::"
         port_value: 8484
+        ipv4_compat: true
     filter_chains:
     - filters:
       - name: envoy.filters.network.http_connection_manager
@@ -35,7 +36,7 @@ static_resources:
               "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
               dns_cache_config:
                 name: dynamic_forward_proxy_cache_config
-                dns_lookup_family: V4_ONLY
+                dns_lookup_family: ALL
                 max_hosts: 100
                 host_ttl: 30s
                 typed_dns_resolver_config:
@@ -51,13 +52,21 @@ static_resources:
     connect_timeout: 10s
     lb_policy: CLUSTER_PROVIDED
     max_requests_per_connection: 1
+    common_lb_config:
+      healthy_panic_threshold:
+        value: 0
+    upstream_connection_options:
+      tcp_keepalive:
+        keepalive_probes: 1
+        keepalive_time: 1
+        keepalive_interval: 1
     cluster_type:
       name: envoy.clusters.dynamic_forward_proxy
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
         dns_cache_config:
           name: dynamic_forward_proxy_cache_config
-          dns_lookup_family: V4_ONLY
+          dns_lookup_family: ALL
           max_hosts: 100
           host_ttl: 30s
           typed_dns_resolver_config:
@@ -70,3 +79,4 @@ admin:
     socket_address:
       address: 127.0.0.1
       port_value: 9901
+

@@ -25,6 +25,7 @@ docker run -it -d \
   --privileged \
   --cap-add=NET_ADMIN \
   --device=/dev/net/tun \
+  --ulimit nofile=65536:65536 \
   --tmpfs /run \
   --tmpfs /run/lock \
   --tmpfs /tmp \
