@@ -15,7 +15,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o tundler-api ./cmd/tundler-api
 
 # Runtime stage building the tundler
-FROM ubuntu:24.10
+# Use an LTS release to avoid EOL apt repositories
+FROM ubuntu:24.04
 
 ARG INSTALL_EXPRESSVPN=true
 ARG INSTALL_MULLVAD=true
