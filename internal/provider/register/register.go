@@ -5,4 +5,5 @@ import (
 	_ "github.com/laurentpellegrino/tundler/internal/provider/mullvad"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/nordvpn"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/pia"
+	_ "github.com/laurentpellegrino/tundler/internal/provider/surfshark"
 )

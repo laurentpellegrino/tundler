@@ -9,7 +9,7 @@ to minimise breakage and remains stateless on its own.
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
-- ExpressVPN, Mullvad, NordVPN and Private Internet Access (PIA) support out of the box.
+- ExpressVPN, Mullvad, NordVPN, Private Internet Access (PIA) and Surfshark support out of the box.
 - Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
@@ -95,6 +95,8 @@ MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
 PRIVATEINTERNETACCESS_USERNAME=<username> \
 PRIVATEINTERNETACCESS_PASSWORD=<password> \
+SURFSHARK_EMAIL=<email> \
+SURFSHARK_PASSWORD=<password> \
 docker/run.sh
 ```
 
@@ -114,6 +116,7 @@ remain reachable even when the VPN changes routing.
 | Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
 | NordVPN                       | `NORDVPN_TOKEN`                                                    |
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
+| Surfshark                     | `SURFSHARK_EMAIL`, `SURFSHARK_PASSWORD`                            |
 
 ### Configuration
 
