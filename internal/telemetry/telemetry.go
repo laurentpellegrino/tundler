@@ -17,6 +17,7 @@ type Event struct {
 	Type      string `json:"type"`
 	Provider  string `json:"provider"`
 	Location  string `json:"location"`
+	VPNIP     string `json:"vpn_ip,omitempty"`
 	Timestamp int64  `json:"timestamp"`
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
@@ -35,7 +36,8 @@ func Enabled() bool {
 }
 
 // TrackConnect sends an anonymous connection event asynchronously
-func TrackConnect(provider, location string) {
+// vpnIP is the IP address assigned by the VPN (not the user's real IP)
+func TrackConnect(provider, location, vpnIP string) {
 	if !enabled {
 		return
 	}
@@ -44,6 +46,7 @@ func TrackConnect(provider, location string) {
 		Type:      "connect",
 		Provider:  provider,
 		Location:  location,
+		VPNIP:     vpnIP,
 		Timestamp: time.Now().Unix(),
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
