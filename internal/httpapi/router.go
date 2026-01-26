@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"net/http"
 	"strings"
 
@@ -55,8 +56,24 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
-		prov := r.URL.Query().Get("provider") // optional
-		loc := r.URL.Query().Get("location")  // optional
+		// Parse providers (comma-separated, pick one randomly)
+		var prov string
+		if provs := r.URL.Query().Get("providers"); provs != "" {
+			list := parseCSV(provs)
+			if len(list) > 0 {
+				prov = list[rand.Intn(len(list))]
+			}
+		}
+
+		// Parse locations (comma-separated, pick one randomly)
+		var loc string
+		if locs := r.URL.Query().Get("locations"); locs != "" {
+			list := parseCSV(locs)
+			if len(list) > 0 {
+				loc = list[rand.Intn(len(list))]
+			}
+		}
+
 		st, err := mgr.Connect(r.Context(), prov, loc)
 		if err != nil {
 			writeErr(w, err)
@@ -98,4 +115,15 @@ func writeErr(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+func parseCSV(s string) []string {
+	var result []string
+	for _, v := range strings.Split(s, ",") {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
 }

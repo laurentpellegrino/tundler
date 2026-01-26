@@ -141,7 +141,7 @@ providers:
 | Endpoint      | Method | Query params                        | Description                                         |
 |---------------|--------|-------------------------------------|-----------------------------------------------------|
 | `/`           | GET    | –                                   | List providers and login state                      |
-| `/connect`    | POST   | `location`, `provider` *(optional)* | Connect to a new location or provider               |
+| `/connect`    | POST   | `locations`, `providers` *(optional)* | Connect to a random location/provider from the list |
 | `/disconnect` | POST   | –                                   | Tear down the current tunnel                        |
 | `/login`      | POST   | `providers` *(optional)*            | Login comma-separated providers or all when omitted |
 | `/logout`     | POST   | `provider` *(optional)*             | Logout one provider or all when omitted             |
