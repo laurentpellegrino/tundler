@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math/rand"
@@ -23,43 +24,17 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		provs := r.URL.Query().Get("providers")
-		if provs == "" {
-			if err := mgr.Login(r.Context(), ""); err != nil {
-				writeErr(w, err)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
+		if err := forEachProvider(r, mgr.Login); err != nil {
+			writeErr(w, err)
 			return
-		}
-
-		for _, name := range strings.Split(provs, ",") {
-			name = strings.TrimSpace(name)
-			if name == "" {
-				continue
-			}
-			if err := mgr.Login(r.Context(), name); err != nil {
-				writeErr(w, err)
-				return
-			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
-		provs := parseCSV(r.URL.Query().Get("providers"))
-		if len(provs) == 0 {
-			if err := mgr.Logout(r.Context(), ""); err != nil {
-				writeErr(w, err)
-				return
-			}
-		} else {
-			for _, prov := range provs {
-				if err := mgr.Logout(r.Context(), prov); err != nil {
-					writeErr(w, err)
-					return
-				}
-			}
+		if err := forEachProvider(r, mgr.Logout); err != nil {
+			writeErr(w, err)
+			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -126,4 +101,17 @@ func pickRandom(list []string) string {
 		return ""
 	}
 	return list[rand.Intn(len(list))]
+}
+
+func forEachProvider(r *http.Request, fn func(context.Context, string) error) error {
+	provs := parseCSV(r.URL.Query().Get("providers"))
+	if len(provs) == 0 {
+		return fn(r.Context(), "")
+	}
+	for _, prov := range provs {
+		if err := fn(r.Context(), prov); err != nil {
+			return err
+		}
+	}
+	return nil
 }
