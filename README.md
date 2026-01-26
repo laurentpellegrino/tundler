@@ -89,7 +89,10 @@ docker/build.sh
 
 ### Run the container
 
+Credentials can be provided via environment variables or a `.env` file at the project root:
+
 ```bash
+# Option 1: Environment variables
 EXPRESSVPN_ACTIVATION_CODE=<code> \
 MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
@@ -97,6 +100,13 @@ PRIVATEINTERNETACCESS_USERNAME=<username> \
 PRIVATEINTERNETACCESS_PASSWORD=<password> \
 SURFSHARK_OPENVPN_USERNAME=<username> \
 SURFSHARK_OPENVPN_PASSWORD=<password> \
+docker/run.sh
+
+# Option 2: .env file (automatically loaded by run.sh)
+cat > .env << 'EOF'
+NORDVPN_TOKEN=<token>
+MULLVAD_ACCOUNT_NUMBER=<account>
+EOF
 docker/run.sh
 ```
 
@@ -134,7 +144,7 @@ providers:
 ```
 
 - `debug` enables verbose logging and may also be set with `-d/--debug`.
-- `telemetry` enables anonymous usage statistics (disabled by default). Only provider and location are collected, not user IP. May also be set with `--telemetry`.
+- `telemetry` enables anonymous usage statistics (disabled by default). Collects provider, location, and VPN IP (the IP assigned by the VPN, not your real IP). May also be set with `--telemetry`.
 - `providers.<name>.locations` restricts the random locations used when `location` is omitted in API calls.
 - `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
 
