@@ -8,6 +8,7 @@ import (
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/telemetry"
 )
 
 // -----------------------------------------------------------------------------
@@ -66,7 +67,11 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 	}
 
 	shared.Debugf("[manager] connect %s location=%s", providerName, location)
-	return p.Connect(ctx, location), nil
+	status := p.Connect(ctx, location)
+	if status.Connected {
+		telemetry.TrackConnect(providerName, location)
+	}
+	return status, nil
 }
 
 // Disconnect terminates any active tunnel.

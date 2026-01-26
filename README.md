@@ -125,6 +125,7 @@ When present, `~/.config/tundler/tundler.yaml` is read at startup:
 
 ```yaml
 debug: true
+telemetry: false
 providers:
   - nordvpn:
       locations:
@@ -133,6 +134,7 @@ providers:
 ```
 
 - `debug` enables verbose logging and may also be set with `-d/--debug`.
+- `telemetry` enables anonymous usage statistics (disabled by default). Only provider and location are collected, not user IP. May also be set with `--telemetry`.
 - `providers.<name>.locations` restricts the random locations used when `location` is omitted in API calls.
 - `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
 
