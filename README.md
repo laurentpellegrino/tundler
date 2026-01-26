@@ -95,8 +95,8 @@ MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
 PRIVATEINTERNETACCESS_USERNAME=<username> \
 PRIVATEINTERNETACCESS_PASSWORD=<password> \
-SURFSHARK_EMAIL=<email> \
-SURFSHARK_PASSWORD=<password> \
+SURFSHARK_OPENVPN_USERNAME=<username> \
+SURFSHARK_OPENVPN_PASSWORD=<password> \
 docker/run.sh
 ```
 
@@ -116,7 +116,8 @@ remain reachable even when the VPN changes routing.
 | Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
 | NordVPN                       | `NORDVPN_TOKEN`                                                    |
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
-| Surfshark                     | `SURFSHARK_EMAIL`, `SURFSHARK_PASSWORD`                            |
+| Surfshark (OpenVPN)           | `SURFSHARK_OPENVPN_USERNAME`, `SURFSHARK_OPENVPN_PASSWORD`         |
+| Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_KEYS`, `SURFSHARK_PROTOCOL=wireguard`         |
 
 ### Configuration
 

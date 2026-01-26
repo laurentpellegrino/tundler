@@ -1,161 +1,420 @@
 package surfshark
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
 
+const name = "surfshark"
+const apiURL = "https://api.surfshark.com/v4/server/clusters/generic"
+const cacheExpiry = 1 * time.Hour
+
 type Surfshark struct{}
 
-const bin = "surfshark-vpn"
-const name = "surfshark"
+type Server struct {
+	Country        string  `json:"country"`
+	CountryCode    string  `json:"countryCode"`
+	Region         string  `json:"region"`
+	Location       string  `json:"location"`
+	ConnectionName string  `json:"connectionName"`
+	PubKey         string  `json:"pubKey"`
+	Load           int     `json:"load"`
+}
+
+type WireGuardKey struct {
+	Private string `json:"private"`
+	Public  string `json:"public"`
+}
+
+var (
+	serverCache     []Server
+	serverCacheMu   sync.RWMutex
+	serverCacheTime time.Time
+	activeServer    *Server
+	activeProtocol  string
+)
 
 func init() { provider.Registry[name] = Surfshark{} }
 
-// runCmd runs surfshark-vpn with empty stdin (required by CLI to avoid prompts)
-func runCmd(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Stdin = strings.NewReader("")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
-	return strings.TrimSpace(out.String()), err
+// fetchServers retrieves server list from API or cache
+func fetchServers(ctx context.Context) ([]Server, error) {
+	serverCacheMu.RLock()
+	if len(serverCache) > 0 && time.Since(serverCacheTime) < cacheExpiry {
+		servers := serverCache
+		serverCacheMu.RUnlock()
+		return servers, nil
+	}
+	serverCacheMu.RUnlock()
+
+	serverCacheMu.Lock()
+	defer serverCacheMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if len(serverCache) > 0 && time.Since(serverCacheTime) < cacheExpiry {
+		return serverCache, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+
+	var servers []Server
+	if err := json.NewDecoder(resp.Body).Decode(&servers); err != nil {
+		return nil, err
+	}
+
+	serverCache = servers
+	serverCacheTime = time.Now()
+	shared.Debugf("Surfshark: cached %d servers", len(servers))
+
+	return servers, nil
 }
 
-func quiet(ctx context.Context, args ...string) { _, _ = runCmd(ctx, args...) }
+// findServers filters servers by ISO country code (e.g., "FR", "US", "DE")
+func findServers(servers []Server, location string) []Server {
+	if location == "" {
+		return servers
+	}
+
+	loc := strings.ToUpper(location)
+	var matches []Server
+
+	for _, s := range servers {
+		if strings.ToUpper(s.CountryCode) == loc {
+			matches = append(matches, s)
+		}
+	}
+
+	return matches
+}
+
+// pickRandomServer selects a random server from the list
+func pickRandomServer(servers []Server) *Server {
+	if len(servers) == 0 {
+		return nil
+	}
+	return &servers[rand.Intn(len(servers))]
+}
+
+// getProtocol returns the configured protocol (openvpn or wireguard)
+func getProtocol() string {
+	proto := os.Getenv("SURFSHARK_PROTOCOL")
+	if proto == "" {
+		proto = "openvpn"
+	}
+	return strings.ToLower(proto)
+}
+
+// getOpenVPNCredentials returns OpenVPN username and password
+func getOpenVPNCredentials() (string, string, error) {
+	user := os.Getenv("SURFSHARK_OPENVPN_USERNAME")
+	pass := os.Getenv("SURFSHARK_OPENVPN_PASSWORD")
+	if user == "" || pass == "" {
+		return "", "", fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD required for OpenVPN")
+	}
+	return user, pass, nil
+}
+
+// getWireGuardKeys returns the pool of WireGuard keys
+func getWireGuardKeys() ([]WireGuardKey, error) {
+	keysJSON := os.Getenv("SURFSHARK_WIREGUARD_KEYS")
+	if keysJSON == "" {
+		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_KEYS required for WireGuard")
+	}
+
+	var keys []WireGuardKey
+	if err := json.Unmarshal([]byte(keysJSON), &keys); err != nil {
+		return nil, fmt.Errorf("invalid SURFSHARK_WIREGUARD_KEYS JSON: %w", err)
+	}
+
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_KEYS is empty")
+	}
+
+	return keys, nil
+}
+
+// pickRandomKey selects a random WireGuard key from the pool
+func pickRandomKey(keys []WireGuardKey) WireGuardKey {
+	return keys[rand.Intn(len(keys))]
+}
+
+// connectOpenVPN connects using OpenVPN
+func connectOpenVPN(ctx context.Context, server *Server) error {
+	user, pass, err := getOpenVPNCredentials()
+	if err != nil {
+		return err
+	}
+
+	// Write credentials file
+	credFile := "/etc/surfshark/openvpn/auth.txt"
+	if err := os.WriteFile(credFile, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
+		return fmt.Errorf("failed to write credentials: %w", err)
+	}
+
+	// Generate OpenVPN config
+	config := fmt.Sprintf(`client
+dev tun
+proto udp
+remote %s 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+auth-user-pass %s
+cipher AES-256-CBC
+auth SHA512
+verb 3
+ca /etc/surfshark/ca.crt
+tls-auth /etc/surfshark/ta.key 1
+`, server.ConnectionName, credFile)
+
+	configFile := "/etc/surfshark/openvpn/client.ovpn"
+	if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	// Start OpenVPN in background
+	cmd := exec.CommandContext(ctx, "openvpn", "--config", configFile, "--daemon")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to start openvpn: %w", err)
+	}
+
+	// Wait for connection (check every 500ms, max 15 seconds)
+	for i := 0; i < 30; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if isOpenVPNConnected() {
+			activeServer = server
+			activeProtocol = "openvpn"
+			return nil
+		}
+	}
+
+	return fmt.Errorf("openvpn connection timeout")
+}
+
+// connectWireGuard connects using WireGuard
+func connectWireGuard(ctx context.Context, server *Server) error {
+	keys, err := getWireGuardKeys()
+	if err != nil {
+		return err
+	}
+
+	key := pickRandomKey(keys)
+
+	// Generate WireGuard config
+	config := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = 10.14.0.2/16
+DNS = 162.252.172.57, 149.154.159.92
+
+[Peer]
+PublicKey = %s
+AllowedIPs = 0.0.0.0/0
+Endpoint = %s:51820
+PersistentKeepalive = 25
+`, key.Private, server.PubKey, server.ConnectionName)
+
+	configFile := "/etc/surfshark/wireguard/wg0.conf"
+	if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	// Start WireGuard
+	cmd := exec.CommandContext(ctx, "wg-quick", "up", configFile)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to start wireguard: %w: %s", err, output)
+	}
+
+	activeServer = server
+	activeProtocol = "wireguard"
+	return nil
+}
+
+// isOpenVPNConnected checks if OpenVPN tunnel is up
+func isOpenVPNConnected() bool {
+	out, err := exec.Command("ip", "link", "show", "tun0").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "UP")
+}
+
+// isWireGuardConnected checks if WireGuard tunnel is up
+func isWireGuardConnected() bool {
+	out, err := exec.Command("wg", "show", "wg0").Output()
+	if err != nil {
+		return false
+	}
+	return len(out) > 0
+}
 
 func (s Surfshark) ActiveLocation(ctx context.Context) string {
-	out, _ := runCmd(ctx, "status")
-	for _, ln := range strings.Split(out, "\n") {
-		ln = strings.TrimSpace(ln)
-		// Parse "You are connected to: <location>" or similar
-		if strings.Contains(strings.ToLower(ln), "connected to") {
-			parts := strings.SplitN(ln, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
-			}
-		}
-		if strings.HasPrefix(ln, "Server:") {
-			return strings.TrimSpace(strings.TrimPrefix(ln, "Server:"))
-		}
-		if strings.HasPrefix(ln, "Location:") {
-			return strings.TrimSpace(strings.TrimPrefix(ln, "Location:"))
-		}
+	if activeServer != nil {
+		return fmt.Sprintf("%s - %s", activeServer.Country, activeServer.Location)
 	}
 	return ""
 }
 
 func (s Surfshark) Connect(ctx context.Context, location string) provider.Status {
-	if location != "" {
-		// The CLI uses numeric selection, but we can try passing location directly
-		// or use 'attack' for quick connect to optimal
-		quiet(ctx, location)
-	} else {
-		// Use 'attack' for quick connect to optimal location
-		quiet(ctx, "attack")
+	servers, err := fetchServers(ctx)
+	if err != nil {
+		shared.Debugf("Surfshark: failed to fetch servers: %v", err)
+		return provider.Status{Connected: false}
 	}
+
+	matches := findServers(servers, location)
+	if len(matches) == 0 {
+		shared.Debugf("Surfshark: no servers found for location: %s", location)
+		return provider.Status{Connected: false}
+	}
+
+	server := pickRandomServer(matches)
+	shared.Debugf("Surfshark: connecting to %s (%s)", server.ConnectionName, server.Country)
+
+	proto := getProtocol()
+	var connectErr error
+
+	if proto == "wireguard" {
+		connectErr = connectWireGuard(ctx, server)
+	} else {
+		connectErr = connectOpenVPN(ctx, server)
+	}
+
+	if connectErr != nil {
+		shared.Debugf("Surfshark: connection failed: %v", connectErr)
+		return provider.Status{Connected: false}
+	}
+
 	return s.Status(ctx)
 }
 
 func (s Surfshark) Connected(ctx context.Context) bool {
-	out, _ := runCmd(ctx, "status")
-	lower := strings.ToLower(out)
-	return strings.Contains(lower, "connected") &&
-		!strings.Contains(lower, "not connected") &&
-		!strings.Contains(lower, "disconnected")
+	proto := getProtocol()
+	if proto == "wireguard" {
+		return isWireGuardConnected()
+	}
+	return isOpenVPNConnected()
 }
 
 func (s Surfshark) Disconnect(ctx context.Context) error {
-	_, err := runCmd(ctx, "down")
-	return err
+	proto := activeProtocol
+	if proto == "" {
+		proto = getProtocol()
+	}
+
+	if proto == "wireguard" {
+		exec.Command("wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf").Run()
+	} else {
+		exec.Command("pkill", "-SIGTERM", "openvpn").Run()
+		// Wait for process to terminate
+		for i := 0; i < 10; i++ {
+			if !isOpenVPNConnected() {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	activeServer = nil
+	activeProtocol = ""
+	return nil
 }
 
 func (s Surfshark) Locations(ctx context.Context) []string {
-	// The legacy CLI doesn't have a locations list command
-	// Return common country codes that Surfshark supports
-	return []string{}
-}
-
-func (s Surfshark) LoggedIn(ctx context.Context) bool {
-	// surfshark-vpn stores credentials in ~/.surfshark/credentials/
-	// Check if credential files exist
-	entries, err := os.ReadDir(os.ExpandEnv("$HOME/.surfshark/credentials"))
+	servers, err := fetchServers(ctx)
 	if err != nil {
-		return false
-	}
-	return len(entries) > 0
-}
-
-func (s Surfshark) Login(ctx context.Context) error {
-	email := os.Getenv("SURFSHARK_EMAIL")
-	pass := os.Getenv("SURFSHARK_PASSWORD")
-
-	if email == "" || pass == "" {
-		return fmt.Errorf("SURFSHARK_EMAIL and SURFSHARK_PASSWORD environment variables not set")
-	}
-	if s.LoggedIn(ctx) {
 		return nil
 	}
 
-	// Use expect to handle interactive login prompts
-	expectScript := fmt.Sprintf(`
-set timeout 30
-spawn %s
-expect "email:"
-send "%s\r"
-expect "assword:"
-send "%s\r"
-expect eof
-`, bin, email, pass)
+	seen := make(map[string]bool)
+	var locations []string
 
-	cmd := exec.CommandContext(ctx, "expect", "-c", expectScript)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	for _, srv := range servers {
+		code := strings.ToUpper(srv.CountryCode)
+		if !seen[code] {
+			seen[code] = true
+			locations = append(locations, code)
+		}
+	}
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("surfshark login failed: %w: %s", err, out.String())
+	return locations
+}
+
+func (s Surfshark) LoggedIn(ctx context.Context) bool {
+	proto := getProtocol()
+	if proto == "wireguard" {
+		_, err := getWireGuardKeys()
+		return err == nil
+	}
+	_, _, err := getOpenVPNCredentials()
+	return err == nil
+}
+
+func (s Surfshark) Login(ctx context.Context) error {
+	// No login needed - credentials are provided via environment variables
+	if !s.LoggedIn(ctx) {
+		proto := getProtocol()
+		if proto == "wireguard" {
+			return fmt.Errorf("SURFSHARK_WIREGUARD_KEYS not configured")
+		}
+		return fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD not configured")
 	}
 	return nil
 }
 
 func (s Surfshark) Logout(ctx context.Context) error {
-	_, err := runCmd(ctx, "forget")
-	return err
+	// Nothing to do - credentials are env vars
+	return nil
 }
 
 func (s Surfshark) Status(ctx context.Context) provider.Status {
 	if !s.Connected(ctx) {
-		return provider.Status{Connected: false}
+		return provider.Status{Connected: false, Provider: name}
 	}
-	out, _ := runCmd(ctx, "status")
-	return provider.Status{
+
+	status := provider.Status{
 		Connected: true,
-		IP:        shared.FirstIPv4(out),
 		Location:  s.ActiveLocation(ctx),
 		Provider:  name,
 	}
+
+	// Get VPN IP (quick timeout)
+	if out, err := exec.Command("curl", "-s", "--max-time", "2", "https://api.ipify.org").Output(); err == nil {
+		status.IP = strings.TrimSpace(string(out))
+	}
+
+	return status
 }
 
 func (s Surfshark) Version(ctx context.Context) (string, error) {
-	out, err := runCmd(ctx, "version")
+	servers, err := fetchServers(ctx)
 	if err != nil {
-		// Try --version flag
-		out, err = runCmd(ctx, "--version")
-		if err != nil {
-			return "", err
-		}
+		return "", err
 	}
-	if v := shared.ExtractVersion(out); v != "" {
-		return v, nil
-	}
-	return strings.TrimSpace(out), nil
+	return fmt.Sprintf("API (%d servers)", len(servers)), nil
 }
