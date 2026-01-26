@@ -93,17 +93,17 @@ func fetchServers(ctx context.Context) ([]Server, error) {
 	return servers, nil
 }
 
-// findServers filters servers by ISO country code (e.g., "FR", "US", "DE")
+// findServers filters servers by country name (e.g., "France", "United States", "Germany")
 func findServers(servers []Server, location string) []Server {
 	if location == "" {
 		return servers
 	}
 
-	loc := strings.ToUpper(location)
+	loc := strings.ToLower(location)
 	var matches []Server
 
 	for _, s := range servers {
-		if strings.ToUpper(s.CountryCode) == loc {
+		if strings.ToLower(s.Country) == loc {
 			matches = append(matches, s)
 		}
 	}
@@ -356,10 +356,9 @@ func (s Surfshark) Locations(ctx context.Context) []string {
 	var locations []string
 
 	for _, srv := range servers {
-		code := strings.ToUpper(srv.CountryCode)
-		if !seen[code] {
-			seen[code] = true
-			locations = append(locations, code)
+		if !seen[srv.Country] {
+			seen[srv.Country] = true
+			locations = append(locations, srv.Country)
 		}
 	}
 
