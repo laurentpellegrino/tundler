@@ -56,24 +56,8 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
-		// Parse providers (comma-separated, pick one randomly)
-		var prov string
-		if provs := r.URL.Query().Get("providers"); provs != "" {
-			list := parseCSV(provs)
-			if len(list) > 0 {
-				prov = list[rand.Intn(len(list))]
-			}
-		}
-
-		// Parse locations (comma-separated, pick one randomly)
-		var loc string
-		if locs := r.URL.Query().Get("locations"); locs != "" {
-			list := parseCSV(locs)
-			if len(list) > 0 {
-				loc = list[rand.Intn(len(list))]
-			}
-		}
-
+		prov := pickRandom(parseCSV(r.URL.Query().Get("providers")))
+		loc := pickRandom(parseCSV(r.URL.Query().Get("locations")))
 		st, err := mgr.Connect(r.Context(), prov, loc)
 		if err != nil {
 			writeErr(w, err)
@@ -126,4 +110,11 @@ func parseCSV(s string) []string {
 		}
 	}
 	return result
+}
+
+func pickRandom(list []string) string {
+	if len(list) == 0 {
+		return ""
+	}
+	return list[rand.Intn(len(list))]
 }
