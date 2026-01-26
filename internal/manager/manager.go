@@ -69,7 +69,7 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 	shared.Debugf("[manager] connect %s location=%s", providerName, location)
 	status := p.Connect(ctx, location)
 	if status.Connected {
-		telemetry.TrackConnect(providerName, location)
+		telemetry.TrackConnect(providerName, location, status.IP)
 	}
 	return status, nil
 }
