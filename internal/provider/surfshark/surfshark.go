@@ -43,6 +43,7 @@ var (
 	serverCacheTime time.Time
 	activeServer    *Server
 	activeProtocol  string
+	loggedIn        bool
 )
 
 func init() { provider.Registry[name] = Surfshark{} }
@@ -366,29 +367,26 @@ func (s Surfshark) Locations(ctx context.Context) []string {
 }
 
 func (s Surfshark) LoggedIn(ctx context.Context) bool {
-	proto := getProtocol()
-	if proto == "wireguard" {
-		_, err := getWireGuardKeys()
-		return err == nil
-	}
-	_, _, err := getOpenVPNCredentials()
-	return err == nil
+	return loggedIn
 }
 
 func (s Surfshark) Login(ctx context.Context) error {
-	// No login needed - credentials are provided via environment variables
-	if !s.LoggedIn(ctx) {
-		proto := getProtocol()
-		if proto == "wireguard" {
+	proto := getProtocol()
+	if proto == "wireguard" {
+		if _, err := getWireGuardKeys(); err != nil {
 			return fmt.Errorf("SURFSHARK_WIREGUARD_KEYS not configured")
 		}
-		return fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD not configured")
+	} else {
+		if _, _, err := getOpenVPNCredentials(); err != nil {
+			return fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD not configured")
+		}
 	}
+	loggedIn = true
 	return nil
 }
 
 func (s Surfshark) Logout(ctx context.Context) error {
-	// Nothing to do - credentials are env vars
+	loggedIn = false
 	return nil
 }
 
