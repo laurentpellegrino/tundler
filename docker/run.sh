@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
+# Source .env file if present (for credentials)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  echo "[run.sh] Loading environment from $SCRIPT_DIR/.env"
+  set -a
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
 CONFIG_FILE="$HOME/.config/tundler/tundler.yaml"
 CFG_MOUNT=""
 if [[ -f "$CONFIG_FILE" ]]; then
