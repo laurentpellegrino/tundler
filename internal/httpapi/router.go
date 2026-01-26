@@ -47,10 +47,19 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
-		prov := r.URL.Query().Get("provider")
-		if err := mgr.Logout(r.Context(), prov); err != nil {
-			writeErr(w, err)
-			return
+		provs := parseCSV(r.URL.Query().Get("providers"))
+		if len(provs) == 0 {
+			if err := mgr.Logout(r.Context(), ""); err != nil {
+				writeErr(w, err)
+				return
+			}
+		} else {
+			for _, prov := range provs {
+				if err := mgr.Logout(r.Context(), prov); err != nil {
+					writeErr(w, err)
+					return
+				}
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
