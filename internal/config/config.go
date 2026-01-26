@@ -14,6 +14,7 @@ type Provider struct {
 
 type Config struct {
 	Debug     bool
+	Telemetry bool
 	Providers map[string]Provider
 }
 
@@ -40,6 +41,9 @@ func Load(path string) (*Config, error) {
 		case strings.HasPrefix(line, "debug:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "debug:"))
 			cfg.Debug = val == "true"
+		case strings.HasPrefix(line, "telemetry:"):
+			val := strings.TrimSpace(strings.TrimPrefix(line, "telemetry:"))
+			cfg.Telemetry = val == "true"
 		case strings.HasPrefix(line, "providers:"):
 			// no-op
 		case strings.HasPrefix(line, "- ") && strings.HasSuffix(line, ":"):

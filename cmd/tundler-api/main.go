@@ -16,6 +16,7 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/manager"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
+	"github.com/laurentpellegrino/tundler/internal/telemetry"
 )
 
 func main() {
@@ -39,8 +40,11 @@ func main() {
 	debug := cfg.Debug
 	flag.BoolVar(&debug, "d", debug, "enable debug logging")
 	flag.BoolVar(&debug, "debug", debug, "enable debug logging (long)")
+	enableTelemetry := cfg.Telemetry
+	flag.BoolVar(&enableTelemetry, "telemetry", enableTelemetry, "enable anonymous telemetry")
 	flag.Parse()
 
+	telemetry.SetEnabled(enableTelemetry)
 	mgr := manager.New(debug, providerLocations(cfg))
 
 	if *login != "" {
@@ -71,7 +75,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("tundler-api listening on %s (debug=%v)", addr, debug)
+	log.Printf("tundler-api listening on %s (debug=%v, telemetry=%v)", addr, debug, enableTelemetry)
 	log.Fatal(srv.ListenAndServe())
 }
 
