@@ -77,10 +77,11 @@ COPY --from=builder /build/tundler-api /usr/local/bin/tundler-api
 # Copy custom scripts and services
 COPY docker/services/tundler-configure.sh /usr/local/bin/tundler-configure.sh
 COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
+COPY docker/services/tundler-entrypoint.sh /usr/local/bin/tundler-entrypoint.sh
 COPY docker/services/tundler-api.service /etc/systemd/system/
 
 # Make script executable
-RUN chmod +x /usr/local/bin/tundler-configure.sh /usr/local/bin/setup-netns.sh && \
+RUN chmod +x /usr/local/bin/tundler-configure.sh /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh && \
     systemctl enable tundler-api.service && \
     systemctl set-default multi-user.target && \
     systemctl mask getty@tty1.service console-getty.service
@@ -97,4 +98,4 @@ EXPOSE 8484/tcp
 VOLUME ["/sys/fs/cgroup"]
 STOPSIGNAL SIGRTMIN+3
 
-ENTRYPOINT ["/lib/systemd/systemd"]
+ENTRYPOINT ["/usr/local/bin/tundler-entrypoint.sh"]
