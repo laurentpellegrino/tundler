@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 
 IMAGE_NAME="tundler"
 NO_CACHE=false
+QUICK=false
 BUILD_ARGS=()
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 CONTEXT_DIR="$SCRIPT_DIR/.."
@@ -16,6 +17,7 @@ Usage: $(basename "$0") [options]
 Options:
   -t, --tag <name[:tag]>   Image tag/name (default: ${IMAGE_NAME})
       --no-cache           Build without cache
+  -q, --quick              Quick rebuild: build binary locally and copy to running container
       --build-arg KEY=VAL  Pass build-arg (repeatable)
   -f, --file <Dockerfile>  Dockerfile path (default: docker/Dockerfile)
   -C, --context <dir>      Build context directory (default: repo root)
@@ -24,6 +26,7 @@ Options:
 Examples:
   $0 --no-cache --build-arg INSTALL_NORDVPN=false
   $0 -t tundler:dev -f docker/Dockerfile -C .
+  $0 --quick  # Fast rebuild for development
 EOF
 }
 
@@ -33,6 +36,8 @@ while [[ $# -gt 0 ]]; do
       IMAGE_NAME="$2"; shift 2;;
     --no-cache)
       NO_CACHE=true; shift;;
+    -q|--quick)
+      QUICK=true; shift;;
     --build-arg)
       BUILD_ARGS+=("--build-arg" "$2"); shift 2;;
     -f|--file)
@@ -63,6 +68,27 @@ if [[ ! -d "$CONTEXT_DIR" ]]; then
 fi
 
 cd -- "$CONTEXT_DIR"
+
+# Quick build: compile locally and copy to running container
+if [[ "$QUICK" == true ]]; then
+  echo "[build.sh] Quick build: compiling binary locally..."
+  BINARY="/tmp/tundler-api"
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$BINARY" ./cmd/tundler-api
+
+  if ! docker ps --format '{{.Names}}' | grep -Eq "^${IMAGE_NAME}\$"; then
+    echo "[build.sh] Error: container '$IMAGE_NAME' is not running" >&2
+    exit 1
+  fi
+
+  echo "[build.sh] Copying binary to container..."
+  docker cp "$BINARY" "${IMAGE_NAME}:/usr/local/bin/tundler-api"
+
+  echo "[build.sh] Restarting tundler-api service..."
+  docker exec "$IMAGE_NAME" systemctl restart tundler-api
+
+  echo "[build.sh] Quick build done."
+  exit 0
+fi
 
 echo "[build.sh] Building Docker image: $IMAGE_NAME"
 echo "[build.sh] Dockerfile: $DOCKERFILE"
