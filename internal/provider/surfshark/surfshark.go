@@ -23,15 +23,14 @@ const cacheExpiry = 1 * time.Hour
 type Surfshark struct{}
 
 type Server struct {
-	Country        string  `json:"country"`
-	CountryCode    string  `json:"countryCode"`
-	Region         string  `json:"region"`
-	Location       string  `json:"location"`
-	ConnectionName string  `json:"connectionName"`
-	PubKey         string  `json:"pubKey"`
-	Load           int     `json:"load"`
+	Country        string `json:"country"`
+	CountryCode    string `json:"countryCode"`
+	Region         string `json:"region"`
+	Location       string `json:"location"`
+	ConnectionName string `json:"connectionName"`
+	PubKey         string `json:"pubKey"`
+	Load           int    `json:"load"`
 }
-
 
 var (
 	serverCache     []Server
