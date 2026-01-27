@@ -58,7 +58,7 @@ func (n NordVPN) Locations(ctx context.Context) []string {
 
 func (n NordVPN) LoggedIn(ctx context.Context) bool {
 	out, _ := shared.RunCmd(ctx, bin, "login")
-	return strings.Contains(out, "You are already logged in.")
+	return strings.Contains(out, "already logged in")
 }
 
 func (n NordVPN) Login(ctx context.Context) error {
