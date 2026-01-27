@@ -32,10 +32,6 @@ type Server struct {
 	Load           int     `json:"load"`
 }
 
-type WireGuardKey struct {
-	Private string `json:"private"`
-	Public  string `json:"public"`
-}
 
 var (
 	serverCache     []Server
@@ -138,27 +134,30 @@ func getOpenVPNCredentials() (string, string, error) {
 	return user, pass, nil
 }
 
-// getWireGuardKeys returns the pool of WireGuard keys
-func getWireGuardKeys() ([]WireGuardKey, error) {
-	keysJSON := os.Getenv("SURFSHARK_WIREGUARD_KEYS")
-	if keysJSON == "" {
-		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_KEYS required for WireGuard")
+// getWireGuardKeys returns the pool of WireGuard private keys
+func getWireGuardKeys() ([]string, error) {
+	keysStr := os.Getenv("SURFSHARK_WIREGUARD_PRIVATE_KEYS")
+	if keysStr == "" {
+		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS required for WireGuard")
 	}
 
-	var keys []WireGuardKey
-	if err := json.Unmarshal([]byte(keysJSON), &keys); err != nil {
-		return nil, fmt.Errorf("invalid SURFSHARK_WIREGUARD_KEYS JSON: %w", err)
+	var keys []string
+	for _, k := range strings.Split(keysStr, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
 	}
 
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_KEYS is empty")
+		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS is empty")
 	}
 
 	return keys, nil
 }
 
-// pickRandomKey selects a random WireGuard key from the pool
-func pickRandomKey(keys []WireGuardKey) WireGuardKey {
+// pickRandomKey selects a random WireGuard private key from the pool
+func pickRandomKey(keys []string) string {
 	return keys[rand.Intn(len(keys))]
 }
 
@@ -224,7 +223,7 @@ func connectWireGuard(ctx context.Context, server *Server) error {
 		return err
 	}
 
-	key := pickRandomKey(keys)
+	privateKey := pickRandomKey(keys)
 
 	// Generate WireGuard config
 	config := fmt.Sprintf(`[Interface]
@@ -237,7 +236,7 @@ PublicKey = %s
 AllowedIPs = 0.0.0.0/0
 Endpoint = %s:51820
 PersistentKeepalive = 25
-`, key.Private, server.PubKey, server.ConnectionName)
+`, privateKey, server.PubKey, server.ConnectionName)
 
 	configFile := "/etc/surfshark/wireguard/wg0.conf"
 	if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
@@ -373,7 +372,7 @@ func (s Surfshark) Login(ctx context.Context) error {
 	proto := getProtocol()
 	if proto == "wireguard" {
 		if _, err := getWireGuardKeys(); err != nil {
-			return fmt.Errorf("SURFSHARK_WIREGUARD_KEYS not configured")
+			return fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS not configured")
 		}
 	} else {
 		if _, _, err := getOpenVPNCredentials(); err != nil {
