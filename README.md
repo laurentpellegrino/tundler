@@ -127,7 +127,7 @@ remain reachable even when the VPN changes routing.
 | NordVPN                       | `NORDVPN_TOKEN`                                                    |
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
 | Surfshark (OpenVPN)           | `SURFSHARK_OPENVPN_USERNAME`, `SURFSHARK_OPENVPN_PASSWORD`         |
-| Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_KEYS`, `SURFSHARK_PROTOCOL=wireguard`         |
+| Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_PRIVATE_KEYS`, `SURFSHARK_PROTOCOL=wireguard` |
 
 ### Configuration
 
