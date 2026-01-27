@@ -150,14 +150,15 @@ providers:
 
 ## REST API
 
-| Endpoint      | Method | Query params                        | Description                                         |
-|---------------|--------|-------------------------------------|-----------------------------------------------------|
-| `/`           | GET    | –                                   | List providers and login state                      |
+| Endpoint      | Method | Query params                          | Description                                         |
+|---------------|--------|---------------------------------------|-----------------------------------------------------|
+| `/`           | GET    | –                                     | List providers and login state                      |
 | `/connect`    | POST   | `locations`, `providers` *(optional)* | Connect to a random location/provider from the list |
-| `/disconnect` | POST   | –                                   | Tear down the current tunnel                        |
-| `/login`      | POST   | `providers` *(optional)*            | Login comma-separated providers or all when omitted |
-| `/logout`     | POST   | `providers` *(optional)*            | Logout listed providers, or all if empty            |
-| `/status`     | GET    | –                                   | Return tunnel state, IP and provider in use         |
+| `/disconnect` | POST   | –                                     | Tear down the current tunnel                        |
+| `/locations`  | GET    | –                                     | List available locations per provider               |
+| `/login`      | POST   | `providers` *(optional)*              | Login comma-separated providers or all when omitted |
+| `/logout`     | POST   | `providers` *(optional)*              | Logout listed providers, or all if empty            |
+| `/status`     | GET    | –                                     | Return tunnel state, IP and provider in use         |
 
 ## Extending Tundler
 
