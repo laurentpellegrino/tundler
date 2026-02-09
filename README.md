@@ -33,14 +33,14 @@ The system consists of two isolated network environments within a Docker contain
     │                                                                    │
     │   ┌───────────────── DEFAULT NAMESPACE ────────────────────────┐   │
     │   │                                                            │   │
-    │   │  ┌─────────────┐      ┌─────────────────┐                  │   │
-    │   │  │ Tundler API │      │   Envoy Proxy   │                  │   │
-    │   │  │    :4242    │      │     :8484       │                  │   │
-    │   │  └─────────────┘      └─────────────────┘                  │   │
-    │   │                                │                           │   │
-    │   │                                │ fwmark 200                │   │
-    │   │                                │ (policy routing)          │   │
-    │   │                                ▼                           │   │
+    │   │  ┌─────────────┐   ┌─────────────────┐  ┌──────────────┐  │   │
+    │   │  │ Tundler API │   │   Envoy Proxy   │  │  Docker DNS  │  │   │
+    │   │  │    :4242    │   │  :8484 (envoy)  │  │  (1.1.1.1)   │  │   │
+    │   │  └─────────────┘   └────────┬────────┘  └──────▲───────┘  │   │
+    │   │                             │                   │ DNS      │   │
+    │   │            UID-based mark ──┤  DNS queries ─────┘          │   │
+    │   │            (fwmark 200)     │  exempt from VPN routing     │   │
+    │   │                             ▼                              │   │
     │   │        ┌─────────────────────────────────────┐             │   │
     │   │        │             vpn-host                │             │   │
     │   │        │          172.18.0.1/30              │             │   │
@@ -52,7 +52,7 @@ The system consists of two isolated network environments within a Docker contain
     │   ┌──────────────── VPN NAMESPACE (vpnns) ─────────────────────┐   │
     │   │                                                            │   │
     │   │        ┌─────────────────────────────────────┐             │   │
-    │   │        │              vpn-ns                 │             │   │
+    │   │        │         vpn-ns + MASQUERADE          │             │   │
     │   │        │           172.18.0.2/30             │             │   │
     │   │        │         (veth interface)            │             │   │
     │   │        └─────────────────────────────────────┘             │   │
@@ -79,6 +79,23 @@ The system consists of two isolated network environments within a Docker contain
                                 └─────────────────┘
 ```
 
+### How Traffic Flows
+
+1. **Proxy requests**: Client connects to Envoy on port 8484. Envoy resolves the
+   upstream hostname using Docker DNS (exempt from VPN routing), then opens a
+   connection to the upstream server. Because Envoy runs as the dedicated `envoy`
+   user, an iptables mangle rule marks all its non-DNS packets with fwmark 200.
+   Policy routing sends those packets through the veth pair into vpnns, where they
+   are MASQUERADE'd and forwarded through the active VPN tunnel.
+
+2. **DNS isolation**: VPN providers rewrite `/etc/resolv.conf` to point at their own
+   tunnel-internal DNS servers. A systemd `BindPaths=` override gives each VPN daemon
+   a separate copy (`/etc/resolv.conf.vpnns`) so the real file — used by Envoy —
+   keeps the original Docker DNS.
+
+3. **API requests**: The Tundler REST API on port 4242 runs as root in the default
+   namespace and is unaffected by VPN routing.
+
 ## Getting Started
 
 ### Build the image
@@ -103,9 +120,10 @@ SURFSHARK_OPENVPN_PASSWORD=<password> \
 docker/run.sh
 
 # Option 2: .env file (automatically loaded by run.sh)
+# Variables must be prefixed with VPN_ in the .env file
 cat > .env << 'EOF'
-NORDVPN_TOKEN=<token>
-MULLVAD_ACCOUNT_NUMBER=<account>
+VPN_NORDVPN_TOKEN=<token>
+VPN_MULLVAD_ACCOUNT_NUMBER=<account>
 EOF
 docker/run.sh
 ```
