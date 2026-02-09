@@ -16,6 +16,8 @@ const name = "privateinternetaccess"
 
 type PIA struct{}
 
+var loggedIn bool
+
 func init() { provider.Registry[name] = PIA{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
@@ -96,39 +98,15 @@ func (p PIA) Locations(ctx context.Context) []string {
 }
 
 func (p PIA) LoggedIn(ctx context.Context) bool {
-	shared.Debugf("PIA: LoggedIn() called")
-
-	username := os.Getenv("PRIVATEINTERNETACCESS_USERNAME")
-	password := os.Getenv("PRIVATEINTERNETACCESS_PASSWORD")
-
-	if username == "" || password == "" {
-		shared.Debugf("PIA: LoggedIn() - missing credentials")
-		return false
-	}
-
-	// Check with real credentials directly
-	credentialsFile := "/tmp/pia_credentials_check"
-	credentials := fmt.Sprintf("%s\n%s", username, password)
-
-	if err := os.WriteFile(credentialsFile, []byte(credentials), 0600); err != nil {
-		shared.Debugf("PIA: LoggedIn() - failed to write credentials file: %v", err)
-		return false
-	}
-	defer os.Remove(credentialsFile)
-
-	shared.Debugf("PIA: LoggedIn() - attempting login with credentials")
-	out, _ := shared.RunCmd(ctx, bin, "login", credentialsFile)
-	shared.Debugf("PIA: LoggedIn() - login output: %s", out)
-
-	// If output contains "Already logged into account", we're already logged in
-	if strings.Contains(out, "Already logged into account") {
-		shared.Debugf("PIA: LoggedIn() - already logged in")
+	if loggedIn {
 		return true
 	}
-
-	// If we successfully logged in, logout before returning false
-	shared.Debugf("PIA: LoggedIn() - was not logged in, logging out")
-	quiet(ctx, "logout")
+	// Check if credentials are available (required for login)
+	username := os.Getenv("PRIVATEINTERNETACCESS_USERNAME")
+	password := os.Getenv("PRIVATEINTERNETACCESS_PASSWORD")
+	if username == "" || password == "" {
+		shared.Debugf("PIA: LoggedIn() - missing credentials")
+	}
 	return false
 }
 
@@ -162,19 +140,24 @@ func (p PIA) Login(ctx context.Context) error {
 	}
 	defer os.Remove(credentialsFile)
 
+	// PIA daemon can take up to ~60s to initialize its network stack.
+	// Use a generous piactl timeout to avoid rate-limiting from rapid retries.
 	shared.Debugf("PIA: Login() - executing login command")
-	out, err := shared.RunCmd(ctx, bin, "login", credentialsFile)
+	out, err := shared.RunCmd(ctx, bin, "--timeout", "90", "login", credentialsFile)
 	shared.Debugf("PIA: Login() - login output: %s", out)
-	if err != nil {
-		shared.Debugf("PIA: Login() - login failed: %v", err)
-		return fmt.Errorf("pia login failed: %w", err)
+	// piactl returns exit 0 on fresh login, exit 127 on "Already logged in"
+	if err == nil || strings.Contains(out, "Already logged into account") {
+		shared.Debugf("PIA: Login() - login successful")
+		loggedIn = true
+		return nil
 	}
 
-	shared.Debugf("PIA: Login() - login successful")
-	return nil
+	shared.Debugf("PIA: Login() - login failed: %v", err)
+	return fmt.Errorf("pia login failed: %w", err)
 }
 
 func (p PIA) Logout(ctx context.Context) error {
+	loggedIn = false
 	_, err := shared.RunCmd(ctx, bin, "logout")
 	return err
 }

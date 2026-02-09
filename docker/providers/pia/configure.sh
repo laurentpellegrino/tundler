@@ -17,8 +17,8 @@ systemctl enable "${SERVICE}" --now
 
 # CLI commands must run inside the VPN namespace to reach the daemon
 ip netns exec "${NETNS}" piactl background enable
-ip netns exec "${NETNS}" piactl set allowlan enable || true
-ip netns exec "${NETNS}" piactl set debuglogging enable || true
+ip netns exec "${NETNS}" piactl set allowlan true || true
+ip netns exec "${NETNS}" piactl set debuglogging true || true
 
 # Restart the service to ensure clean state
 systemctl restart "${SERVICE}" || true
