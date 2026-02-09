@@ -120,10 +120,9 @@ SURFSHARK_OPENVPN_PASSWORD=<password> \
 docker/run.sh
 
 # Option 2: .env file (automatically loaded by run.sh)
-# Variables must be prefixed with VPN_ in the .env file
 cat > .env << 'EOF'
-VPN_NORDVPN_TOKEN=<token>
-VPN_MULLVAD_ACCOUNT_NUMBER=<account>
+NORDVPN_TOKEN=<token>
+MULLVAD_ACCOUNT_NUMBER=<account>
 EOF
 docker/run.sh
 ```
