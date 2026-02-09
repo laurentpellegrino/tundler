@@ -42,7 +42,7 @@ RUN useradd -m -s /bin/bash tundler \
 # Install Envoy proxy
 COPY docker/config/envoy.yaml /tmp/envoy.yaml
 RUN if [ "$INSTALL_TUNDLER_PROXY" = "true" ]; then \
-      ENVOY_VERSION="1.34.4" && \
+      ENVOY_VERSION="1.34.12" && \
       curl -L "https://github.com/envoyproxy/envoy/releases/download/v${ENVOY_VERSION}/envoy-${ENVOY_VERSION}-linux-x86_64" -o /usr/local/bin/envoy && \
       chmod +x /usr/local/bin/envoy && \
       mkdir -p /etc/envoy && \
