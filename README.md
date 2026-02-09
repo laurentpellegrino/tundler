@@ -82,19 +82,14 @@ The system consists of two isolated network environments within a Docker contain
 ### How Traffic Flows
 
 1. **Proxy requests**: Client connects to Envoy on port 8484. Envoy resolves the
-   upstream hostname using Docker DNS (exempt from VPN routing), then opens a
-   connection to the upstream server. Because Envoy runs as the dedicated `envoy`
-   user, an iptables mangle rule marks all its non-DNS packets with fwmark 200.
-   Policy routing sends those packets through the veth pair into vpnns, where they
-   are MASQUERADE'd and forwarded through the active VPN tunnel.
+   upstream hostname, then opens a connection to the upstream server. All Envoy
+   traffic is routed through the veth pair into vpnns and forwarded through the
+   active VPN tunnel. By default, DNS queries are resolved outside the tunnel for
+   lower latency. Set `TUNDLER_VPN_DNS=true` to also route DNS through the tunnel
+   for full privacy (see [Environment variables](#environment-variables)).
 
-2. **DNS isolation**: VPN providers rewrite `/etc/resolv.conf` to point at their own
-   tunnel-internal DNS servers. A systemd `BindPaths=` override gives each VPN daemon
-   a separate copy (`/etc/resolv.conf.vpnns`) so the real file — used by Envoy —
-   keeps the original Docker DNS.
-
-3. **API requests**: The Tundler REST API on port 4242 runs as root in the default
-   namespace and is unaffected by VPN routing.
+2. **API requests**: The Tundler REST API on port 4242 stays in the default
+   namespace and is always reachable regardless of VPN state.
 
 ## Getting Started
 
@@ -137,6 +132,8 @@ remain reachable even when the VPN changes routing.
 
 #### Environment variables
 
+##### Provider credentials
+
 | Provider                      | Variables                                                          |
 |-------------------------------|--------------------------------------------------------------------|
 | ExpressVPN                    | `EXPRESSVPN_ACTIVATION_CODE`                                       |
@@ -145,6 +142,12 @@ remain reachable even when the VPN changes routing.
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
 | Surfshark (OpenVPN)           | `SURFSHARK_OPENVPN_USERNAME`, `SURFSHARK_OPENVPN_PASSWORD`         |
 | Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_PRIVATE_KEYS`, `SURFSHARK_PROTOCOL=wireguard` |
+
+##### Tundler options
+
+| Variable          | Default | Description                                                        |
+|-------------------|---------|--------------------------------------------------------------------|
+| `TUNDLER_VPN_DNS` | `false` | Route proxy DNS queries through the VPN tunnel for full privacy    |
 
 ### Configuration
 
