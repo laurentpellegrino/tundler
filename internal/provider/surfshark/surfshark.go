@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -176,16 +175,20 @@ func connectOpenVPN(ctx context.Context, server *Server) error {
 	// Generate OpenVPN config
 	config := fmt.Sprintf(`client
 dev tun
-proto udp
-remote %s 1194
-resolv-retry infinite
+proto tcp
+remote %s 1443
+remote-random
 nobind
-persist-key
-persist-tun
+tun-mtu 1500
+mssfix 1450
+ping 15
+ping-restart 0
+reneg-sec 0
 remote-cert-tls server
 auth-user-pass %s
 cipher AES-256-CBC
 auth SHA512
+fast-io
 verb 3
 ca /etc/surfshark/ca.crt
 tls-auth /etc/surfshark/ta.key 1
@@ -196,9 +199,9 @@ tls-auth /etc/surfshark/ta.key 1
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 
-	// Start OpenVPN in background
-	cmd := exec.CommandContext(ctx, "openvpn", "--config", configFile, "--daemon")
-	if err := cmd.Run(); err != nil {
+	// Start OpenVPN in background inside VPN namespace
+	// RunCmd waits for the parent to exit (--daemon forks to background)
+	if _, err := shared.RunCmd(ctx, "openvpn", "--config", configFile, "--daemon"); err != nil {
 		return fmt.Errorf("failed to start openvpn: %w", err)
 	}
 
@@ -242,9 +245,8 @@ PersistentKeepalive = 25
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 
-	// Start WireGuard
-	cmd := exec.CommandContext(ctx, "wg-quick", "up", configFile)
-	output, err := cmd.CombinedOutput()
+	// Start WireGuard inside VPN namespace
+	output, err := shared.RunCmd(ctx, "wg-quick", "up", configFile)
 	if err != nil {
 		return fmt.Errorf("failed to start wireguard: %w: %s", err, output)
 	}
@@ -254,18 +256,18 @@ PersistentKeepalive = 25
 	return nil
 }
 
-// isOpenVPNConnected checks if OpenVPN tunnel is up
+// isOpenVPNConnected checks if OpenVPN tunnel is up inside VPN namespace
 func isOpenVPNConnected() bool {
-	out, err := exec.Command("ip", "link", "show", "tun0").Output()
+	out, err := shared.RunCmd(context.Background(), "ip", "link", "show", "tun0")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(out), "UP")
+	return strings.Contains(out, "UP")
 }
 
-// isWireGuardConnected checks if WireGuard tunnel is up
+// isWireGuardConnected checks if WireGuard tunnel is up inside VPN namespace
 func isWireGuardConnected() bool {
-	out, err := exec.Command("wg", "show", "wg0").Output()
+	out, err := shared.RunCmd(context.Background(), "wg", "show", "wg0")
 	if err != nil {
 		return false
 	}
@@ -327,9 +329,9 @@ func (s Surfshark) Disconnect(ctx context.Context) error {
 	}
 
 	if proto == "wireguard" {
-		exec.Command("wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf").Run()
+		shared.RunCmd(ctx, "wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf")
 	} else {
-		exec.Command("pkill", "-SIGTERM", "openvpn").Run()
+		shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
 		// Wait for process to terminate
 		for i := 0; i < 10; i++ {
 			if !isOpenVPNConnected() {
@@ -399,8 +401,8 @@ func (s Surfshark) Status(ctx context.Context) provider.Status {
 	}
 
 	// Get VPN IP (quick timeout)
-	if out, err := exec.Command("curl", "-s", "--max-time", "2", "https://api.ipify.org").Output(); err == nil {
-		status.IP = strings.TrimSpace(string(out))
+	if out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "2", "https://checkip.amazonaws.com/"); err == nil {
+		status.IP = strings.TrimSpace(out)
 	}
 
 	return status
