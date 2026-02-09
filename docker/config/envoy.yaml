@@ -51,7 +51,16 @@ static_resources:
   - name: dynamic_forward_proxy_cluster
     connect_timeout: 10s
     lb_policy: CLUSTER_PROVIDED
-    max_requests_per_connection: 1
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        upstream_http_protocol_options:
+          auto_sni: true
+          auto_san_validation: true
+        common_http_protocol_options:
+          max_requests_per_connection: 1
+        explicit_http_config:
+          http_protocol_options: {}
     common_lb_config:
       healthy_panic_threshold:
         value: 0
@@ -73,6 +82,14 @@ static_resources:
             name: envoy.network.dns_resolver.getaddrinfo
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.getaddrinfo.v3.GetAddrInfoDnsResolverConfig
+
+overload_manager:
+  refresh_interval: 0.25s
+  resource_monitors:
+    - name: "envoy.resource_monitors.global_downstream_max_connections"
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 50000
 
 admin:
   address:
