@@ -39,6 +39,9 @@ RUN useradd -m -s /bin/bash tundler \
     && echo "tundler ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
     && chown tundler:tundler /root
 
+# Create dedicated user for Envoy proxy (used for UID-based policy routing)
+RUN useradd -r -s /usr/sbin/nologin envoy
+
 # Install Envoy proxy
 COPY docker/config/envoy.yaml /tmp/envoy.yaml
 RUN if [ "$INSTALL_TUNDLER_PROXY" = "true" ]; then \
