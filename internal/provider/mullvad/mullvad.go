@@ -20,8 +20,15 @@ func init() { provider.Registry[name] = Mullvad{} }
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
 // revokeAllDevices revokes every device registered on the account.
+// The account number is required because listing/revoking devices
+// requires either being logged in or passing --account explicitly.
 func revokeAllDevices(ctx context.Context) {
-	out, _ := shared.RunCmd(ctx, bin, "account", "list-devices", "-v")
+	acct := os.Getenv("MULLVAD_ACCOUNT_NUMBER")
+	args := []string{"account", "list-devices", "-v"}
+	if acct != "" {
+		args = append(args, "--account", acct)
+	}
+	out, _ := shared.RunCmd(ctx, bin, args...)
 	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "Id") {
@@ -29,7 +36,11 @@ func revokeAllDevices(ctx context.Context) {
 			if len(parts) == 2 {
 				id := strings.TrimSpace(parts[1])
 				if id != "" {
-					quiet(ctx, "account", "revoke-device", id)
+					revokeArgs := []string{"account", "revoke-device", id}
+					if acct != "" {
+						revokeArgs = append(revokeArgs, "--account", acct)
+					}
+					shared.RunCmd(ctx, bin, revokeArgs...)
 				}
 			}
 		}
