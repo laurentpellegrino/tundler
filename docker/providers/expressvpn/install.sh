@@ -16,7 +16,7 @@ SYSTEMCTL_BAK="/usr/bin/systemctl.real"
 
 # Install runtime dependencies required by ExpressVPN v5
 apt-get update
-apt-get install -y procps psmisc libatomic1 libglib2.0-0 libbrotli1
+apt-get install -y procps psmisc libatomic1 libglib2.0-0 libbrotli1 libcap2-bin
 
 # Download & extract installer
 mkdir -p "$WORKDIR"
@@ -27,40 +27,39 @@ chmod +x "$FILENAME"
 
 # Manually install ExpressVPN files (the v5 multi_arch_installer.sh
 # refuses to run in headless Docker environments)
-SRCDIR="$WORKDIR/extracted/${ARCH}/expressvpnfiles"
+ARCHDIR="$WORKDIR/extracted/${ARCH}"
+SRCDIR="${ARCHDIR}/expressvpnfiles"
 
 if [[ ! -d "$SRCDIR" ]]; then
     echo "Expected directory not found: $SRCDIR"
-    echo "Contents of extracted:"
     ls -la "$WORKDIR/extracted/" || true
-    echo "Contents of extracted/${ARCH}:"
-    ls -la "$WORKDIR/extracted/${ARCH}/" || true
+    ls -la "$ARCHDIR/" || true
     exit 1
 fi
 
-cd "$SRCDIR"
-
 # Install main application to /opt/expressvpn
-mkdir -p /opt/expressvpn
-cp -dr bin lib plugins qml share /opt/expressvpn/
+cp -a "$SRCDIR" /opt/expressvpn
 
-# Symlink binaries into PATH
-for binary in /opt/expressvpn/bin/*; do
-    ln -sf "$binary" "/usr/bin/$(basename "$binary")"
-done
+# Create required runtime directories
+mkdir -p /opt/expressvpn/{etc,var}
 
-# Check for systemd service and sysusers files in the archive
-EXTRACT_ROOT="$WORKDIR/extracted"
-if find "$EXTRACT_ROOT" -name "expressvpn-service.service" -type f | head -1 | grep -q .; then
-    cp "$(find "$EXTRACT_ROOT" -name "expressvpn-service.service" -type f | head -1)" /usr/lib/systemd/system/
-fi
-if find "$EXTRACT_ROOT" -name "expressvpn.conf" -path "*/sysusers.d/*" -type f | head -1 | grep -q .; then
-    mkdir -p /usr/lib/sysusers.d
-    cp "$(find "$EXTRACT_ROOT" -name "expressvpn.conf" -path "*/sysusers.d/*" -type f | head -1)" /usr/lib/sysusers.d/
+# Set capabilities on unbound binary
+setcap 'cap_net_bind_service=+ep' /opt/expressvpn/bin/expressvpn-unbound
+
+# Install additional files from installfiles/
+if [[ -d "${ARCHDIR}/installfiles" ]]; then
+    cp "${ARCHDIR}/installfiles/error-notice.sh" /opt/expressvpn/bin/ 2>/dev/null || true
 fi
 
-# Create systemd service if not provided in the archive
-if [[ ! -f /usr/lib/systemd/system/expressvpn-service.service ]]; then
+# Symlink CLI binaries into PATH
+ln -sf /opt/expressvpn/bin/expressvpnctl /usr/bin/expressvpnctl
+ln -sf /opt/expressvpn/bin/expressvpn-client /usr/bin/expressvpn-client
+
+# Install systemd service from archive
+if [[ -f "${ARCHDIR}/installfiles/expressvpn-service.service" ]]; then
+    cp "${ARCHDIR}/installfiles/expressvpn-service.service" /usr/lib/systemd/system/
+else
+    # Fallback: create service manually
     cat > /usr/lib/systemd/system/expressvpn-service.service <<'EOF'
 [Unit]
 Description=ExpressVPN Daemon
@@ -76,11 +75,18 @@ WantedBy=multi-user.target
 EOF
 fi
 
+# Create expressvpn system groups
+mkdir -p /usr/lib/sysusers.d
+cat > /usr/lib/sysusers.d/expressvpn.conf <<'EOF'
+g expressvpn - - -
+g expressvpnhnsd - - -
+EOF
+
 # Temporarily stub out systemctl to prevent service start during build
 [[ -f $SYSTEMCTL_BAK ]] || { mv "$SYSTEMCTL" "$SYSTEMCTL_BAK"; ln -s /bin/true "$SYSTEMCTL"; }
 trap 'rm -f "$SYSTEMCTL"; mv "$SYSTEMCTL_BAK" "$SYSTEMCTL"' EXIT
 
-# Create expressvpn system user
+# Create system groups
 systemd-sysusers
 
 # Clean up extracted files
