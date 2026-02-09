@@ -52,4 +52,5 @@ docker run -it -d \
   -e SURFSHARK_PROTOCOL \
   -e SURFSHARK_WIREGUARD_PRIVATE_KEYS \
   -e TUNDLER_NETNS=vpnns \
+  -e TUNDLER_VPN_DNS \
   "$IMAGE_NAME"
