@@ -99,8 +99,10 @@ if [[ -n "$DOCKER_SUBNET" ]]; then
     ip netns exec "$NETNS" ip route add "$DOCKER_SUBNET" via "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
 fi
 # MASQUERADE forwarded proxy traffic entering vpnns so the VPN tunnel sees
-# its own client IP as source instead of the Docker bridge address
-ip netns exec "$NETNS" iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE 2>/dev/null || true
+# its own client IP as source instead of the Docker bridge address.
+# Match all interfaces except the veth pair to cover any VPN tunnel type
+# (tun0 for OpenVPN, wg0-mullvad for Mullvad, nordlynx for NordVPN, etc.)
+ip netns exec "$NETNS" iptables -t nat -A POSTROUTING ! -o "$NS_VETH" -j MASQUERADE 2>/dev/null || true
 
 # === API AND PROXY ACCESS PROTECTION ===
 # Insert rules at position 1 (highest priority) to allow external access to tundler ports
