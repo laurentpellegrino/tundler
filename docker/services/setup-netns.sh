@@ -75,20 +75,44 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 # This section ensures that traffic from Envoy proxy (port 8484) gets routed through the VPN
 # Create a custom routing table named "vpn" with ID 200 (if it doesn't already exist)
 echo "200 vpn" >> /etc/iproute2/rt_tables 2>/dev/null || true
-# Mark all TCP packets originating from port 8484 (Envoy proxy) with mark 200
-# This allows us to apply special routing rules to proxy traffic
-iptables -t mangle -A OUTPUT -p tcp --sport 8484 -j MARK --set-mark 200 2>/dev/null || true
+# Route all traffic from Envoy (uid=envoy) through the VPN, except DNS queries
+# which must use Docker DNS from the default namespace to resolve upstream hosts
+iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p udp --dport 53 -j RETURN 2>/dev/null || true
+iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p tcp --dport 53 -j RETURN 2>/dev/null || true
+iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -j MARK --set-mark 200 2>/dev/null || true
 # Create a policy routing rule: packets with mark 200 should use the "vpn" routing table
 ip rule add fwmark 200 table vpn 2>/dev/null || true
 # In the "vpn" routing table, set default route to go through the VPN namespace
 # This ensures proxy traffic gets routed through the VPN connection
 ip route add default via "$NS_IP" table vpn 2>/dev/null || true
+# Keep Docker bridge reachable in the vpn table so that reply packets
+# (SYN-ACK, etc.) from Envoy go back via eth0 instead of through the VPN
+DOCKER_SUBNET=$(ip -4 route show dev eth0 proto kernel 2>/dev/null | awk '{print $1; exit}')
+if [[ -n "$DOCKER_SUBNET" ]]; then
+    ip route add "$DOCKER_SUBNET" dev eth0 table vpn 2>/dev/null || true
+    # Route Docker subnet responses back through the veth pair inside vpnns.
+    # Without this, VPN split routes (0.0.0.0/1 + 128.0.0.0/1) would loop
+    # response packets back into the tunnel instead of returning them to Envoy.
+    ip netns exec "$NETNS" ip route add "$DOCKER_SUBNET" via "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
+fi
+# MASQUERADE forwarded proxy traffic entering vpnns so the VPN tunnel sees
+# its own client IP as source instead of the Docker bridge address
+ip netns exec "$NETNS" iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE 2>/dev/null || true
 
-# === API ACCESS PROTECTION ===
-# Insert rule at position 1 (highest priority) to allow tundler API access on port 4242
+# === API AND PROXY ACCESS PROTECTION ===
+# Insert rules at position 1 (highest priority) to allow external access to tundler ports
 # This is necessary because VPN providers may install iptables rules that block external access
-# Position 1 ensures this rule takes precedence over any VPN blocking rules
+# Position 1 ensures these rules take precedence over any VPN blocking rules
 iptables -I INPUT 1 -p tcp --dport 4242 -j ACCEPT 2>/dev/null || true
+iptables -I INPUT 1 -p tcp --dport 8484 -j ACCEPT 2>/dev/null || true
+
+# === DNS PROTECTION ===
+# VPN providers (e.g. ExpressVPN v5) overwrite /etc/resolv.conf with their
+# VPN-internal DNS servers that are only reachable from inside the tunnel.
+# Envoy runs in the default namespace and needs Docker DNS to resolve upstreams.
+# Solution: create a separate resolv.conf that VPN daemons bind-mount over
+# /etc/resolv.conf via systemd BindPaths, leaving the real file untouched.
+cp /etc/resolv.conf /etc/resolv.conf.vpnns 2>/dev/null || true
 
 # === VPN PROVIDER NAMESPACE CONFIGURATION ===
 # VPN provider systemd overrides are created during Docker build by each provider's configure.sh
@@ -105,11 +129,12 @@ if command -v envoy >/dev/null; then
     # This prevents race conditions where Envoy starts before routing is fully configured
     sleep 1
     
-    # Start Envoy proxy in the DEFAULT namespace (not VPN namespace)
+    # Start Envoy proxy as the 'envoy' user in the DEFAULT namespace
     # Key reasons for running in default namespace:
     # 1. Envoy listens on port 8484 for external connections from host
     # 2. Uses getaddrinfo DNS resolver which inherits system DNS automatically
-    # 3. Outbound connections are routed through VPN via policy routing (fwmark 200)
+    # 3. Outbound connections are routed through VPN via UID-based policy routing
     # 4. This setup allows external API access while routing proxy traffic through VPN
-    envoy -c /etc/envoy/envoy.yaml --log-level info &
+    # Running as 'envoy' user enables UID-based iptables matching for policy routing
+    su -s /bin/sh envoy -c "envoy -c /etc/envoy/envoy.yaml --log-level info &"
 fi
