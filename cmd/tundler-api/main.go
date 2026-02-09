@@ -91,8 +91,16 @@ func providerLocations(cfg *config.Config) map[string][]string {
 		if len(p.Locations) == 0 {
 			continue
 		}
-		valid := make(map[string]struct{})
-		for _, loc := range prov.Locations(ctx) {
+		// Some providers (e.g. ExpressVPN v5) only report locations
+		// when logged in. Skip validation and trust config locations
+		// when the provider cannot supply its location list yet.
+		known := prov.Locations(ctx)
+		if len(known) == 0 || !prov.LoggedIn(ctx) {
+			out[name] = append(out[name], p.Locations...)
+			continue
+		}
+		valid := make(map[string]struct{}, len(known))
+		for _, loc := range known {
 			valid[loc] = struct{}{}
 		}
 		for _, loc := range p.Locations {
