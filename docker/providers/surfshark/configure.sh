@@ -14,7 +14,7 @@ echo "Downloading Surfshark OpenVPN configurations..."
 curl -sL "$CONFIG_URL" -o "$TMP_ZIP"
 
 # Extract a sample .ovpn file to get CA and TLS-Auth key
-unzip -p "$TMP_ZIP" "$(unzip -l "$TMP_ZIP" | grep '\.ovpn$' | head -1 | awk '{print $4}')" > "$TMP_OVPN"
+unzip -p "$TMP_ZIP" "$(unzip -l "$TMP_ZIP" | awk '/\.ovpn$/{print $4; exit}')" > "$TMP_OVPN"
 
 # Extract CA certificate
 echo "Extracting CA certificate..."
