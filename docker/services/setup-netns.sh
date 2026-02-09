@@ -75,10 +75,13 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 # This section ensures that traffic from Envoy proxy (port 8484) gets routed through the VPN
 # Create a custom routing table named "vpn" with ID 200 (if it doesn't already exist)
 echo "200 vpn" >> /etc/iproute2/rt_tables 2>/dev/null || true
-# Route all traffic from Envoy (uid=envoy) through the VPN, except DNS queries
-# which must use Docker DNS from the default namespace to resolve upstream hosts
-iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p udp --dport 53 -j RETURN 2>/dev/null || true
-iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p tcp --dport 53 -j RETURN 2>/dev/null || true
+# Route all traffic from Envoy (uid=envoy) through the VPN.
+# By default, DNS queries are exempt and resolved via Docker DNS for lower latency.
+# Set TUNDLER_VPN_DNS=true to also route DNS through the VPN tunnel for full privacy.
+if [[ "${TUNDLER_VPN_DNS:-false}" != "true" ]]; then
+    iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p udp --dport 53 -j RETURN 2>/dev/null || true
+    iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -p tcp --dport 53 -j RETURN 2>/dev/null || true
+fi
 iptables -t mangle -A OUTPUT -m owner --uid-owner envoy -j MARK --set-mark 200 2>/dev/null || true
 # Create a policy routing rule: packets with mark 200 should use the "vpn" routing table
 ip rule add fwmark 200 table vpn 2>/dev/null || true
