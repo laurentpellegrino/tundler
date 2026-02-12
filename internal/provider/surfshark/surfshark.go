@@ -173,10 +173,12 @@ func connectOpenVPN(ctx context.Context, server *Server) error {
 	}
 
 	// Generate OpenVPN config
+	// Use UDP to avoid TCP-over-TCP meltdown (retransmission cascades
+	// causing TLS handshake timeouts under high concurrency)
 	config := fmt.Sprintf(`client
 dev tun
-proto tcp
-remote %s 1443
+proto udp
+remote %s 1194
 remote-random
 nobind
 tun-mtu 1500
