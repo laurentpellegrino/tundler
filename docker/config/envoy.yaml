@@ -38,7 +38,7 @@ static_resources:
                 name: dynamic_forward_proxy_cache_config
                 dns_lookup_family: ALL
                 max_hosts: 1024
-                host_ttl: 60s
+                host_ttl: 300s
                 dns_refresh_rate: 60s
                 dns_failure_refresh_rate:
                   base_interval: 1s
@@ -91,7 +91,7 @@ static_resources:
           name: dynamic_forward_proxy_cache_config
           dns_lookup_family: ALL
           max_hosts: 1024
-          host_ttl: 60s
+          host_ttl: 300s
           dns_refresh_rate: 60s
           dns_failure_refresh_rate:
             base_interval: 1s
