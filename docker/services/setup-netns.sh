@@ -103,6 +103,11 @@ fi
 # Match all interfaces except the veth pair to cover any VPN tunnel type
 # (tun0 for OpenVPN, wg0-mullvad for Mullvad, nordlynx for NordVPN, etc.)
 ip netns exec "$NETNS" iptables -t nat -A POSTROUTING ! -o "$NS_VETH" -j MASQUERADE 2>/dev/null || true
+# Clamp TCP MSS to the path MTU on forwarded traffic entering the VPN namespace.
+# VPN tunnels (tun/wg) have a lower MTU than the veth pair (1500). Without this,
+# TCP SYN packets advertise an MSS too large for the tunnel, causing oversized
+# segments to be silently dropped — resulting in TLS handshake failures.
+ip netns exec "$NETNS" iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 # === API AND PROXY ACCESS PROTECTION ===
 # Insert rules at position 1 (highest priority) to allow external access to tundler ports
