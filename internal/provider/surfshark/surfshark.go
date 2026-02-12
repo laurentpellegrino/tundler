@@ -406,7 +406,7 @@ func (s Surfshark) Status(ctx context.Context) provider.Status {
 	}
 
 	// Get VPN IP (quick timeout)
-	if out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "2", "https://checkip.amazonaws.com/"); err == nil {
+	if out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "2", "https://icanhazip.com"); err == nil {
 		status.IP = strings.TrimSpace(out)
 	}
 
