@@ -6,6 +6,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 IMAGE_NAME="tundler"
 NO_CACHE=false
 QUICK=false
+PUSH=false
 BUILD_ARGS=()
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 CONTEXT_DIR="$SCRIPT_DIR/.."
@@ -18,6 +19,7 @@ Options:
   -t, --tag <name[:tag]>   Image tag/name (default: ${IMAGE_NAME})
       --no-cache           Build without cache
   -q, --quick              Quick rebuild: build binary locally and copy to running container
+      --push               Push image to Docker Hub after build
       --build-arg KEY=VAL  Pass build-arg (repeatable)
   -f, --file <Dockerfile>  Dockerfile path (default: docker/Dockerfile)
   -C, --context <dir>      Build context directory (default: repo root)
@@ -36,6 +38,8 @@ while [[ $# -gt 0 ]]; do
       IMAGE_NAME="$2"; shift 2;;
     --no-cache)
       NO_CACHE=true; shift;;
+    --push)
+      PUSH=true; shift;;
     -q|--quick)
       QUICK=true; shift;;
     --build-arg)
@@ -109,3 +113,12 @@ fi
 docker build "${ARGS[@]}" .
 
 echo "[build.sh] Done. Image built: $IMAGE_NAME"
+
+if [[ "$PUSH" == true ]]; then
+  DOCKER_HUB_IMAGE="laurentpellegrino/tundler"
+  echo "[build.sh] Tagging image as $DOCKER_HUB_IMAGE"
+  docker tag "$IMAGE_NAME" "$DOCKER_HUB_IMAGE"
+  echo "[build.sh] Pushing image: $DOCKER_HUB_IMAGE"
+  docker push "$DOCKER_HUB_IMAGE"
+  echo "[build.sh] Push complete."
+fi
