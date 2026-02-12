@@ -37,12 +37,26 @@ static_resources:
               dns_cache_config:
                 name: dynamic_forward_proxy_cache_config
                 dns_lookup_family: ALL
-                max_hosts: 100
-                host_ttl: 30s
+                max_hosts: 1024
+                host_ttl: 60s
+                dns_refresh_rate: 60s
+                dns_failure_refresh_rate:
+                  base_interval: 1s
+                  max_interval: 10s
                 typed_dns_resolver_config:
-                  name: envoy.network.dns_resolver.getaddrinfo
+                  name: envoy.network.dns_resolver.cares
                   typed_config:
-                    "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.getaddrinfo.v3.GetAddrInfoDnsResolverConfig
+                    "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+                    resolvers:
+                    - socket_address:
+                        address: "1.1.1.1"
+                        port_value: 53
+                    - socket_address:
+                        address: "1.0.0.1"
+                        port_value: 53
+                    dns_resolver_options:
+                      use_tcp_for_dns_lookups: false
+                      no_default_search_domain: true
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -76,12 +90,26 @@ static_resources:
         dns_cache_config:
           name: dynamic_forward_proxy_cache_config
           dns_lookup_family: ALL
-          max_hosts: 100
-          host_ttl: 30s
+          max_hosts: 1024
+          host_ttl: 60s
+          dns_refresh_rate: 60s
+          dns_failure_refresh_rate:
+            base_interval: 1s
+            max_interval: 10s
           typed_dns_resolver_config:
-            name: envoy.network.dns_resolver.getaddrinfo
+            name: envoy.network.dns_resolver.cares
             typed_config:
-              "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.getaddrinfo.v3.GetAddrInfoDnsResolverConfig
+              "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+              resolvers:
+              - socket_address:
+                  address: "1.1.1.1"
+                  port_value: 53
+              - socket_address:
+                  address: "1.0.0.1"
+                  port_value: 53
+              dns_resolver_options:
+                use_tcp_for_dns_lookups: false
+                no_default_search_domain: true
 
 overload_manager:
   refresh_interval: 0.25s
