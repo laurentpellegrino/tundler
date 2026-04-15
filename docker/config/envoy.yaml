@@ -80,9 +80,9 @@ static_resources:
         value: 0
     upstream_connection_options:
       tcp_keepalive:
-        keepalive_probes: 1
-        keepalive_time: 1
-        keepalive_interval: 1
+        keepalive_probes: 2
+        keepalive_time: 10
+        keepalive_interval: 3
     cluster_type:
       name: envoy.clusters.dynamic_forward_proxy
       typed_config:
