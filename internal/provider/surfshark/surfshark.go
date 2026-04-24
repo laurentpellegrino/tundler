@@ -42,6 +42,16 @@ var (
 
 func init() { provider.Registry[name] = Surfshark{} }
 
+func activeRegion() string {
+	if activeServer == nil {
+		return ""
+	}
+	if activeServer.Region != "" {
+		return activeServer.Region
+	}
+	return activeServer.Country
+}
+
 // fetchServers retrieves server list from API or cache
 func fetchServers(ctx context.Context) ([]Server, error) {
 	serverCacheMu.RLock()
@@ -402,6 +412,7 @@ func (s Surfshark) Status(ctx context.Context) provider.Status {
 	status := provider.Status{
 		Connected: true,
 		Location:  s.ActiveLocation(ctx),
+		Region:    activeRegion(),
 		Provider:  name,
 	}
 

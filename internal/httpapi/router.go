@@ -9,10 +9,11 @@ import (
 	"strings"
 
 	"github.com/laurentpellegrino/tundler/internal/manager"
+	"github.com/laurentpellegrino/tundler/internal/plugin"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
 
-func Router(mgr *manager.Manager) *http.ServeMux {
+func Router(mgr *manager.Manager, plugins *plugin.Manager) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +67,18 @@ func Router(mgr *manager.Manager) *http.ServeMux {
 		}
 		writeJSON(w, st)
 	})
+
+	mux.HandleFunc("/plugins", func(w http.ResponseWriter, _ *http.Request) {
+		if plugins == nil {
+			writeJSON(w, map[string]any{"plugins": []plugin.Metadata{}})
+			return
+		}
+		writeJSON(w, map[string]any{"plugins": plugins.List()})
+	})
+
+	if plugins != nil {
+		plugins.Mount(mux)
+	}
 	return mux
 }
 

@@ -189,6 +189,7 @@ func (m Mullvad) Status(ctx context.Context) provider.Status {
 		Connected: true,
 		IP:        ip,
 		Location:  m.ActiveLocation(ctx),
+		Region:    m.ActiveLocation(ctx),
 		Provider:  name,
 	}
 }
