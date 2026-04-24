@@ -74,6 +74,16 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 
 	shared.Debugf("[manager] connect %s location=%s", providerName, location)
 	status := p.Connect(ctx, location)
+	// Stamp the attempted provider/location onto every returned Status,
+	// including failures. Without this, clients observing a connect that
+	// returned Connected=false see {provider: "", location: ""} and have
+	// no way to tell which provider is misbehaving.
+	if status.Provider == "" {
+		status.Provider = providerName
+	}
+	if status.Location == "" {
+		status.Location = location
+	}
 	if status.Connected {
 		telemetry.TrackConnect(providerName, location, status.IP)
 		if m.plugins != nil {
