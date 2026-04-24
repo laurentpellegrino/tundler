@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/plugin"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 	"github.com/laurentpellegrino/tundler/internal/telemetry"
@@ -17,12 +18,13 @@ import (
 
 type Manager struct {
 	locations map[string][]string
+	plugins   *plugin.Manager
 	providers map[string]provider.VPNProvider
 }
 
-func New(debug bool, locs map[string][]string) *Manager {
+func New(debug bool, locs map[string][]string, plugins *plugin.Manager) *Manager {
 	shared.SetDebug(debug)
-	return &Manager{locations: locs, providers: provider.Registry}
+	return &Manager{locations: locs, plugins: plugins, providers: provider.Registry}
 }
 
 // -----------------------------------------------------------------------------
@@ -34,7 +36,11 @@ func New(debug bool, locs map[string][]string) *Manager {
 //   - a random logged-in provider. Empty strings mean “unspecified”.
 func (m *Manager) Connect(ctx context.Context, providerName, location string) (provider.Status, error) {
 	if _, p := m.connectedProvider(ctx); p != nil { // disconnect current tunnel
+		st := p.Status(ctx)
 		_ = p.Disconnect(ctx)
+		if m.plugins != nil && st.Connected {
+			m.plugins.Emit(ctx, "disconnected", st.Provider, st.Location, statusRegion(st), st.IP)
+		}
 	}
 
 	var p provider.VPNProvider
@@ -70,6 +76,9 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 	status := p.Connect(ctx, location)
 	if status.Connected {
 		telemetry.TrackConnect(providerName, location, status.IP)
+		if m.plugins != nil {
+			m.plugins.Emit(ctx, "connected", providerName, location, statusRegion(status), status.IP)
+		}
 	}
 	return status, nil
 }
@@ -78,7 +87,14 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 func (m *Manager) Disconnect(ctx context.Context) error {
 	if _, p := m.connectedProvider(ctx); p != nil {
 		shared.Debugf("[manager] disconnect")
-		return p.Disconnect(ctx)
+		st := p.Status(ctx)
+		if err := p.Disconnect(ctx); err != nil {
+			return err
+		}
+		if m.plugins != nil && st.Connected {
+			m.plugins.Emit(ctx, "disconnected", st.Provider, st.Location, statusRegion(st), st.IP)
+		}
+		return nil
 	}
 	return nil
 }
@@ -247,4 +263,11 @@ func (m *Manager) providerInfos(ctx context.Context) map[string]map[string]any {
 		}
 	}
 	return out
+}
+
+func statusRegion(st provider.Status) string {
+	if st.Region != "" {
+		return st.Region
+	}
+	return st.Location
 }

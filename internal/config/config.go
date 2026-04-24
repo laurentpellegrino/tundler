@@ -16,6 +16,7 @@ type Config struct {
 	Debug     bool
 	Telemetry bool
 	Providers map[string]Provider
+	Plugins   []string
 }
 
 // Load reads a very small subset of YAML from path. Missing file yields an empty configuration.
@@ -30,6 +31,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{Providers: map[string]Provider{}}
 	var current string
+	var inPlugins bool
 	var inLocations bool
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	for sc.Scan() {
@@ -41,15 +43,23 @@ func Load(path string) (*Config, error) {
 		case strings.HasPrefix(line, "debug:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "debug:"))
 			cfg.Debug = val == "true"
+			inPlugins = false
 		case strings.HasPrefix(line, "telemetry:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "telemetry:"))
 			cfg.Telemetry = val == "true"
+			inPlugins = false
 		case strings.HasPrefix(line, "providers:"):
-			// no-op
+			inPlugins = false
+		case strings.HasPrefix(line, "plugins:"):
+			inPlugins = true
+			inLocations = false
 		case strings.HasPrefix(line, "- ") && strings.HasSuffix(line, ":"):
 			current = strings.TrimSuffix(strings.TrimPrefix(line, "- "), ":")
 			cfg.Providers[current] = Provider{}
+			inPlugins = false
 			inLocations = false
+		case inPlugins && strings.HasPrefix(line, "- "):
+			cfg.Plugins = append(cfg.Plugins, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
 		case strings.HasPrefix(line, "locations:"):
 			inLocations = true
 		case inLocations && strings.HasPrefix(line, "- "):

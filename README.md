@@ -13,6 +13,7 @@ to minimise breakage and remains stateless on its own.
 - Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
+- Sidecar plugins can add non-core API features under `/plugins/...`.
 
 ## Architecture
 
@@ -156,6 +157,8 @@ When present, `~/.config/tundler/tundler.yaml` is read at startup:
 ```yaml
 debug: true
 telemetry: false
+plugins:
+  - vpnipobserver
 providers:
   - nordvpn:
       locations:
@@ -165,6 +168,7 @@ providers:
 
 - `debug` enables verbose logging and may also be set with `-d/--debug`.
 - `telemetry` enables anonymous usage statistics (disabled by default). Collects provider, location, and VPN IP (the IP assigned by the VPN, not your real IP). May also be set with `--telemetry`.
+- `plugins` enables specific sidecar plugins. When omitted, every compiled-in plugin is enabled.
 - `providers.<name>.locations` restricts the random locations used when `location` is omitted in API calls.
 - `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
 
@@ -178,7 +182,16 @@ providers:
 | `/locations`  | GET    | –                                     | List available locations for logged in providers    |
 | `/login`      | POST   | `providers` *(optional)*              | Login comma-separated providers or all when omitted |
 | `/logout`     | POST   | `providers` *(optional)*              | Logout listed providers, or all if empty            |
+| `/plugins`    | GET    | –                                     | List enabled sidecar plugins with `id` and `name`   |
 | `/status`     | GET    | –                                     | Return tunnel state, IP and provider in use         |
+
+Compiled plugins are mounted below `/plugins/<id>/...`.
+
+The built-in `vpnipobserver` plugin exposes:
+
+| Endpoint                         | Method | Description                                                   |
+|----------------------------------|--------|---------------------------------------------------------------|
+| `/plugins/vpnipobserver/ips`     | GET    | List VPN IPs with last-seen timestamp plus provider/region data |
 
 ## Extending Tundler
 
@@ -192,6 +205,27 @@ import _ "github.com/laurentpellegrino/tundler/internal/provider/<your_provider>
 ```
 
 5. Document new environment variables in this README.
+
+## Injecting Sidecar Plugins
+
+Provider integrations remain the core extension point for tunnel control. If you
+need extra features that should not affect that core API, add a plugin instead:
+
+1. Create `internal/plugin/<your_plugin>`.
+2. Implement the `internal/plugin`.Plugin interface.
+3. Register it in `init()` by adding it to `plugin.Registry`.
+4. Add a blank import in `internal/plugin/register/register.go`.
+
+Plugins are isolated in two ways:
+
+- They only receive tunnel lifecycle events after Tundler has already connected or disconnected.
+- Their HTTP handlers live under `/plugins/<id>/...`, separate from the main API.
+
+Plugin metadata and events:
+
+- Every plugin must expose a stable `id` and a human-readable `name`.
+- Plugins receive `connected` and `disconnected` events.
+- Event payloads include `provider`, `location`, `region` when available, `ip`, and `timestamp`.
 
 ## Contributing
 

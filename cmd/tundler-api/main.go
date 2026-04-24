@@ -14,6 +14,8 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/config"
 	"github.com/laurentpellegrino/tundler/internal/httpapi"
 	"github.com/laurentpellegrino/tundler/internal/manager"
+	"github.com/laurentpellegrino/tundler/internal/plugin"
+	_ "github.com/laurentpellegrino/tundler/internal/plugin/register"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
 	"github.com/laurentpellegrino/tundler/internal/telemetry"
@@ -45,7 +47,11 @@ func main() {
 	flag.Parse()
 
 	telemetry.SetEnabled(enableTelemetry)
-	mgr := manager.New(debug, providerLocations(cfg))
+	pluginManager, err := plugin.New(cfg.Plugins)
+	if err != nil {
+		log.Fatalf("cannot load plugins: %v", err)
+	}
+	mgr := manager.New(debug, providerLocations(cfg), pluginManager)
 
 	if *login != "" {
 		ctx := context.Background()
@@ -66,7 +72,7 @@ func main() {
 		}
 	}
 
-	mux := httpapi.Router(mgr)
+	mux := httpapi.Router(mgr, pluginManager)
 	addr := fmt.Sprintf(":%s", *port)
 
 	srv := &http.Server{
