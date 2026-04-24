@@ -88,16 +88,41 @@ ip rule add fwmark 200 table vpn 2>/dev/null || true
 # In the "vpn" routing table, set default route to go through the VPN namespace
 # This ensures proxy traffic gets routed through the VPN connection
 ip route add default via "$NS_IP" table vpn 2>/dev/null || true
-# Keep Docker bridge reachable in the vpn table so that reply packets
-# (SYN-ACK, etc.) from Envoy go back via eth0 instead of through the VPN
-DOCKER_SUBNET=$(ip -4 route show dev eth0 proto kernel 2>/dev/null | awk '{print $1; exit}')
-if [[ -n "$DOCKER_SUBNET" ]]; then
-    ip route add "$DOCKER_SUBNET" dev eth0 table vpn 2>/dev/null || true
-    # Route Docker subnet responses back through the veth pair inside vpnns.
-    # Without this, VPN split routes (0.0.0.0/1 + 128.0.0.0/1) would loop
-    # response packets back into the tunnel instead of returning them to Envoy.
-    ip netns exec "$NETNS" ip route add "$DOCKER_SUBNET" via "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
-fi
+# Keep eth0-reachable destinations from being swallowed by the VPN split
+# routes. Without this, response packets (SYN-ACK, etc.) get looped back
+# into the VPN tunnel instead of returning to Envoy in the default namespace.
+#
+# Three possible shapes for eth0's routing, depending on the container runtime:
+#
+#   * Docker bridge:
+#       172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.X
+#     -> use the subnet as-is (1 route covers everything including the gateway).
+#
+#   * Kubernetes with CNIs that give the pod a /32 IP (Calico, Cilium, etc.):
+#       default via 10.0.156.250 dev eth0 mtu 1370
+#       10.0.156.250 dev eth0 scope link
+#     -> no "proto kernel" route; must pick up the "scope link" gateway AND
+#        the pod's own /32 address separately.
+#
+#   * Classic /24 or similar on eth0 without a kernel route:
+#     -> covered by the "scope link" detection.
+eth0_reachable=()
+eth0_kernel=$(ip -4 route show dev eth0 proto kernel 2>/dev/null | awk '{print $1; exit}')
+[[ -n "$eth0_kernel" ]] && eth0_reachable+=("$eth0_kernel")
+eth0_link=$(ip -4 route show dev eth0 scope link 2>/dev/null | awk '{print $1; exit}')
+[[ -n "$eth0_link" ]] && eth0_reachable+=("$eth0_link")
+eth0_self=$(ip -4 addr show dev eth0 2>/dev/null | awk '/inet / {print $2; exit}')
+[[ -n "$eth0_self" ]] && eth0_reachable+=("$eth0_self")
+
+for addr in "${eth0_reachable[@]}"; do
+    # Envoy's outbound packets to these destinations should still egress via
+    # eth0, not the VPN (used for e.g. envoy reaching the pod's own IP stack).
+    ip route add "$addr" dev eth0 table vpn 2>/dev/null || true
+    # Reply packets arriving through the VPN tunnel and NAT-reversed back to
+    # the pod's eth0 must exit vpnns via the veth pair, not be re-routed into
+    # the tunnel by the VPN provider's 0.0.0.0/1+128.0.0.0/1 split routes.
+    ip netns exec "$NETNS" ip route add "$addr" via "$HOST_IP" dev "$NS_VETH" 2>/dev/null || true
+done
 # MASQUERADE forwarded proxy traffic entering vpnns so the VPN tunnel sees
 # its own client IP as source instead of the Docker bridge address.
 # Match all interfaces except the veth pair to cover any VPN tunnel type
