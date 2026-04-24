@@ -172,6 +172,7 @@ func (p PIA) Status(ctx context.Context) provider.Status {
 
 	if connected {
 		status.Location = p.ActiveLocation(ctx)
+		status.Region = status.Location
 
 		if out, err := shared.RunCmd(ctx, bin, "get", "vpnip"); err == nil {
 			status.IP = shared.FirstIPv4(out)
