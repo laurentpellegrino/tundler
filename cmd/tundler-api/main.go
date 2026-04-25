@@ -51,7 +51,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("cannot load plugins: %v", err)
 	}
-	mgr := manager.New(debug, providerLocations(cfg), pluginManager)
+	mgr := manager.New(debug, providerFilters(cfg), pluginManager)
 
 	if *login != "" {
 		ctx := context.Background()
@@ -85,37 +85,49 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func providerLocations(cfg *config.Config) map[string][]string {
+func providerFilters(cfg *config.Config) map[string]manager.LocationFilter {
 	ctx := context.Background()
-	out := make(map[string][]string, len(cfg.Providers))
+	out := make(map[string]manager.LocationFilter, len(cfg.Providers))
 	for name, p := range cfg.Providers {
 		prov, ok := provider.Registry[name]
 		if !ok {
 			log.Printf("[config] unknown provider %q ignored", name)
 			continue
 		}
-		if len(p.Locations) == 0 {
+		if len(p.Locations.Allow) == 0 && len(p.Locations.Block) == 0 {
 			continue
 		}
 		// Some providers (e.g. ExpressVPN v5) only report locations
-		// when logged in. Skip validation and trust config locations
-		// when the provider cannot supply its location list yet.
+		// when logged in. Skip validation and trust the config when the
+		// provider cannot supply its location list yet.
 		known := prov.Locations(ctx)
 		if len(known) == 0 || !prov.LoggedIn(ctx) {
-			out[name] = append(out[name], p.Locations...)
+			out[name] = manager.LocationFilter{
+				Allow: append([]string(nil), p.Locations.Allow...),
+				Block: append([]string(nil), p.Locations.Block...),
+			}
 			continue
 		}
 		valid := make(map[string]struct{}, len(known))
 		for _, loc := range known {
 			valid[loc] = struct{}{}
 		}
-		for _, loc := range p.Locations {
+		var f manager.LocationFilter
+		for _, loc := range p.Locations.Allow {
 			if _, ok := valid[loc]; ok {
-				out[name] = append(out[name], loc)
+				f.Allow = append(f.Allow, loc)
 			} else {
-				log.Printf("[config] provider %s: unknown location %s ignored", name, loc)
+				log.Printf("[config] provider %s: unknown allow location %s ignored", name, loc)
 			}
 		}
+		for _, loc := range p.Locations.Block {
+			if _, ok := valid[loc]; ok {
+				f.Block = append(f.Block, loc)
+			} else {
+				log.Printf("[config] provider %s: unknown block location %s ignored", name, loc)
+			}
+		}
+		out[name] = f
 	}
 	return out
 }

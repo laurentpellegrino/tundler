@@ -28,4 +28,7 @@ var (
 
 	ErrUnknownProvider = New("UNKNOWN_PROVIDER",
 		"Unknown VPN provider", http.StatusBadRequest) // 400
+
+	ErrNoEligibleLocations = New("NO_ELIGIBLE_LOCATIONS",
+		"No locations remain after applying the configured allow and block lists.", http.StatusBadRequest) // 400
 )

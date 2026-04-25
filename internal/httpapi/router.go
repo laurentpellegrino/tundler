@@ -41,9 +41,11 @@ func Router(mgr *manager.Manager, plugins *plugin.Manager) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/connect", func(w http.ResponseWriter, r *http.Request) {
-		prov := pickRandom(parseCSV(r.URL.Query().Get("providers")))
-		loc := pickRandom(parseCSV(r.URL.Query().Get("locations")))
-		st, err := mgr.Connect(r.Context(), prov, loc)
+		q := r.URL.Query()
+		prov := pickRandom(parseCSV(q.Get("providers")))
+		allow := parseCSV(q.Get("locations.allow"))
+		block := parseCSV(q.Get("locations.block"))
+		st, err := mgr.Connect(r.Context(), prov, "", allow, block)
 		if err != nil {
 			writeErr(w, err)
 			return
