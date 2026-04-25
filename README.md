@@ -9,7 +9,7 @@ to minimise breakage and remains stateless on its own.
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
-- ExpressVPN, Mullvad, NordVPN, Private Internet Access (PIA) and Surfshark support out of the box.
+- ExpressVPN, Mullvad, NordVPN, Private Internet Access (PIA), Proton VPN and Surfshark support out of the box.
 - Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
@@ -111,6 +111,8 @@ MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
 PRIVATEINTERNETACCESS_USERNAME=<username> \
 PRIVATEINTERNETACCESS_PASSWORD=<password> \
+PROTON_OPENVPN_USERNAME=<username> \
+PROTON_OPENVPN_PASSWORD=<password> \
 SURFSHARK_OPENVPN_USERNAME=<username> \
 SURFSHARK_OPENVPN_PASSWORD=<password> \
 docker/run.sh
@@ -141,8 +143,17 @@ remain reachable even when the VPN changes routing.
 | Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
 | NordVPN                       | `NORDVPN_TOKEN`                                                    |
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
+| Proton VPN (OpenVPN)          | `PROTON_OPENVPN_USERNAME`, `PROTON_OPENVPN_PASSWORD`               |
 | Surfshark (OpenVPN)           | `SURFSHARK_OPENVPN_USERNAME`, `SURFSHARK_OPENVPN_PASSWORD`         |
 | Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_PRIVATE_KEYS`, `SURFSHARK_PROTOCOL=wireguard` |
+
+Proton VPN uses the OpenVPN/IKEv2 credentials from your Proton account page,
+not your regular Proton account password. Tundler automatically downloads
+Proton server metadata during container configuration and generates the
+OpenVPN profile at connection time. Optional settings:
+`PROTON_OPENVPN_PROTOCOL=udp|tcp` (default `udp`) and `PROTON_OPENVPN_PORT`
+(defaults to `1194` for UDP and `443` for TCP). `PROTON_SERVERS_URL` may be
+set to override the server metadata source.
 
 ##### Tundler options
 
