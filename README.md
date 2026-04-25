@@ -173,22 +173,28 @@ plugins:
 providers:
   - nordvpn:
       locations:
-        - France
-        - Germany
+        allow:
+          - France
+          - Germany
+        block:
+          - United_States
 ```
 
 - `debug` enables verbose logging and may also be set with `-d/--debug`.
 - `telemetry` enables anonymous usage statistics (disabled by default). Collects provider, location, and VPN IP (the IP assigned by the VPN, not your real IP). May also be set with `--telemetry`.
 - `plugins` enables specific sidecar plugins. When omitted, every compiled-in plugin is enabled.
-- `providers.<name>.locations` restricts the random locations used when `location` is omitted in API calls.
+- `providers.<name>.locations.allow` restricts the random locations used when `location` is omitted in API calls. When empty, the provider's full location list is used.
+- `providers.<name>.locations.block` removes locations from the candidate pool (the `allow` list above, or the provider's full list when `allow` is empty).
 - `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
+
+> The previous flat `locations: [France, Germany]` form is no longer accepted; migrate to `locations.allow:`.
 
 ## REST API
 
 | Endpoint      | Method | Query params                          | Description                                         |
 |---------------|--------|---------------------------------------|-----------------------------------------------------|
 | `/`           | GET    | –                                     | List providers and login state                      |
-| `/connect`    | POST   | `locations`, `providers` *(optional)* | Connect to a random location/provider from the list |
+| `/connect`    | POST   | `locations.allow`, `locations.block`, `providers` *(optional)* | Connect to a random location/provider from the allow set, minus the block set |
 | `/disconnect` | POST   | –                                     | Tear down the current tunnel                        |
 | `/locations`  | GET    | –                                     | List available locations for logged in providers    |
 | `/login`      | POST   | `providers` *(optional)*              | Login comma-separated providers or all when omitted |

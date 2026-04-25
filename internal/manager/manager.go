@@ -16,15 +16,24 @@ import (
 // Manager (stateless)
 // -----------------------------------------------------------------------------
 
+// LocationFilter is the per-provider allow/block policy applied to random
+// location selection. Allow narrows the candidate pool (empty means "use the
+// provider's full list"); Block subtracts entries from whatever pool was
+// chosen.
+type LocationFilter struct {
+	Allow []string
+	Block []string
+}
+
 type Manager struct {
-	locations map[string][]string
+	filters   map[string]LocationFilter
 	plugins   *plugin.Manager
 	providers map[string]provider.VPNProvider
 }
 
-func New(debug bool, locs map[string][]string, plugins *plugin.Manager) *Manager {
+func New(debug bool, filters map[string]LocationFilter, plugins *plugin.Manager) *Manager {
 	shared.SetDebug(debug)
-	return &Manager{locations: locs, plugins: plugins, providers: provider.Registry}
+	return &Manager{filters: filters, plugins: plugins, providers: provider.Registry}
 }
 
 // -----------------------------------------------------------------------------
@@ -34,7 +43,16 @@ func New(debug bool, locs map[string][]string, plugins *plugin.Manager) *Manager
 // Connect tears down any active tunnel, then connects via:
 //   - the requested *provider* (when non-empty) with optional *location*, or
 //   - a random logged-in provider. Empty strings mean “unspecified”.
-func (m *Manager) Connect(ctx context.Context, providerName, location string) (provider.Status, error) {
+//
+// allowLocations and blockLocations are per-request lists used only when
+// location is empty:
+//   - allowLocations, if non-empty, replaces the configured allow list as
+//     the candidate pool (request beats config).
+//   - blockLocations is unioned with the configured block list and
+//     subtracted from whichever candidate pool is in effect.
+//
+// When location is non-empty (explicit pin) both lists are ignored.
+func (m *Manager) Connect(ctx context.Context, providerName, location string, allowLocations, blockLocations []string) (provider.Status, error) {
 	if _, p := m.connectedProvider(ctx); p != nil { // disconnect current tunnel
 		st := p.Status(ctx)
 		_ = p.Disconnect(ctx)
@@ -62,14 +80,28 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string) (p
 	}
 
 	if location == "" {
-		locs := m.locations[providerName]
-		if len(locs) == 0 {
+		f := m.filters[providerName]
+		var locs []string
+		switch {
+		case len(allowLocations) > 0:
+			locs = allowLocations
+		case len(f.Allow) > 0:
+			locs = f.Allow
+		default:
 			locs = p.Locations(ctx)
 		}
+		hasFilter := len(allowLocations) > 0 || len(f.Allow) > 0 ||
+			len(f.Block) > 0 || len(blockLocations) > 0
+		locs = filterOut(locs, f.Block)
+		locs = filterOut(locs, blockLocations)
 		if len(locs) > 0 {
 			r := rand.New(rand.NewSource(time.Now().UnixNano()))
 			location = locs[r.Intn(len(locs))]
+		} else if hasFilter {
+			return provider.Status{Provider: providerName}, shared.ErrNoEligibleLocations
 		}
+		// else: no filter configured and nothing to enumerate — fall through
+		// with location="" so the provider can pick its own default.
 	}
 
 	shared.Debugf("[manager] connect %s location=%s", providerName, location)
@@ -280,4 +312,24 @@ func statusRegion(st provider.Status) string {
 		return st.Region
 	}
 	return st.Location
+}
+
+// filterOut returns the entries of in that are not present in blocked.
+// Comparison is exact (case-sensitive) to match how configured allow lists
+// are validated against provider-supplied location names.
+func filterOut(in, blocked []string) []string {
+	if len(blocked) == 0 || len(in) == 0 {
+		return in
+	}
+	deny := make(map[string]struct{}, len(blocked))
+	for _, b := range blocked {
+		deny[b] = struct{}{}
+	}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, bad := deny[v]; !bad {
+			out = append(out, v)
+		}
+	}
+	return out
 }
