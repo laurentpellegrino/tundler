@@ -117,6 +117,12 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string, al
 		status.Location = location
 	}
 	if status.Connected {
+		// Lower the tunnel interface MTU when the underlay (pod eth0)
+		// is smaller than the provider assumed — fixes nordlynx/wg
+		// black-holing under Kubernetes CNIs that add encapsulation
+		// overhead (Calico IP-in-IP, Cilium VXLAN, etc.). No-op when
+		// the underlay is 1500 bytes, so plain Docker is unaffected.
+		clampTunnelMTUIfNeeded(ctx)
 		telemetry.TrackConnect(providerName, location, status.IP)
 		if m.plugins != nil {
 			m.plugins.Emit(ctx, "connected", providerName, location, statusRegion(status), status.IP)
