@@ -72,6 +72,13 @@ func main() {
 		}
 	}
 
+	// Self-restart on sustained provider wedge. Complements the /livez
+	// probe (which keeps kubelet from SIGKILLing on transient CLI
+	// slowness): a provider whose status query times out for 5+ minutes
+	// straight is judged broken, and tundler exits so kubelet recreates
+	// the container with fresh daemons.
+	mgr.StartWatchdog(context.Background())
+
 	mux := httpapi.Router(mgr, pluginManager)
 	addr := fmt.Sprintf(":%s", *port)
 
