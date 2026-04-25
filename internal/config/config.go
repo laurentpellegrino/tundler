@@ -4,12 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"log"
 	"os"
 	"strings"
 )
 
+type LocationFilter struct {
+	Allow []string
+	Block []string
+}
+
 type Provider struct {
-	Locations []string
+	Locations LocationFilter
 }
 
 type Config struct {
@@ -32,7 +38,15 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{Providers: map[string]Provider{}}
 	var current string
 	var inPlugins bool
-	var inLocations bool
+	var inLocations, inAllow, inBlock bool
+
+	resetSections := func() {
+		inPlugins = false
+		inLocations = false
+		inAllow = false
+		inBlock = false
+	}
+
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -43,30 +57,46 @@ func Load(path string) (*Config, error) {
 		case strings.HasPrefix(line, "debug:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "debug:"))
 			cfg.Debug = val == "true"
-			inPlugins = false
+			resetSections()
 		case strings.HasPrefix(line, "telemetry:"):
 			val := strings.TrimSpace(strings.TrimPrefix(line, "telemetry:"))
 			cfg.Telemetry = val == "true"
-			inPlugins = false
+			resetSections()
 		case strings.HasPrefix(line, "providers:"):
-			inPlugins = false
+			resetSections()
 		case strings.HasPrefix(line, "plugins:"):
+			resetSections()
 			inPlugins = true
-			inLocations = false
 		case strings.HasPrefix(line, "- ") && strings.HasSuffix(line, ":"):
 			current = strings.TrimSuffix(strings.TrimPrefix(line, "- "), ":")
 			cfg.Providers[current] = Provider{}
-			inPlugins = false
-			inLocations = false
+			resetSections()
 		case inPlugins && strings.HasPrefix(line, "- "):
 			cfg.Plugins = append(cfg.Plugins, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
 		case strings.HasPrefix(line, "locations:"):
 			inLocations = true
-		case inLocations && strings.HasPrefix(line, "- "):
+			inAllow = false
+			inBlock = false
+		case inLocations && strings.HasPrefix(line, "allow:"):
+			inAllow = true
+			inBlock = false
+		case inLocations && strings.HasPrefix(line, "block:"):
+			inBlock = true
+			inAllow = false
+		case inAllow && strings.HasPrefix(line, "- "):
 			loc := strings.TrimSpace(strings.TrimPrefix(line, "- "))
 			p := cfg.Providers[current]
-			p.Locations = append(p.Locations, loc)
+			p.Locations.Allow = append(p.Locations.Allow, loc)
 			cfg.Providers[current] = p
+		case inBlock && strings.HasPrefix(line, "- "):
+			loc := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+			p := cfg.Providers[current]
+			p.Locations.Block = append(p.Locations.Block, loc)
+			cfg.Providers[current] = p
+		case inLocations && strings.HasPrefix(line, "- "):
+			log.Printf("[config] provider %s: legacy flat 'locations:' list is no longer supported; "+
+				"use 'locations: { allow: [...], block: [...] }' instead (entry %q ignored)",
+				current, strings.TrimSpace(strings.TrimPrefix(line, "- ")))
 		}
 	}
 	return cfg, sc.Err()
