@@ -90,6 +90,19 @@ RUN chmod +x /usr/local/bin/tundler-configure.sh /usr/local/bin/setup-netns.sh /
     systemctl set-default multi-user.target && \
     systemctl mask getty@tty1.service console-getty.service
 
+# Bound how long systemd waits for each unit to stop before SIGKILLing
+# it. The default is 90 s, which means a single misbehaving VPN daemon
+# (expressvpnd-CPU-spin, nordvpnd-stuck-on-tunnel-teardown, ...) can
+# stall the whole container shutdown well past Kubernetes' default
+# pod-deletion grace window. With several such daemons in a row, the
+# wait stacks into multi-minute zombie pods that have to be
+# `--grace-period=0 --force` deleted. 10 s is enough for cooperative
+# cleanup but stops the dead-weight wait from accumulating; in
+# practice the well-behaved daemons exit in <1 s anyway.
+RUN mkdir -p /etc/systemd/system.conf.d && \
+    printf '[Manager]\nDefaultTimeoutStopSec=10s\nDefaultTimeoutAbortSec=10s\n' \
+        > /etc/systemd/system.conf.d/00-tundler-shutdown.conf
+
 # Clean up
 RUN apt-get autoremove -y
 RUN apt-get autoclean -y
