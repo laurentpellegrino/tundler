@@ -92,7 +92,7 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 		return fmt.Errorf("cannot write activation code: %w", err)
 	}
 
-	if _, err := shared.RunCmd(ctx, bin, "login", tmpFile); err != nil {
+	if _, err := shared.RunCmd(ctx, bin, "login", "-t", "20", tmpFile); err != nil {
 		return fmt.Errorf("expressvpnctl login failed: %w", err)
 	}
 
