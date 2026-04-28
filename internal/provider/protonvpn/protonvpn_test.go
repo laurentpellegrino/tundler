@@ -18,6 +18,9 @@ func resetTestState(t *testing.T) {
 	activeServer = nil
 	loggedIn = false
 	serverCacheMu.Unlock()
+	activeMu.Lock()
+	activeLocation = ""
+	activeMu.Unlock()
 }
 
 func writeServersFile(t *testing.T) string {
@@ -145,5 +148,60 @@ func TestBuildOpenVPNConfig(t *testing.T) {
 	}
 	if strings.Contains(config, "fast-io") {
 		t.Fatalf("tcp config should not include udp-only fast-io:\n%s", config)
+	}
+}
+
+// TestActiveLocationRoundTrip pins the contract that ActiveLocation
+// returns the verbatim string passed to Connect, so a value pulled
+// from Locations() (the candidate pool the manager picks from) and
+// stamped onto Status.Location can be matched byte-for-byte against a
+// config block/allow entry.
+func TestActiveLocationRoundTrip(t *testing.T) {
+	resetTestState(t)
+	activeServer = &protonServer{Country: "France", City: "Paris"}
+	activeMu.Lock()
+	activeLocation = "France"
+	activeMu.Unlock()
+
+	if got := (ProtonVPN{}).ActiveLocation(context.Background()); got != "France" {
+		t.Fatalf("ActiveLocation = %q, want %q", got, "France")
+	}
+}
+
+func TestActiveLocationEmptyWhenDisconnected(t *testing.T) {
+	resetTestState(t)
+	// activeServer is nil → not connected → ActiveLocation must not
+	// surface a stale value, even if activeLocation happens to be set.
+	activeMu.Lock()
+	activeLocation = "France"
+	activeMu.Unlock()
+
+	if got := (ProtonVPN{}).ActiveLocation(context.Background()); got != "" {
+		t.Fatalf("ActiveLocation while disconnected = %q, want empty", got)
+	}
+}
+
+func TestDisconnectClearsActiveLocation(t *testing.T) {
+	resetTestState(t)
+	activeServer = &protonServer{Country: "France"}
+	activeMu.Lock()
+	activeLocation = "France"
+	activeMu.Unlock()
+
+	// Disconnect calls `pkill openvpn`, which is fine even when openvpn
+	// isn't running (RunCmd swallows the non-zero exit). The state we
+	// care about — activeServer/activeLocation — is cleared
+	// unconditionally on the way out.
+	if err := (ProtonVPN{}).Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect error: %v", err)
+	}
+	if activeServer != nil {
+		t.Fatalf("activeServer not cleared after Disconnect")
+	}
+	activeMu.RLock()
+	got := activeLocation
+	activeMu.RUnlock()
+	if got != "" {
+		t.Fatalf("activeLocation after Disconnect = %q, want empty", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
@@ -15,11 +16,31 @@ type NordVPN struct{}
 const bin = "nordvpn"
 const name = bin
 
+// activeLocation is whatever string was passed to Connect — i.e. an
+// entry from Locations() (the candidate pool the manager picks from).
+// Reporting it verbatim from ActiveLocation guarantees a config
+// block/allow list entry can match: pool ↔ Status.Location round-trip
+// the same string. Parsing `nordvpn status` would yield "tn2.nordvpn.com"
+// or "Cote d'Ivoire", neither of which appears in `nordvpn countries`.
+var (
+	activeLocation string
+	activeMu       sync.RWMutex
+)
+
 func init() { provider.Registry[name] = NordVPN{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
 func (n NordVPN) ActiveLocation(ctx context.Context) string {
+	if !n.Connected(ctx) {
+		return ""
+	}
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	return activeLocation
+}
+
+func (n NordVPN) activeHostname(ctx context.Context) string {
 	out, _ := shared.RunCmd(ctx, bin, "status")
 	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -38,6 +59,9 @@ func (n NordVPN) Connect(ctx context.Context, location string) provider.Status {
 		args = append(args, location)
 	}
 	quiet(ctx, args...)
+	activeMu.Lock()
+	activeLocation = location
+	activeMu.Unlock()
 	return n.Status(ctx)
 }
 
@@ -47,6 +71,9 @@ func (n NordVPN) Connected(ctx context.Context) bool {
 }
 
 func (n NordVPN) Disconnect(ctx context.Context) error {
+	activeMu.Lock()
+	activeLocation = ""
+	activeMu.Unlock()
 	_, err := shared.RunCmd(ctx, bin, "disconnect")
 	return err
 }
@@ -89,7 +116,7 @@ func (n NordVPN) Status(ctx context.Context) provider.Status {
 		Connected: true,
 		IP:        shared.FirstIPv4(out),
 		Location:  n.ActiveLocation(ctx),
-		Region:    n.ActiveLocation(ctx),
+		Region:    n.activeHostname(ctx),
 		Provider:  name,
 	}
 }

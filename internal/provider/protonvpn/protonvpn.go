@@ -53,6 +53,8 @@ var (
 	serverCacheMu   sync.RWMutex
 	serverCacheTime time.Time
 	activeServer    *protonServer
+	activeLocation  string
+	activeMu        sync.RWMutex
 	loggedIn        bool
 )
 
@@ -212,14 +214,17 @@ func isOpenVPNConnected() bool {
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
+// ActiveLocation returns whatever was passed to Connect — i.e. an
+// entry from Locations(). Reporting the verbatim pool string is what
+// makes a config block/allow list match. Granular per-server detail
+// (e.g. "Cuba - Havana") is exposed via Status.Region.
 func (p ProtonVPN) ActiveLocation(ctx context.Context) string {
 	if activeServer == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
-	}
-	return activeServer.Country
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	return activeLocation
 }
 
 func (p ProtonVPN) Connect(ctx context.Context, location string) provider.Status {
@@ -240,7 +245,9 @@ func (p ProtonVPN) Connect(ctx context.Context, location string) provider.Status
 		shared.Debugf("ProtonVPN: connection failed: %v", err)
 		return provider.Status{Connected: false, Provider: name, Location: location}
 	}
-
+	activeMu.Lock()
+	activeLocation = location
+	activeMu.Unlock()
 	return p.Status(ctx)
 }
 
@@ -294,6 +301,9 @@ func (p ProtonVPN) Disconnect(ctx context.Context) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	activeServer = nil
+	activeMu.Lock()
+	activeLocation = ""
+	activeMu.Unlock()
 	return nil
 }
 
@@ -374,6 +384,9 @@ func publicIP(ctx context.Context) string {
 func activeRegion() string {
 	if activeServer == nil {
 		return ""
+	}
+	if activeServer.City != "" {
+		return activeServer.Country + " - " + activeServer.City
 	}
 	if activeServer.Region != "" {
 		return activeServer.Region
