@@ -37,6 +37,8 @@ var (
 	serverCacheTime time.Time
 	activeServer    *Server
 	activeProtocol  string
+	activeLocation  string
+	activeMu        sync.RWMutex
 	loggedIn        bool
 )
 
@@ -45,6 +47,9 @@ func init() { provider.Registry[name] = Surfshark{} }
 func activeRegion() string {
 	if activeServer == nil {
 		return ""
+	}
+	if activeServer.Location != "" {
+		return fmt.Sprintf("%s - %s", activeServer.Country, activeServer.Location)
 	}
 	if activeServer.Region != "" {
 		return activeServer.Region
@@ -289,11 +294,17 @@ func isWireGuardConnected() bool {
 	return len(out) > 0
 }
 
+// ActiveLocation returns whatever was passed to Connect — i.e. an
+// entry from Locations(). Reporting the verbatim pool string is what
+// makes a config block/allow list match. Granular per-server detail
+// (e.g. "United States - New York") is exposed via Status.Region.
 func (s Surfshark) ActiveLocation(ctx context.Context) string {
-	if activeServer != nil {
-		return fmt.Sprintf("%s - %s", activeServer.Country, activeServer.Location)
+	if activeServer == nil {
+		return ""
 	}
-	return ""
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	return activeLocation
 }
 
 func (s Surfshark) Connect(ctx context.Context, location string) provider.Status {
@@ -325,7 +336,9 @@ func (s Surfshark) Connect(ctx context.Context, location string) provider.Status
 		shared.Debugf("Surfshark: connection failed: %v", connectErr)
 		return provider.Status{Connected: false}
 	}
-
+	activeMu.Lock()
+	activeLocation = location
+	activeMu.Unlock()
 	return s.Status(ctx)
 }
 
@@ -358,6 +371,9 @@ func (s Surfshark) Disconnect(ctx context.Context) error {
 
 	activeServer = nil
 	activeProtocol = ""
+	activeMu.Lock()
+	activeLocation = ""
+	activeMu.Unlock()
 	return nil
 }
 
