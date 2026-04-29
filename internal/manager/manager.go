@@ -92,6 +92,7 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string, al
 		}
 		hasFilter := len(allowLocations) > 0 || len(f.Allow) > 0 ||
 			len(f.Block) > 0 || len(blockLocations) > 0
+		locs = dropMalformedLocations(locs)
 		locs = filterOut(locs, f.Block)
 		locs = filterOut(locs, blockLocations)
 		if len(locs) > 0 {
@@ -338,4 +339,42 @@ func filterOut(in, blocked []string) []string {
 		}
 	}
 	return out
+}
+
+// dropMalformedLocations is a defence in depth against provider implementations
+// that swallow CLI errors and return error text as if it were a location list.
+// We can't validate location names structurally because the legitimate set is
+// wildly heterogeneous across providers — hyphens (express: "uk-london",
+// "usa-st.-louis"), underscores (nord/surfshark: "Cayman_Islands"), spaces
+// (proton: "Costa Rica"), apostrophes (proton: "Cote d'Ivoire"), parens and
+// dots (express: "india-(via-singapore)", "usa-st.-louis"). The one shape no
+// real location takes is a *purely numeric* token: those only show up when
+// CLI error output ("Timed out after 5.002 sec") gets fed through
+// strings.Fields and the digits leak in as "5.002". Empty strings are
+// dropped on the same principle — they only appear from over-eager parsing.
+// Anything else passes through; we trust the provider beyond that.
+func dropMalformedLocations(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := in[:0:0]
+	for _, v := range in {
+		if v == "" || isPurelyNumeric(v) {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func isPurelyNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && r != '.' {
+			return false
+		}
+	}
+	return true
 }
