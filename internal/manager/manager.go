@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/plugin"
@@ -13,7 +14,7 @@ import (
 )
 
 // -----------------------------------------------------------------------------
-// Manager (stateless)
+// Manager
 // -----------------------------------------------------------------------------
 
 // LocationFilter is the per-provider allow/block policy applied to random
@@ -25,15 +26,39 @@ type LocationFilter struct {
 	Block []string
 }
 
+// failureCooldown is how long a (provider, location) pair is excluded from
+// random selection after a connect attempt failed to establish a tunnel.
+// Long enough that the upstream issue (bad exit IP, transient handshake
+// failure, regional outage) has likely cleared or rotated; short enough
+// that a brief blip doesn't permanently exclude a region from the pool.
+// Compare with LocationFilter.Block, which is forever and policy-driven.
+const failureCooldown = 10 * time.Minute
+
 type Manager struct {
 	filters   map[string]LocationFilter
 	plugins   *plugin.Manager
 	providers map[string]provider.VPNProvider
+
+	// recentFailures tracks the last time each (provider, location) pair
+	// failed to establish a tunnel. The pool is filtered by this map at
+	// random-pick time; expired entries are lazily removed.
+	recentFailures   map[string]time.Time
+	recentFailuresMu sync.Mutex
+
+	// now is the clock source, overridable in tests so cooldown expiry
+	// can be exercised without time.Sleep.
+	now func() time.Time
 }
 
 func New(debug bool, filters map[string]LocationFilter, plugins *plugin.Manager) *Manager {
 	shared.SetDebug(debug)
-	return &Manager{filters: filters, plugins: plugins, providers: provider.Registry}
+	return &Manager{
+		filters:        filters,
+		plugins:        plugins,
+		providers:      provider.Registry,
+		recentFailures: map[string]time.Time{},
+		now:            time.Now,
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -95,6 +120,12 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string, al
 		locs = dropMalformedLocations(locs)
 		locs = filterOut(locs, f.Block)
 		locs = filterOut(locs, blockLocations)
+		// Skip locations recently observed to fail tunnel establishment;
+		// fall back to the unfiltered pool when every option is in cooldown
+		// (better to retry a recent failure than refuse to connect).
+		if cooled := m.dropCooldown(providerName, locs); len(cooled) > 0 {
+			locs = cooled
+		}
 		if len(locs) > 0 {
 			r := rand.New(rand.NewSource(time.Now().UnixNano()))
 			location = locs[r.Intn(len(locs))]
@@ -116,6 +147,12 @@ func (m *Manager) Connect(ctx context.Context, providerName, location string, al
 	}
 	if status.Location == "" {
 		status.Location = location
+	}
+	if !status.Connected && status.Location != "" {
+		// Tunnel didn't come up. Record the (provider, location) pair so the
+		// next random pick avoids it for ~10 min — handles flaky exit IPs
+		// and transient regional outages without permanently blocklisting.
+		m.markConnectFailure(providerName, status.Location)
 	}
 	if status.Connected {
 		// Lower the tunnel interface MTU when the underlay (pod eth0)
@@ -363,6 +400,44 @@ func dropMalformedLocations(in []string) []string {
 			continue
 		}
 		out = append(out, v)
+	}
+	return out
+}
+
+// markConnectFailure stamps a (provider, location) pair as recently failed so
+// future random picks skip it during the cooldown window.
+func (m *Manager) markConnectFailure(providerName, location string) {
+	if location == "" {
+		return
+	}
+	m.recentFailuresMu.Lock()
+	defer m.recentFailuresMu.Unlock()
+	m.recentFailures[providerName+"\x00"+location] = m.now()
+}
+
+// dropCooldown returns the subset of in that is NOT currently in cooldown for
+// the given provider. Expired entries are pruned in passing. Callers should
+// fall back to the unfiltered list when this returns empty — i.e. when every
+// candidate is in cooldown — so the connect path doesn't dead-end.
+func (m *Manager) dropCooldown(providerName string, in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	m.recentFailuresMu.Lock()
+	defer m.recentFailuresMu.Unlock()
+	now := m.now()
+	out := in[:0:0]
+	for _, l := range in {
+		key := providerName + "\x00" + l
+		failedAt, hit := m.recentFailures[key]
+		if !hit {
+			out = append(out, l)
+			continue
+		}
+		if now.Sub(failedAt) >= failureCooldown {
+			delete(m.recentFailures, key)
+			out = append(out, l)
+		}
 	}
 	return out
 }
