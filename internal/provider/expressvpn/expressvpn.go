@@ -20,8 +20,18 @@ func init() { provider.Registry[name] = ExpressVPN{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+// get returns the trimmed stdout of `expressvpnctl get <key>`. When the CLI
+// fails (non-zero exit, including its internal "Timed out after N sec"
+// timeout), it returns "". Without this guard, error text would be propagated
+// as a real value: callers like Locations() then split it on whitespace and
+// produce garbage tokens that the manager picks at random and feeds back into
+// `expressvpnctl connect <token>`, wasting every connect attempt where the
+// daemon was momentarily slow.
 func get(ctx context.Context, key string) string {
-	out, _ := shared.RunCmd(ctx, bin, "get", key)
+	out, err := shared.RunCmd(ctx, bin, "get", key)
+	if err != nil {
+		return ""
+	}
 	return strings.TrimSpace(out)
 }
 
@@ -73,7 +83,10 @@ func (e ExpressVPN) Disconnect(ctx context.Context) error {
 }
 
 func (e ExpressVPN) Locations(ctx context.Context) []string {
-	out, _ := shared.RunCmd(ctx, bin, "get", "regions")
+	out, err := shared.RunCmd(ctx, bin, "get", "regions")
+	if err != nil {
+		return nil
+	}
 	return strings.Fields(out)
 }
 
