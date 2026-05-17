@@ -9,7 +9,7 @@ to minimise breakage and remains stateless on its own.
 ## Features
 
 - REST API on port `4242` for controlling VPN connections.
-- ExpressVPN, Mullvad, NordVPN, Private Internet Access (PIA), Proton VPN and Surfshark support out of the box.
+- ExpressVPN, IPVanish, Mullvad, NordVPN, Private Internet Access (PIA), Proton VPN and Surfshark support out of the box.
 - Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
 - YAML configuration file for location filtering and debug mode.
 - Easily extensible to add new providers.
@@ -107,6 +107,8 @@ Credentials can be provided via environment variables or a `.env` file at the pr
 ```bash
 # Option 1: Environment variables
 EXPRESSVPN_ACTIVATION_CODE=<code> \
+IPVANISH_USERNAME=<username> \
+IPVANISH_PASSWORD=<password> \
 MULLVAD_ACCOUNT_NUMBER=<account> \
 NORDVPN_TOKEN=<token> \
 PRIVATEINTERNETACCESS_USERNAME=<username> \
@@ -140,6 +142,7 @@ remain reachable even when the VPN changes routing.
 | Provider                      | Variables                                                          |
 |-------------------------------|--------------------------------------------------------------------|
 | ExpressVPN                    | `EXPRESSVPN_ACTIVATION_CODE`                                       |
+| IPVanish                      | `IPVANISH_USERNAME`, `IPVANISH_PASSWORD`                           |
 | Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
 | NordVPN                       | `NORDVPN_TOKEN`                                                    |
 | Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
@@ -154,6 +157,11 @@ OpenVPN profile at connection time. Optional settings:
 `PROTON_OPENVPN_PROTOCOL=udp|tcp` (default `udp`) and `PROTON_OPENVPN_PORT`
 (defaults to `1194` for UDP and `443` for TCP). `PROTON_SERVERS_URL` may be
 set to override the server metadata source.
+
+IPVanish has no Linux CLI; Tundler downloads IPVanish's official OpenVPN
+`configs.zip` during container configuration and connects with the username
+and password from your IPVanish account. `IPVANISH_CONFIGS_URL` may be set
+to override the configs source.
 
 ##### Tundler options
 
