@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
@@ -14,9 +15,22 @@ import (
 const bin = "piactl"
 const name = "privateinternetaccess"
 
+// rateLimitCooldown is how long Login refuses to call piactl after PIA's
+// auth API has returned ApiRateLimitedError. Chosen to outlast PIA's typical
+// Cloudflare-style sliding-window rate limits (a few minutes to ~30 min) so
+// repeated tundler restarts across a fleet don't keep hammering the API
+// while it's already throttling us. The cooldown is per-process; if a pod
+// restarts during it, the new process starts with a clean slate but will
+// re-trigger the cooldown on the very next failed login response.
+const rateLimitCooldown = 15 * time.Minute
+
 type PIA struct{}
 
-var loggedIn bool
+var (
+	loggedIn          bool
+	rateLimitedUntil  time.Time
+	rateLimitMu       sync.Mutex
+)
 
 func init() { provider.Registry[name] = PIA{} }
 
@@ -121,6 +135,20 @@ func (p PIA) Login(ctx context.Context) error {
 		return fmt.Errorf("PRIVATEINTERNETACCESS_USERNAME and PRIVATEINTERNETACCESS_PASSWORD environment variables must be set")
 	}
 
+	// Honor any active rate-limit cooldown — refuse to call piactl while
+	// PIA's auth API is still throttling us. This prevents fleets of
+	// pods restarting in close succession from continuously re-triggering
+	// the rate limit (which is what produced the multi-hour PIA outage
+	// observed in the 2026-05-17 incident).
+	rateLimitMu.Lock()
+	until := rateLimitedUntil
+	rateLimitMu.Unlock()
+	if remaining := time.Until(until); remaining > 0 {
+		shared.Debugf("PIA: Login() - skipping piactl call, rate-limit cooldown %s remaining",
+			remaining.Round(time.Second))
+		return fmt.Errorf("pia api rate-limited, cooldown %s remaining", remaining.Round(time.Second))
+	}
+
 	shared.Debugf("PIA: Login() - enabling background")
 	quiet(ctx, "background", "enable")
 
@@ -144,12 +172,31 @@ func (p PIA) Login(ctx context.Context) error {
 	// Use a generous piactl timeout to avoid rate-limiting from rapid retries.
 	shared.Debugf("PIA: Login() - executing login command")
 	out, err := shared.RunCmd(ctx, bin, "--timeout", "90", "login", credentialsFile)
-	shared.Debugf("PIA: Login() - login output: %s", out)
-	// piactl returns exit 0 on fresh login, exit 127 on "Already logged in"
+	shared.Debugf("PIA: Login() - login output: %s, err: %v", out, err)
+
+	// Success paths: exit 0 (fresh login), or output contains the historical
+	// "Already logged into account" marker (older piactl versions returned
+	// exit 127 with this output). Modern piactl (3.7.2+) returns exit 0 on
+	// fresh login and proper non-zero codes on failure — the marker check
+	// is kept for backwards-compat with older builds in the wild.
 	if err == nil || strings.Contains(out, "Already logged into account") {
 		shared.Debugf("PIA: Login() - login successful")
 		loggedIn = true
 		return nil
+	}
+
+	// PIA's auth API returns "ApiRateLimitedError" (Cloudflare-style sliding-
+	// window throttle) when too many login attempts come from one account in
+	// a short period. Record a cooldown and return a distinct error so callers
+	// can distinguish rate-limit from credential/network failures. The
+	// piactl --debug output puts the literal "ApiRateLimitedError" string in
+	// stderr; RunCmd captures both stdout and stderr into `out`.
+	if strings.Contains(out, "ApiRateLimitedError") {
+		rateLimitMu.Lock()
+		rateLimitedUntil = time.Now().Add(rateLimitCooldown)
+		rateLimitMu.Unlock()
+		shared.Debugf("PIA: Login() - PIA API rate-limited, cooldown %s set", rateLimitCooldown)
+		return fmt.Errorf("pia api rate-limited, will retry after %s", rateLimitCooldown)
 	}
 
 	shared.Debugf("PIA: Login() - login failed: %v", err)
