@@ -76,8 +76,9 @@ func main() {
 	// guards on state==Ready internally so this is safe to call even if
 	// the hourly rotator timer is racing with an HTTP-driven rotation.
 	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+	drain := newEnvoyDrainController(envoyAdminURL)
 	triggerRotation := func() {
-		rotateIfReady(ctx, prov, state, providerName, excluded)
+		rotateIfReady(ctx, prov, state, providerName, excluded, drain)
 	}
 
 	// xDS server: serves envoy config (LDS+CDS+RDS) to the pod-local
@@ -156,7 +157,7 @@ func main() {
 	// offset is uniformly random in [0, MIN_ROTATION_SECONDS) so a fleet
 	// that boots together doesn't rotate in lockstep.
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
-	go runRotator(ctx, prov, state, providerName, excluded, minRotation)
+	go runRotator(ctx, prov, state, providerName, excluded, minRotation, drain)
 
 	// Self-monitor (Trigger C): poll envoy admin /stats; if our exit
 	// IP's 429-rate exceeds the threshold over the window, rotate
