@@ -11,9 +11,11 @@
 //   - Failed-rotation retry-with-different-location (ROTATION_RETRY_MAX) (slice c'.2)
 //   - POST /rotate HTTP handler (consumed by tundler-fleet-controller) (slice d'.1)
 //   - internal/xds SnapshotBuilder + gRPC Server on :18000 (slice e'.1 + e'.2)
+//   - Self-monitor (Trigger C): sliding-window 429-rate → auto-rotate (slice f'.1)
 //
-// Future slices: self-monitor (Trigger C), Layer 1+2 envoy drain,
-// per-provider Dockerfile + CI matrix.
+// Future slices: Layer 1+2 envoy drain hooks (call envoy admin's
+// /drain_listeners + poll downstream_cx_active), per-provider Dockerfile
+// + CI matrix.
 package main
 
 import (
@@ -38,12 +40,16 @@ const (
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
 	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
+	envSelfMonitorIntervalSec = "SELF_MONITOR_INTERVAL_SECONDS"
+	envSelfMonitorWindowSamples = "SELF_MONITOR_WINDOW_SAMPLES"
+	envSelfMonitorThresholdPct  = "SELF_MONITOR_THRESHOLD_PERCENT"
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
 	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
 
-	xdsListenAddr  = "127.0.0.1:18000" // loopback-only per design-doc tunnel-pod envoy config
-	dataListenPort = 8484              // matches the bake-time envoy bootstrap
+	xdsListenAddr   = "127.0.0.1:18000" // loopback-only per design-doc tunnel-pod envoy config
+	envoyAdminURL   = "http://127.0.0.1:9901"
+	dataListenPort  = 8484 // matches the bake-time envoy bootstrap
 )
 
 func main() {
@@ -152,8 +158,18 @@ func main() {
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
 	go runRotator(ctx, prov, state, providerName, excluded, minRotation)
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
-		watchdogInterval, minRotation)
+	// Self-monitor (Trigger C): poll envoy admin /stats; if our exit
+	// IP's 429-rate exceeds the threshold over the window, rotate
+	// proactively. Same RotateTrigger as /rotate so the underlying
+	// rotation lifecycle is reused.
+	mp := defaultMonitorParams()
+	mp.interval = time.Duration(getEnvInt(envSelfMonitorIntervalSec, int(mp.interval.Seconds()))) * time.Second
+	mp.windowSamples = getEnvInt(envSelfMonitorWindowSamples, mp.windowSamples)
+	mp.threshold = float64(getEnvInt(envSelfMonitorThresholdPct, int(mp.threshold*100))) / 100.0
+	go runSelfMonitor(ctx, fetchEnvoyStats(envoyAdminURL), state, triggerRotation, mp)
+
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s self-monitor=%s/window=%d/threshold=%.0f%%",
+		watchdogInterval, minRotation, mp.interval, mp.windowSamples, mp.threshold*100)
 
 	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
 	// (Trigger C) and Layer 1+2 envoy drain hooks.
