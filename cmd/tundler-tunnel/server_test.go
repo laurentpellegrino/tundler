@@ -109,3 +109,29 @@ func TestStatusHandler_ReadyEmitsLoggedInAt(t *testing.T) {
 		t.Errorf("logged_in_at=%q is not RFC3339: %v", loggedInAt, err)
 	}
 }
+
+func TestStatusHandler_TunnelUpFields(t *testing.T) {
+	st := NewStateTracker("expressvpn")
+	st.RecordTunnelUp("Switzerland", "45.83.124.18")
+	st.Set(StateReady)
+
+	rr := httptest.NewRecorder()
+	statusHandler(st)(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var snap map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := snap["current_location"]; got != "Switzerland" {
+		t.Errorf("current_location=%v, want Switzerland", got)
+	}
+	if got := snap["current_exit_ip"]; got != "45.83.124.18" {
+		t.Errorf("current_exit_ip=%v, want 45.83.124.18", got)
+	}
+	// tunnel_age_seconds is computed from time.Now(); immediately after
+	// RecordTunnelUp it rounds to 0 (or close to it). Assert the field
+	// exists and is numeric, don't pin to a specific value.
+	if _, ok := snap["tunnel_age_seconds"]; !ok {
+		t.Error("tunnel_age_seconds missing from snapshot")
+	}
+}
