@@ -8,9 +8,11 @@
 //   - Connect to random allowed location + record current_location/exit_ip (slice b'.1)
 //   - Watchdog reconnect on unexpected tunnel drop (slice b'.2)
 //   - Hourly random rotation timer (Ready → Draining → Rotating → Ready) (slice c'.1)
+//   - Failed-rotation retry-with-different-location (ROTATION_RETRY_MAX) (slice c'.2)
+//   - POST /rotate HTTP handler (consumed by tundler-fleet-controller) (slice d'.1)
 //
-// Future slices: failed-rotation retry-with-different-location, xDS server,
-// /rotate HTTP handler, self-monitor (Trigger C), Layer 1+2 envoy drain.
+// Future slices: xDS server on :18000, self-monitor (Trigger C), Layer 1+2
+// envoy drain, per-provider Dockerfile + CI matrix.
 package main
 
 import (
@@ -56,8 +58,17 @@ func main() {
 	state := NewStateTracker(providerName)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// /rotate handler invokes this closure in a goroutine; rotateIfReady
+	// guards on state==Ready internally so this is safe to call even if
+	// the hourly rotator timer is racing with an HTTP-driven rotation.
+	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+	triggerRotation := func() {
+		rotateIfReady(ctx, prov, state, providerName, excluded)
+	}
+
 	go func() {
-		if err := startServer(ctx, state); err != nil {
+		if err := startServer(ctx, state, triggerRotation); err != nil {
 			log.Fatalf("tundler-tunnel: HTTP server: %v", err)
 		}
 	}()
@@ -80,8 +91,8 @@ func main() {
 
 	// Tunnel hold: pick a random allowed location (provider-filtered minus
 	// EXCLUDED_LOCATIONS) and Connect. On success → Ready. On failure
-	// surrender to Failed.
-	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+	// surrender to Failed. `excluded` is captured in triggerRotation
+	// above; reuse it here.
 	if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
 		log.Printf("tundler-tunnel: initial connect failed: %v", err)
 		failAndExit(state)
@@ -104,8 +115,8 @@ func main() {
 	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
 		watchdogInterval, minRotation)
 
-	// Hold the tunnel until SIGTERM. Future slices add the hourly rotation
-	// timer, /rotate handler, and xDS pushes.
+	// Hold the tunnel until SIGTERM. Future slices add the xDS server
+	// and self-monitor (Trigger C).
 	<-ctx.Done()
 	log.Printf("tundler-tunnel: shutting down")
 }
