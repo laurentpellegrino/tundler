@@ -9,6 +9,11 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/provider"
 )
 
+const (
+	envRotationRetryMax     = "ROTATION_RETRY_MAX"
+	defaultRotationRetryMax = 3
+)
+
 // runRotator fires a tunnel rotation every `minInterval ± jitter`, picking
 // a fresh random allowed location each time. Mirrors the design-doc
 // "Hourly random rotation" lifecycle (Ready → Draining → Rotating →
@@ -57,7 +62,21 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 // rotateIfReady runs one rotation cycle if the pod is currently in
 // StateReady. Other states (Connecting, Draining, Rotating, Failed) mean
 // some other code path is in charge of the connection — skip.
+//
+// On Connect failure, retries up to ROTATION_RETRY_MAX times with
+// different locations (and exponential backoff between attempts) per the
+// design-doc "Failed-rotation handling" section. If all attempts fail,
+// surrenders to StateFailed; the liveness probe then triggers a k8s
+// restart.
 func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string) {
+	rotateIfReadyWithDeps(ctx, prov, state, providerName, excluded,
+		getEnvInt(envRotationRetryMax, defaultRotationRetryMax), time.Sleep)
+}
+
+// rotateIfReadyWithDeps is the testable form of rotateIfReady — exposes
+// maxAttempts + sleep so tests can drive deterministic behavior without
+// reading env vars or waiting for real backoffs.
+func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration)) {
 	if state.Get() != StateReady {
 		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready)", state.Get())
 		return
@@ -72,7 +91,9 @@ func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateT
 	state.Set(StateDraining)
 	log.Printf("tundler-tunnel: rotation started (previous_exit_ip=%s)", previousIP)
 
-	// Rotating: disconnect, then reconnect to a fresh random location.
+	// Rotating: disconnect, then reconnect with retry-with-different-
+	// location. The connectWithRetry helper tracks recentlyFailed within
+	// this rotation so the same broken location isn't retried twice.
 	state.Set(StateRotating)
 	if err := prov.Disconnect(ctx); err != nil {
 		// Disconnect failures are surprisingly common when the network
@@ -81,8 +102,8 @@ func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateT
 		log.Printf("tundler-tunnel: rotation Disconnect failed (continuing to Connect): %v", err)
 	}
 
-	if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
-		log.Printf("tundler-tunnel: rotation Connect failed: %v", err)
+	if err := connectWithRetry(ctx, prov, state, providerName, excluded, maxAttempts, sleep); err != nil {
+		log.Printf("tundler-tunnel: rotation failed after retries: %v", err)
 		state.RecordRotation(previousIP, "", "failed", time.Since(started))
 		state.Set(StateFailed)
 		return
