@@ -135,3 +135,32 @@ func TestStatusHandler_TunnelUpFields(t *testing.T) {
 		t.Error("tunnel_age_seconds missing from snapshot")
 	}
 }
+
+func TestStateTracker_TunnelUpListenerFiresWithExitIP(t *testing.T) {
+	st := NewStateTracker("expressvpn")
+	got := make(chan string, 3)
+	st.SetTunnelUpListener(func(exitIP string) { got <- exitIP })
+
+	st.RecordTunnelUp("Switzerland", "1.1.1.1")
+	st.RecordTunnelUp("Norway", "2.2.2.2")
+
+	for _, want := range []string{"1.1.1.1", "2.2.2.2"} {
+		select {
+		case ip := <-got:
+			if ip != want {
+				t.Errorf("listener got %q, want %q", ip, want)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Errorf("listener not fired for %q", want)
+		}
+	}
+}
+
+func TestStateTracker_TunnelUpListenerNilSafe(t *testing.T) {
+	st := NewStateTracker("expressvpn")
+	// No listener registered — RecordTunnelUp must not panic.
+	st.RecordTunnelUp("USA", "1.2.3.4")
+	if got := st.Snapshot().CurrentExitIP; got != "1.2.3.4" {
+		t.Errorf("current_exit_ip=%q, want 1.2.3.4 (state still recorded)", got)
+	}
+}
