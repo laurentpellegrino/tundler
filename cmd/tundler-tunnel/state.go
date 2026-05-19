@@ -10,16 +10,17 @@ import (
 // "state" field in the Tundler-hub /status response schema documented in
 // architecture-tundler-fleet-controller.md (the per-pod schema).
 //
-// Slice (a') only uses Booting, LoggingIn, Ready, Failed. Later slices add
-// Draining and Rotating when the rotation lifecycle is implemented.
+// Slices implemented so far cover Booting, LoggingIn, Connecting, Ready,
+// Failed. Draining and Rotating will be added with the rotation lifecycle.
 type State string
 
 const (
-	StateBooting   State = "Booting"   // process started, awaiting boot-login jitter
-	StateLoggingIn State = "LoggingIn" // calling provider.Login()
-	StateReady     State = "Ready"     // login succeeded; ready to serve traffic
+	StateBooting    State = "Booting"    // process started, awaiting boot-login jitter
+	StateLoggingIn  State = "LoggingIn"  // calling provider.Login()
+	StateConnecting State = "Connecting" // calling provider.Connect() + waiting for tunnel up
+	StateReady      State = "Ready"      // tunnel up; serving traffic
 	// StateDraining / StateRotating reserved for the rotation slice.
-	StateFailed State = "Failed" // login surrendered; /livez flips to 503 so k8s restarts
+	StateFailed State = "Failed" // login/connect surrendered; /livez flips to 503 so k8s restarts
 )
 
 // StateTracker is the source of truth for the /status JSON and the probe
@@ -32,6 +33,9 @@ type StateTracker struct {
 	provider              string
 	bootLoginJitterActual time.Duration
 	loggedInAt            time.Time
+	currentLocation       string
+	currentExitIP         string
+	tunnelConnectedAt     time.Time
 }
 
 // NewStateTracker initializes a tracker in StateBooting, parking the
@@ -65,22 +69,36 @@ func (s *StateTracker) RecordBootLoginJitter(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// RecordTunnelUp captures the location + exit IP of a freshly-established
+// tunnel and starts the tunnel_age_seconds clock. Called once Connect()
+// reports the tunnel is up (Connecting → Ready transition).
+func (s *StateTracker) RecordTunnelUp(location, exitIP string) {
+	s.mu.Lock()
+	s.currentLocation = location
+	s.currentExitIP = exitIP
+	s.tunnelConnectedAt = time.Now().UTC()
+	s.mu.Unlock()
+}
+
 // Snapshot returns a copy of the tracker's state as the JSON-serializable
 // shape /status emits. Fields not yet implemented in this slice
-// (current_location, current_exit_ip, tunnel_age_seconds,
-// next_rotation_in_seconds, rotation_count_total, last_rotation) are
-// either zero-valued or omitted via `omitempty`; later slices will
-// populate them.
+// (next_rotation_in_seconds, rotation_count_total, last_rotation) are
+// zero-valued; later slices will populate them.
 func (s *StateTracker) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	snap := Snapshot{
 		State:                        s.state,
 		Provider:                     s.provider,
+		CurrentLocation:              s.currentLocation,
+		CurrentExitIP:                s.currentExitIP,
 		BootLoginJitterActualSeconds: int(s.bootLoginJitterActual.Round(time.Second).Seconds()),
 	}
 	if !s.loggedInAt.IsZero() {
 		snap.LoggedInAt = s.loggedInAt.Format(time.RFC3339)
+	}
+	if !s.tunnelConnectedAt.IsZero() {
+		snap.TunnelAgeSeconds = int(time.Since(s.tunnelConnectedAt).Round(time.Second).Seconds())
 	}
 	return snap
 }
