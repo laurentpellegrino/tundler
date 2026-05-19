@@ -192,7 +192,7 @@ func TestRotateIfReadyWithDeps_FailureRetriesThenSurrenders(t *testing.T) {
 	st.Set(StateReady)
 
 	ns := &noSleep{}
-	rotateIfReadyWithDeps(context.Background(), sp, st, "scripted", nil, 3, ns.sleep)
+	rotateIfReadyWithDeps(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, nil)
 
 	if st.Get() != StateFailed {
 		t.Errorf("state=%s after exhausted retries, want Failed", st.Get())
@@ -219,7 +219,7 @@ func TestRotateIfReadyWithDeps_RecoversOnSecondAttempt(t *testing.T) {
 	st.Set(StateReady)
 
 	ns := &noSleep{}
-	rotateIfReadyWithDeps(context.Background(), sp, st, "scripted", nil, 3, ns.sleep)
+	rotateIfReadyWithDeps(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, nil)
 
 	if st.Get() != StateReady {
 		t.Errorf("state=%s, want Ready", st.Get())
