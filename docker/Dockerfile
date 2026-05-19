@@ -1,9 +1,12 @@
 # Build stage for the tundler API binary
-FROM golang:1.24 AS builder
+FROM golang:1.25 AS builder
 WORKDIR /build
 
-# Dependencies first for better layer-cache
-COPY go.mod ./
+# Dependencies first for better layer-cache. go.sum is required alongside
+# go.mod since the introduction of the xds + grpc deps (without it,
+# `go build` re-downloads modules and silently rewrites go.sum, defeating
+# the layer-cache and bypassing checksum verification).
+COPY go.mod go.sum ./
 RUN go mod download
 
 # Project sources
