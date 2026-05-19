@@ -10,9 +10,10 @@
 //   - Hourly random rotation timer (Ready → Draining → Rotating → Ready) (slice c'.1)
 //   - Failed-rotation retry-with-different-location (ROTATION_RETRY_MAX) (slice c'.2)
 //   - POST /rotate HTTP handler (consumed by tundler-fleet-controller) (slice d'.1)
+//   - internal/xds SnapshotBuilder + gRPC Server on :18000 (slice e'.1 + e'.2)
 //
-// Future slices: xDS server on :18000, self-monitor (Trigger C), Layer 1+2
-// envoy drain, per-provider Dockerfile + CI matrix.
+// Future slices: self-monitor (Trigger C), Layer 1+2 envoy drain,
+// per-provider Dockerfile + CI matrix.
 package main
 
 import (
@@ -26,6 +27,7 @@ import (
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
+	"github.com/laurentpellegrino/tundler/internal/xds"
 )
 
 const (
@@ -34,9 +36,14 @@ const (
 	envExcludedLocations     = "EXCLUDED_LOCATIONS"
 	envWatchdogIntervalSec   = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
+	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
+	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
 	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
+
+	xdsListenAddr  = "127.0.0.1:18000" // loopback-only per design-doc tunnel-pod envoy config
+	dataListenPort = 8484              // matches the bake-time envoy bootstrap
 )
 
 func main() {
@@ -66,6 +73,39 @@ func main() {
 	triggerRotation := func() {
 		rotateIfReady(ctx, prov, state, providerName, excluded)
 	}
+
+	// xDS server: serves envoy config (LDS+CDS+RDS) to the pod-local
+	// envoy on loopback :18000. Started before login so envoy can
+	// connect early; the initial snapshot has an empty x-tundler-exit-ip
+	// header until the first tunnel-up's PushExitIP arrives.
+	podName := os.Getenv(envPodName)
+	if podName == "" {
+		// Local-dev fallback. Real pods get POD_NAME via downward API.
+		podName = "tundler-tunnel-local"
+	}
+	xdsServer, err := xds.NewServer(xds.PodInputs{
+		PodName:        podName,
+		NodeIP:         os.Getenv(envNodeIP),
+		DataListenPort: dataListenPort,
+	})
+	if err != nil {
+		log.Fatalf("tundler-tunnel: xDS server init: %v", err)
+	}
+	go func() {
+		if err := xdsServer.Serve(ctx, xdsListenAddr); err != nil {
+			log.Printf("tundler-tunnel: xDS server: %v", err) // not fatal; envoy will reconnect
+		}
+	}()
+
+	// Each successful tunnel-up rebuilds the envoy snapshot with the
+	// new exit IP and pushes it on the xDS stream. Envoy receives the
+	// update within ~100ms — the x-tundler-exit-ip header flips on the
+	// next response without an envoy restart.
+	state.SetTunnelUpListener(func(exitIP string) {
+		if err := xdsServer.PushExitIP(exitIP); err != nil {
+			log.Printf("tundler-tunnel: xDS push (exit_ip=%s) failed: %v", exitIP, err)
+		}
+	})
 
 	go func() {
 		if err := startServer(ctx, state, triggerRotation); err != nil {
@@ -115,8 +155,8 @@ func main() {
 	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
 		watchdogInterval, minRotation)
 
-	// Hold the tunnel until SIGTERM. Future slices add the xDS server
-	// and self-monitor (Trigger C).
+	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
+	// (Trigger C) and Layer 1+2 envoy drain hooks.
 	<-ctx.Done()
 	log.Printf("tundler-tunnel: shutting down")
 }

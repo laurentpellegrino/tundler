@@ -25,6 +25,13 @@ const (
 // outcomes. All mutating accessors use a write lock; the JSON snapshotter
 // uses a read lock. Safe for concurrent use from the HTTP handlers and the
 // main goroutine.
+// TunnelUpListener is called from RecordTunnelUp after the tracker's
+// fields are updated. Used by main to wire the xDS server's PushExitIP
+// without coupling cmd/tundler-tunnel to the xds package directly.
+// Invoked outside the tracker's lock; safe for the listener to call
+// back into the tracker (no deadlock).
+type TunnelUpListener func(exitIP string)
+
 type StateTracker struct {
 	mu                    sync.RWMutex
 	state                 State
@@ -36,6 +43,7 @@ type StateTracker struct {
 	tunnelConnectedAt     time.Time
 	rotationCountTotal    int
 	lastRotation          *RotationRecord
+	tunnelUpListener      TunnelUpListener
 }
 
 // RotationRecord is the JSON shape under `last_rotation` in /status.
@@ -83,11 +91,34 @@ func (s *StateTracker) RecordBootLoginJitter(d time.Duration) {
 // RecordTunnelUp captures the location + exit IP of a freshly-established
 // tunnel and starts the tunnel_age_seconds clock. Called once Connect()
 // reports the tunnel is up (Connecting → Ready transition).
+//
+// If a TunnelUpListener has been registered via SetTunnelUpListener, it's
+// invoked with the new exit IP AFTER the tracker's internal state is
+// updated (and outside the lock so the listener can call back into the
+// tracker if needed). Used to fire xDS pushes on every tunnel-up.
 func (s *StateTracker) RecordTunnelUp(location, exitIP string) {
 	s.mu.Lock()
 	s.currentLocation = location
 	s.currentExitIP = exitIP
 	s.tunnelConnectedAt = time.Now().UTC()
+	listener := s.tunnelUpListener
+	s.mu.Unlock()
+
+	if listener != nil {
+		listener(exitIP)
+	}
+}
+
+// SetTunnelUpListener registers a callback fired on every RecordTunnelUp
+// (initial connect, watchdog reconnect, rotation success). Production
+// wires this to xds.Server.PushExitIP so the pod-local envoy gets a
+// fresh snapshot with the updated x-tundler-exit-ip header.
+//
+// Safe to call concurrently with RecordTunnelUp. Setting nil clears the
+// listener.
+func (s *StateTracker) SetTunnelUpListener(fn TunnelUpListener) {
+	s.mu.Lock()
+	s.tunnelUpListener = fn
 	s.mu.Unlock()
 }
 
