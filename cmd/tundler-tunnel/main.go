@@ -26,6 +26,7 @@ import (
 const (
 	envProvider           = "TUNDLER_TUNNEL_PROVIDER"
 	envBootLoginJitterSec = "BOOT_LOGIN_JITTER_SECONDS"
+	envExcludedLocations  = "EXCLUDED_LOCATIONS"
 	defaultBootJitterSec  = 60
 )
 
@@ -74,18 +75,49 @@ func main() {
 		// and CrashLoopBackOff kicks in), give probes a moment to pick up
 		// the new state, then exit non-zero.
 		log.Printf("tundler-tunnel: initial login failed for provider=%s: %v", providerName, err)
-		state.Set(StateFailed)
-		time.Sleep(2 * time.Second) // one probe period margin
-		os.Exit(1)
+		failAndExit(state)
 	}
-	state.Set(StateReady)
 
-	log.Printf("tundler-tunnel: provider=%s login successful — idling (tunnel hold not yet implemented)", providerName)
-	// Future slices replace this with: connect tunnel, hold, rotate, etc.
-	// For now, keep the process alive until SIGTERM so k8s doesn't see
-	// "completed" + restart-loop.
+	// Tunnel hold: pick a random allowed location (provider-filtered minus
+	// EXCLUDED_LOCATIONS) and Connect. Watchdog reconnect is a future
+	// slice; this one transitions to Ready on successful tunnel-up and
+	// stays there until SIGTERM.
+	state.Set(StateConnecting)
+	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+	available := prov.Locations(ctx)
+	location, err := pickLocation(available, excluded)
+	if err != nil {
+		log.Printf("tundler-tunnel: no allowed location for provider=%s (got %d locations, %d excluded): %v",
+			providerName, len(available), len(excluded), err)
+		failAndExit(state)
+	}
+	log.Printf("tundler-tunnel: provider=%s connecting to location=%s", providerName, location)
+	status := prov.Connect(ctx, location)
+	if !status.Connected {
+		log.Printf("tundler-tunnel: connect failed for provider=%s location=%s status=%+v",
+			providerName, location, status)
+		failAndExit(state)
+	}
+	state.RecordTunnelUp(location, status.IP)
+	state.Set(StateReady)
+	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s — holding",
+		providerName, location, status.IP)
+
+	// Hold the tunnel until SIGTERM. Future slices add the hourly rotation
+	// timer, watchdog reconnect, /rotate handler, and xDS pushes.
 	<-ctx.Done()
 	log.Printf("tundler-tunnel: shutting down")
+}
+
+// failAndExit transitions the tracker to Failed (so /livez flips to 503 on
+// the next probe period and k8s CrashLoopBackOff kicks in), gives probes a
+// moment to pick up the new state, then exits non-zero. Mirrors the
+// initial-login failure handling for any other unrecoverable startup
+// error (connect timeout, no allowed location, etc.).
+func failAndExit(state *StateTracker) {
+	state.Set(StateFailed)
+	time.Sleep(2 * time.Second) // one probe period margin
+	os.Exit(1)
 }
 
 func registryKeys() []string {
