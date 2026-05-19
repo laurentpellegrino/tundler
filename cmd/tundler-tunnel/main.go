@@ -7,9 +7,10 @@
 //   - HTTP server on :4242 with /readyz, /livez, /status (slice a')
 //   - Connect to random allowed location + record current_location/exit_ip (slice b'.1)
 //   - Watchdog reconnect on unexpected tunnel drop (slice b'.2)
+//   - Hourly random rotation timer (Ready → Draining → Rotating → Ready) (slice c'.1)
 //
-// Future slices: hourly rotation, xDS server, /rotate endpoint,
-// self-monitor (Trigger C).
+// Future slices: failed-rotation retry-with-different-location, xDS server,
+// /rotate HTTP handler, self-monitor (Trigger C), Layer 1+2 envoy drain.
 package main
 
 import (
@@ -30,8 +31,10 @@ const (
 	envBootLoginJitterSec    = "BOOT_LOGIN_JITTER_SECONDS"
 	envExcludedLocations     = "EXCLUDED_LOCATIONS"
 	envWatchdogIntervalSec   = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
+	envMinRotationSec        = "MIN_ROTATION_SECONDS"
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
+	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
 )
 
 func main() {
@@ -91,7 +94,15 @@ func main() {
 	watchdogInterval := time.Duration(getEnvInt(envWatchdogIntervalSec, defaultWatchdogIntervSec)) * time.Second
 	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval)
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog interval=%s", watchdogInterval)
+	// Start the hourly rotator: every MIN_ROTATION_SECONDS (default 1h)
+	// ± 10% jitter, pick a fresh random location and rotate. Initial
+	// offset is uniformly random in [0, MIN_ROTATION_SECONDS) so a fleet
+	// that boots together doesn't rotate in lockstep.
+	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
+	go runRotator(ctx, prov, state, providerName, excluded, minRotation)
+
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
+		watchdogInterval, minRotation)
 
 	// Hold the tunnel until SIGTERM. Future slices add the hourly rotation
 	// timer, /rotate handler, and xDS pushes.
