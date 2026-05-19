@@ -12,6 +12,12 @@ import (
 const (
 	envRotationRetryMax     = "ROTATION_RETRY_MAX"
 	defaultRotationRetryMax = 3
+
+	// drainWaitTimeout caps Layer 2 (in-flight wait). Matches the
+	// design-doc 30s hard timeout. If in-flight connections haven't
+	// drained by then, rotation proceeds anyway and Layer 3 (hub envoy
+	// retry) catches any survivors.
+	drainWaitTimeout = 30 * time.Second
 )
 
 // runRotator fires a tunnel rotation every `minInterval ± jitter`, picking
@@ -34,7 +40,7 @@ const (
 // are stubbed for this slice — there's no pod-local envoy yet in the
 // tundler-tunnel runtime. Those calls will be wired in when the xDS
 // server + envoy container are added.
-func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval time.Duration) {
+func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval time.Duration, drain drainController) {
 	// Initial offset: random 0..minInterval. Prevents the entire fleet
 	// from rotating at the same minute when they all boot together.
 	initialOffset := time.Duration(rand.Int64N(int64(minInterval)))
@@ -49,7 +55,7 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			rotateIfReady(ctx, prov, state, providerName, excluded)
+			rotateIfReady(ctx, prov, state, providerName, excluded, drain)
 			// Subsequent rotations: minInterval ± up to 10% jitter so
 			// pods slowly desynchronize even if they boot at the same
 			// moment. (Design doc says "every hour ± jitter".)
@@ -68,15 +74,22 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 // design-doc "Failed-rotation handling" section. If all attempts fail,
 // surrenders to StateFailed; the liveness probe then triggers a k8s
 // restart.
-func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string) {
+//
+// Production passes an envoyDrainController pointing at the pod-local
+// envoy admin; tests use nil (skip Layer 1+2) or a fakeDrainController.
+func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, drain drainController) {
 	rotateIfReadyWithDeps(ctx, prov, state, providerName, excluded,
-		getEnvInt(envRotationRetryMax, defaultRotationRetryMax), time.Sleep)
+		getEnvInt(envRotationRetryMax, defaultRotationRetryMax), time.Sleep, drain)
 }
 
 // rotateIfReadyWithDeps is the testable form of rotateIfReady — exposes
 // maxAttempts + sleep so tests can drive deterministic behavior without
 // reading env vars or waiting for real backoffs.
-func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration)) {
+//
+// drain may be nil (Layer 1+2 skipped). Production passes a non-nil
+// envoyDrainController; existing tests that don't care about envoy
+// drain pass nil.
+func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration), drain drainController) {
 	if state.Get() != StateReady {
 		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready)", state.Get())
 		return
@@ -85,11 +98,25 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 	started := time.Now()
 	previousIP := state.SnapshotCurrentExitIP()
 
-	// Draining: flip /readyz→503 immediately. In the future this is also
-	// where Layer 1 (envoy admin /drain_listeners) + Layer 2 (poll
-	// downstream_cx_active to zero) will live. Stub for now.
+	// Draining: flip /readyz→503 immediately, then run Layer 1+2 to
+	// ensure no in-flight crawl request rides the tunnel through the
+	// reconnect window. Per the design-doc three-defense-layers section.
 	state.Set(StateDraining)
 	log.Printf("tundler-tunnel: rotation started (previous_exit_ip=%s)", previousIP)
+
+	if drain != nil {
+		// Layer 1: tell envoy to refuse new TCP connections.
+		if err := drain.TriggerGracefulDrain(ctx); err != nil {
+			// Best-effort: if admin is unreachable we can't drain
+			// gracefully, but we still proceed — Layer 3 (hub envoy
+			// retry) catches anything that lands on the rotating pod.
+			log.Printf("tundler-tunnel: Layer 1 drain trigger failed (continuing): %v", err)
+		}
+		// Layer 2: wait for in-flight to complete (or hard timeout).
+		if err := drain.WaitForActiveConnectionsToDrain(ctx, drainWaitTimeout); err != nil {
+			log.Printf("tundler-tunnel: Layer 2 drain wait: %v (proceeding to Disconnect)", err)
+		}
+	}
 
 	// Rotating: disconnect, then reconnect with retry-with-different-
 	// location. The connectWithRetry helper tracks recentlyFailed within

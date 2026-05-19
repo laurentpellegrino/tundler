@@ -23,7 +23,7 @@ func TestRotateIfReady_HappyPath(t *testing.T) {
 	st.RecordTunnelUp("USA", "1.1.1.1")
 	st.Set(StateReady)
 
-	rotateIfReady(context.Background(), fp, st, "fake", nil)
+	rotateIfReady(context.Background(), fp, st, "fake", nil, nil)
 
 	if st.Get() != StateReady {
 		t.Errorf("state=%s, want Ready after rotation", st.Get())
@@ -61,7 +61,7 @@ func TestRotateIfReady_SkipsWhenNotReady(t *testing.T) {
 			}
 			st := NewStateTracker("fake")
 			st.Set(s)
-			rotateIfReady(context.Background(), fp, st, "fake", nil)
+			rotateIfReady(context.Background(), fp, st, "fake", nil, nil)
 			if fp.callCount() != 0 {
 				t.Errorf("rotator called Connect %d times in state=%s, want 0", fp.callCount(), s)
 			}
@@ -86,7 +86,7 @@ func TestRotateIfReady_FailureMarksFailed(t *testing.T) {
 	st.RecordTunnelUp("USA", "1.1.1.1")
 	st.Set(StateReady)
 
-	rotateIfReady(context.Background(), fp, st, "fake", nil)
+	rotateIfReady(context.Background(), fp, st, "fake", nil, nil)
 
 	if st.Get() != StateFailed {
 		t.Errorf("state=%s after rotation failure, want Failed", st.Get())
