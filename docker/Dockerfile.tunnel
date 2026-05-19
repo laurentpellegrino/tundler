@@ -1,0 +1,117 @@
+# Per-provider tunnel-pod image (PHASE 1 / Dockerfile-2)
+#
+# Builds a tundler-<provider>:latest image for the VPN-hub architecture:
+# one image per provider, single VPN client installed, runs the
+# tundler-tunnel binary (not the legacy tundler-api). The pod's envoy
+# data-plane container runs in a sibling container — NOT in this image.
+#
+# Build:
+#   docker build -f docker/Dockerfile.tunnel \
+#       --build-arg PROVIDER=expressvpn \
+#       -t laurentpellegrino/tundler-expressvpn:latest .
+#
+# See docs/architecture-tundler-fleet-controller.md ("Docker images from
+# the tundler repo") for the full image-family taxonomy.
+
+# ----------------------------------------------------------------------
+# Build stage — compile tundler-tunnel
+# ----------------------------------------------------------------------
+FROM golang:1.25 AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w" \
+    -o tundler-tunnel ./cmd/tundler-tunnel
+
+# ----------------------------------------------------------------------
+# Runtime stage — install ONE VPN client + tundler-tunnel
+# ----------------------------------------------------------------------
+FROM ubuntu:24.04
+
+# PROVIDER MUST be set at build time. Validated below.
+ARG PROVIDER
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+
+# Fail the build early if PROVIDER is missing or not in the allow-list.
+RUN if [ -z "${PROVIDER}" ]; then \
+        echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
+    fi && \
+    case "${PROVIDER}" in \
+        expressvpn|ipvanish|mullvad|nordvpn|pia|protonvpn|surfshark) ;; \
+        *) echo "ERROR: PROVIDER=${PROVIDER} not in allow-list" >&2; exit 1 ;; \
+    esac
+
+# Install base packages (apt deps + iptables/iproute2 for netns).
+RUN apt-get -y update && \
+    apt-get -y upgrade && \
+    apt-get install -y curl dbus gpg lsb-release sudo systemd unzip wget zip \
+                       iproute2 iptables && \
+    apt-get install -y --no-install-recommends apt-transport-https ca-certificates
+
+# Non-root user with sudo (provider install scripts assume this).
+RUN useradd -m -s /bin/bash tundler \
+    && echo "tundler ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+    && chown tundler:tundler /root
+
+# /usr/sbin/policy-rc.d is dropped to let provider daemons start under
+# systemd (same trick the legacy Dockerfile uses).
+RUN rm -f /usr/sbin/policy-rc.d
+
+# Provider install scripts are shared with the legacy image — we only
+# run the one for the requested PROVIDER and drop the rest.
+COPY docker/providers /opt/providers
+RUN chmod +x /opt/providers/*/install.sh
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN set -euo pipefail && \
+    for dir in /opt/providers/*; do \
+        p="$(basename "$dir")"; \
+        if [[ "$p" == "${PROVIDER}" ]]; then \
+            bash "$dir/install.sh"; \
+        else \
+            rm -rf "$dir"; \
+        fi; \
+    done
+
+# Copy the tundler-tunnel binary + the per-pod systemd unit + shared
+# scripts. The envoy data-plane container in the pod is a SIBLING
+# container (not built into this image), so no envoy install here.
+COPY --from=builder /build/tundler-tunnel /usr/local/bin/tundler-tunnel
+COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
+COPY docker/services/tundler-entrypoint.sh /usr/local/bin/tundler-entrypoint.sh
+COPY docker/services/tundler-tunnel.service /etc/systemd/system/
+
+RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh && \
+    systemctl enable tundler-tunnel.service && \
+    systemctl set-default multi-user.target && \
+    systemctl mask getty@tty1.service console-getty.service
+
+# Bound systemd's per-unit stop timeout so a misbehaving VPN daemon
+# doesn't stall k8s pod-deletion past the grace window. (Same value the
+# legacy image uses — keeps shutdown behavior consistent.)
+RUN mkdir -p /etc/systemd/system.conf.d && \
+    printf '[Manager]\nDefaultTimeoutStopSec=10s\nDefaultTimeoutAbortSec=10s\n' \
+        > /etc/systemd/system.conf.d/00-tundler-shutdown.conf
+
+# Clean apt caches to shrink the final image.
+RUN apt-get autoremove -y && \
+    apt-get autoclean -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# tundler-tunnel exposes:
+#   :4242 — HTTP API (/livez, /readyz, /status, /rotate) — consumed by
+#           k8s probes and by tundler-fleet-controller's rotation forwarder
+# Loopback-only ports NOT declared (they're not reachable from outside):
+#   :18000 — xDS gRPC (consumed by the sibling envoy container)
+EXPOSE 4242/tcp
+
+VOLUME ["/sys/fs/cgroup"]
+STOPSIGNAL SIGRTMIN+3
+
+ENTRYPOINT ["/usr/local/bin/tundler-entrypoint.sh"]

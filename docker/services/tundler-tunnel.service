@@ -1,0 +1,18 @@
+[Unit]
+Description=tundler-tunnel — simplified per-provider VPN runtime + xDS server
+After=network-online.target
+
+[Service]
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=TUNDLER_NETNS=vpnns
+EnvironmentFile=/etc/tundler/env
+ExecStartPre=/usr/local/bin/setup-netns.sh
+ExecStart=/usr/local/bin/tundler-tunnel
+Restart=always
+StandardError=journal+console
+StandardOutput=journal+console
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
