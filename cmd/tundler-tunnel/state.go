@@ -9,9 +9,6 @@ import (
 // and /livez HTTP probes and the /status JSON. Maps directly to the
 // "state" field in the Tundler-hub /status response schema documented in
 // architecture-tundler-fleet-controller.md (the per-pod schema).
-//
-// Slices implemented so far cover Booting, LoggingIn, Connecting, Ready,
-// Failed. Draining and Rotating will be added with the rotation lifecycle.
 type State string
 
 const (
@@ -19,8 +16,9 @@ const (
 	StateLoggingIn  State = "LoggingIn"  // calling provider.Login()
 	StateConnecting State = "Connecting" // calling provider.Connect() + waiting for tunnel up
 	StateReady      State = "Ready"      // tunnel up; serving traffic
-	// StateDraining / StateRotating reserved for the rotation slice.
-	StateFailed State = "Failed" // login/connect surrendered; /livez flips to 503 so k8s restarts
+	StateDraining   State = "Draining"   // rotation start: /readyz→503 + Layer 1 envoy drain in progress
+	StateRotating   State = "Rotating"   // Disconnect done; reconnecting to new location
+	StateFailed     State = "Failed"     // surrendered; /livez flips to 503 so k8s restarts
 )
 
 // StateTracker is the source of truth for the /status JSON and the probe
@@ -36,6 +34,19 @@ type StateTracker struct {
 	currentLocation       string
 	currentExitIP         string
 	tunnelConnectedAt     time.Time
+	rotationCountTotal    int
+	lastRotation          *RotationRecord
+}
+
+// RotationRecord is the JSON shape under `last_rotation` in /status.
+// Populated by RecordRotation after a rotation completes (success or
+// surrender).
+type RotationRecord struct {
+	CompletedAt     string `json:"completed_at"`
+	DurationSeconds int    `json:"duration_seconds"`
+	Outcome         string `json:"outcome"` // "success" or "failed"
+	PreviousExitIP  string `json:"previous_exit_ip,omitempty"`
+	NewExitIP       string `json:"new_exit_ip,omitempty"`
 }
 
 // NewStateTracker initializes a tracker in StateBooting, parking the
@@ -80,10 +91,36 @@ func (s *StateTracker) RecordTunnelUp(location, exitIP string) {
 	s.mu.Unlock()
 }
 
+// SnapshotCurrentExitIP returns the exit IP recorded by the last
+// RecordTunnelUp. Used by the rotator to capture previous_exit_ip
+// before the new Connect overwrites it.
+func (s *StateTracker) SnapshotCurrentExitIP() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentExitIP
+}
+
+// RecordRotation increments rotation_count_total and stamps the
+// last_rotation field of the /status JSON. Called once a rotation
+// completes (success or surrender). duration is the wall-clock time the
+// rotation took (Draining → Ready or Failed).
+func (s *StateTracker) RecordRotation(previousExitIP, newExitIP, outcome string, duration time.Duration) {
+	s.mu.Lock()
+	s.rotationCountTotal++
+	s.lastRotation = &RotationRecord{
+		CompletedAt:     time.Now().UTC().Format(time.RFC3339),
+		DurationSeconds: int(duration.Round(time.Second).Seconds()),
+		Outcome:         outcome,
+		PreviousExitIP:  previousExitIP,
+		NewExitIP:       newExitIP,
+	}
+	s.mu.Unlock()
+}
+
 // Snapshot returns a copy of the tracker's state as the JSON-serializable
-// shape /status emits. Fields not yet implemented in this slice
-// (next_rotation_in_seconds, rotation_count_total, last_rotation) are
-// zero-valued; later slices will populate them.
+// shape /status emits. next_rotation_in_seconds is not populated here —
+// the rotator goroutine owns that knowledge; later slices may pipe it
+// through if dashboards need it.
 func (s *StateTracker) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -92,6 +129,8 @@ func (s *StateTracker) Snapshot() Snapshot {
 		Provider:                     s.provider,
 		CurrentLocation:              s.currentLocation,
 		CurrentExitIP:                s.currentExitIP,
+		RotationCountTotal:           s.rotationCountTotal,
+		LastRotation:                 s.lastRotation,
 		BootLoginJitterActualSeconds: int(s.bootLoginJitterActual.Round(time.Second).Seconds()),
 	}
 	if !s.loggedInAt.IsZero() {
@@ -107,13 +146,14 @@ func (s *StateTracker) Snapshot() Snapshot {
 // rules match the schema documented in
 // architecture-tundler-fleet-controller.md.
 type Snapshot struct {
-	State                        State  `json:"state"`
-	Provider                     string `json:"provider"`
-	CurrentLocation              string `json:"current_location,omitempty"`
-	CurrentExitIP                string `json:"current_exit_ip,omitempty"`
-	TunnelAgeSeconds             int    `json:"tunnel_age_seconds"`
-	NextRotationInSeconds        int    `json:"next_rotation_in_seconds"`
-	RotationCountTotal           int    `json:"rotation_count_total"`
-	LoggedInAt                   string `json:"logged_in_at,omitempty"`
-	BootLoginJitterActualSeconds int    `json:"boot_login_jitter_actual_seconds"`
+	State                        State           `json:"state"`
+	Provider                     string          `json:"provider"`
+	CurrentLocation              string          `json:"current_location,omitempty"`
+	CurrentExitIP                string          `json:"current_exit_ip,omitempty"`
+	TunnelAgeSeconds             int             `json:"tunnel_age_seconds"`
+	NextRotationInSeconds        int             `json:"next_rotation_in_seconds"`
+	RotationCountTotal           int             `json:"rotation_count_total"`
+	LoggedInAt                   string          `json:"logged_in_at,omitempty"`
+	BootLoginJitterActualSeconds int             `json:"boot_login_jitter_actual_seconds"`
+	LastRotation                 *RotationRecord `json:"last_rotation,omitempty"`
 }
