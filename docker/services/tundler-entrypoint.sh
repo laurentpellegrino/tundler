@@ -27,4 +27,15 @@ if [[ -d /opt/providers ]]; then
     done
 fi
 
+# Strip legacy netns-isolation systemd drop-ins. Each provider's
+# configure.sh writes a netns.conf override pinning the VPN daemon to
+# /var/run/netns/vpnns — useful in the LEGACY all-providers-in-one
+# tundler image (where envoy ran inside the same container and needed
+# netns separation), but obsolete in the per-pod VPN-hub architecture
+# where the sibling envoy container shares the pod netns and the
+# vpnns separation just routes VPN traffic into a dead-end namespace.
+# Removing these makes provider daemons (nordvpnd, piavpn, etc.) run
+# in the pod's main netns so they can actually establish tunnels.
+rm -f /etc/systemd/system/*.service.d/netns.conf 2>/dev/null
+
 exec /lib/systemd/systemd
