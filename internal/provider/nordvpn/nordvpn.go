@@ -84,8 +84,13 @@ func (n NordVPN) Locations(ctx context.Context) []string {
 }
 
 func (n NordVPN) LoggedIn(ctx context.Context) bool {
-	out, _ := shared.RunCmd(ctx, bin, "login")
-	return strings.Contains(out, "already logged in")
+	// `nordvpn account` returns 0 + account-info when logged in,
+	// non-zero + "You're not logged in." when not. Quick & doesn't
+	// trigger the interactive OAuth flow that `nordvpn login` (no
+	// args) starts — which would block waiting for browser auth
+	// and balloon RunCmd's stdout buffer until OOM.
+	_, err := shared.RunCmd(ctx, bin, "account")
+	return err == nil
 }
 
 func (n NordVPN) Login(ctx context.Context) error {
