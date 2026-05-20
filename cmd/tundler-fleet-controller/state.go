@@ -44,6 +44,15 @@ func newFleetController(configured map[string]int) *FleetController {
 	}
 }
 
+// replaceConfigured swaps the configured map under the write lock.
+// Used by the fsnotify watcher (Slice 4) when vpn-providers.yaml is
+// updated in the live ConfigMap.
+func (f *FleetController) replaceConfigured(next map[string]int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.configured = next
+}
+
 // serviceForTunnelID returns the governing headless-Service name for a
 // given pod (the tunnel_id), or ok=false if the pod isn't in any
 // vpn-tunnel-* EndpointSlice subset (unknown name, crashed, evicted).
