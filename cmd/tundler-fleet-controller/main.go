@@ -120,7 +120,7 @@ func main() {
 	var wg sync.WaitGroup
 	stops := make([]func(), 0, len(configured))
 	for provider := range configured {
-		svcName := "vpn-tunnel-" + provider
+		svcName := "tundler-tunnel-" + provider
 		stop, done := watcher.startProvider(ctx, svcName, provider)
 		stops = append(stops, stop)
 		wg.Add(1)

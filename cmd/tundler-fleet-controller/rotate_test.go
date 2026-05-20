@@ -104,7 +104,7 @@ func decodeProblem(t *testing.T, resp *http.Response) problemDetails {
 func TestRotate_MalformedBody_BadRequest(t *testing.T) {
 	ts, fwd := newRotateTestServer(t,
 		map[string]int{"expressvpn": 7},
-		map[string]string{"vpn-tunnel-expressvpn-0": "vpn-tunnel-expressvpn"},
+		map[string]string{"tundler-tunnel-expressvpn-0": "tundler-tunnel-expressvpn"},
 	)
 	resp := postJSON(t, ts.URL+"/rotate", "}{ not json")
 	defer resp.Body.Close()
@@ -139,9 +139,9 @@ func TestRotate_MissingTunnelID_BadRequest(t *testing.T) {
 func TestRotate_UnknownTunnelID_BadRequest(t *testing.T) {
 	ts, fwd := newRotateTestServer(t,
 		map[string]int{"expressvpn": 7},
-		map[string]string{"vpn-tunnel-expressvpn-0": "vpn-tunnel-expressvpn"},
+		map[string]string{"tundler-tunnel-expressvpn-0": "tundler-tunnel-expressvpn"},
 	)
-	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "vpn-tunnel-foo-99"}`)
+	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "tundler-tunnel-foo-99"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status=%d, want 400", resp.StatusCode)
@@ -150,8 +150,8 @@ func TestRotate_UnknownTunnelID_BadRequest(t *testing.T) {
 	if p.Type != problemTypeUnknownTunnelID {
 		t.Errorf("type=%q, want %q", p.Type, problemTypeUnknownTunnelID)
 	}
-	if p.TunnelID != "vpn-tunnel-foo-99" {
-		t.Errorf("p.tunnel_id=%q, want vpn-tunnel-foo-99", p.TunnelID)
+	if p.TunnelID != "tundler-tunnel-foo-99" {
+		t.Errorf("p.tunnel_id=%q, want tundler-tunnel-foo-99", p.TunnelID)
 	}
 	if fwd.calls.Load() != 0 {
 		t.Errorf("forwarder called %d times, want 0", fwd.calls.Load())
@@ -161,11 +161,11 @@ func TestRotate_UnknownTunnelID_BadRequest(t *testing.T) {
 func TestRotate_PodUnreachable_BadGateway(t *testing.T) {
 	ts, fwd := newRotateTestServer(t,
 		map[string]int{"expressvpn": 7},
-		map[string]string{"vpn-tunnel-expressvpn-3": "vpn-tunnel-expressvpn"},
+		map[string]string{"tundler-tunnel-expressvpn-3": "tundler-tunnel-expressvpn"},
 	)
 	fwd.setError(errors.New("dial tcp: lookup ... no such host"))
 
-	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "vpn-tunnel-expressvpn-3"}`)
+	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "tundler-tunnel-expressvpn-3"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status=%d, want 502", resp.StatusCode)
@@ -177,23 +177,23 @@ func TestRotate_PodUnreachable_BadGateway(t *testing.T) {
 	if !strings.Contains(p.Detail, "no such host") {
 		t.Errorf("p.detail=%q, want it to mention 'no such host'", p.Detail)
 	}
-	if got := fwd.gotTunnelID; got != "vpn-tunnel-expressvpn-3" {
-		t.Errorf("forwarder got tunnelID=%q, want vpn-tunnel-expressvpn-3", got)
+	if got := fwd.gotTunnelID; got != "tundler-tunnel-expressvpn-3" {
+		t.Errorf("forwarder got tunnelID=%q, want tundler-tunnel-expressvpn-3", got)
 	}
-	if got := fwd.gotService; got != "vpn-tunnel-expressvpn" {
-		t.Errorf("forwarder got service=%q, want vpn-tunnel-expressvpn", got)
+	if got := fwd.gotService; got != "tundler-tunnel-expressvpn" {
+		t.Errorf("forwarder got service=%q, want tundler-tunnel-expressvpn", got)
 	}
 }
 
 func TestRotate_PropagatesPodSuccess_202(t *testing.T) {
 	ts, fwd := newRotateTestServer(t,
 		map[string]int{"expressvpn": 7},
-		map[string]string{"vpn-tunnel-expressvpn-3": "vpn-tunnel-expressvpn"},
+		map[string]string{"tundler-tunnel-expressvpn-3": "tundler-tunnel-expressvpn"},
 	)
-	podBody := `{"tunnel_id":"vpn-tunnel-expressvpn-3","previous_exit_ip":"45.83.124.18","state":"Rotating"}`
+	podBody := `{"tunnel_id":"tundler-tunnel-expressvpn-3","previous_exit_ip":"45.83.124.18","state":"Rotating"}`
 	fwd.setOK(http.StatusAccepted, podBody)
 
-	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "vpn-tunnel-expressvpn-3"}`)
+	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "tundler-tunnel-expressvpn-3"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Errorf("status=%d, want 202 (pod's 202 passed through)", resp.StatusCode)
@@ -214,12 +214,12 @@ func TestRotate_PropagatesPodProblem_409(t *testing.T) {
 	// `type` URI directly, not a fleet-controller wrapping).
 	ts, fwd := newRotateTestServer(t,
 		map[string]int{"expressvpn": 7},
-		map[string]string{"vpn-tunnel-expressvpn-5": "vpn-tunnel-expressvpn"},
+		map[string]string{"tundler-tunnel-expressvpn-5": "tundler-tunnel-expressvpn"},
 	)
-	podProblem := `{"type":"https://tundler-tunnel/errors/pod-failed-awaiting-restart","title":"Pod is in Failed state","status":409,"tunnel_id":"vpn-tunnel-expressvpn-5"}`
+	podProblem := `{"type":"https://tundler-tunnel/errors/pod-failed-awaiting-restart","title":"Pod is in Failed state","status":409,"tunnel_id":"tundler-tunnel-expressvpn-5"}`
 	fwd.setProblem(http.StatusConflict, podProblem)
 
-	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "vpn-tunnel-expressvpn-5"}`)
+	resp := postJSON(t, ts.URL+"/rotate", `{"tunnel_id": "tundler-tunnel-expressvpn-5"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("status=%d, want 409 (pod's 409 passed through)", resp.StatusCode)
@@ -267,12 +267,12 @@ func TestHTTPRotateForwarder_BuildsExpectedURL(t *testing.T) {
 		client:    &http.Client{Transport: rt},
 	}
 	_, err := fwd.forwardRotate(context.Background(),
-		"vpn-tunnel-expressvpn-3", "vpn-tunnel-expressvpn")
+		"tundler-tunnel-expressvpn-3", "tundler-tunnel-expressvpn")
 	if err != nil {
 		t.Fatalf("forwardRotate: %v", err)
 	}
 	got := <-captured
-	want := "http://vpn-tunnel-expressvpn-3.vpn-tunnel-expressvpn.ipregistry-production.svc:4242/rotate"
+	want := "http://tundler-tunnel-expressvpn-3.tundler-tunnel-expressvpn.ipregistry-production.svc:4242/rotate"
 	if got != want {
 		t.Errorf("URL=%s, want %s", got, want)
 	}
