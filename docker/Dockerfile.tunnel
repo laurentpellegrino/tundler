@@ -91,6 +91,25 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
     systemctl set-default multi-user.target && \
     systemctl mask getty@tty1.service console-getty.service
 
+# Enable each provider's daemon systemd unit so the VPN client daemon
+# starts at boot. The provider install scripts copy unit files into
+# /usr/lib/systemd/system/ but most don't enable them — only the legacy
+# `tundler-api` Go binary historically did that lazily at first-login.
+# In the new VPN-hub split, tundler-tunnel calls into the CLI (e.g.
+# `expressvpnctl login`) which would otherwise sit timing out waiting
+# for a daemon that's not running.
+#
+# OpenVPN-based providers (ipvanish / protonvpn / surfshark) don't have
+# a separate daemon to enable — the Go binary spawns openvpn directly
+# at connect time. The `|| true` lines are no-ops for those images.
+RUN case "${PROVIDER}" in \
+        expressvpn) systemctl enable expressvpn-service.service ;; \
+        nordvpn)    systemctl enable nordvpnd.service || true ;; \
+        mullvad)    systemctl enable mullvad-daemon.service || true ;; \
+        pia)        systemctl enable piad.service || true ;; \
+        *)          : ;; \
+    esac
+
 # Bound systemd's per-unit stop timeout so a misbehaving VPN daemon
 # doesn't stall k8s pod-deletion past the grace window. (Same value the
 # legacy image uses — keeps shutdown behavior consistent.)
