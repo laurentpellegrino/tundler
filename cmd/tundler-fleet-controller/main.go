@@ -96,6 +96,22 @@ func main() {
 		},
 	}
 
+	cfgWatcher := &configWatcher{
+		path: path,
+		onReload: func(next map[string]int) {
+			log.Printf("vpn-providers.yaml reloaded: %d providers configured", len(next))
+			fc.replaceConfigured(next)
+			if err := xdsSrv.rebuildSnapshot(); err != nil {
+				log.Printf("rebuild snapshot after config reload: %v", err)
+			}
+		},
+	}
+	go func() {
+		if err := cfgWatcher.watchConfig(ctx); err != nil {
+			log.Printf("config watch: %v", err)
+		}
+	}()
+
 	// Boot one informer per configured provider; gate /readyz on every
 	// initial reconcile completing. Until that's done kube-proxy holds
 	// this Pod out of the Service backends and crawlers route to the
