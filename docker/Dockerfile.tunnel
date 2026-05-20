@@ -112,7 +112,7 @@ RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
         mullvad)    systemctl enable mullvad-daemon.service || true ;; \
-        pia)        systemctl enable piad.service || true ;; \
+        pia)        systemctl enable piavpn.service || true ;; \
         *)          : ;; \
     esac
 
