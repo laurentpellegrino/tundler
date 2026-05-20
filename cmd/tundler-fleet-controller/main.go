@@ -8,9 +8,17 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -22,12 +30,21 @@ const (
 	// httpAddr is the crawler-facing HTTP port (/status, /rotate, /livez,
 	// /readyz). Exposed via the tundler-fleet-controller Service.
 	httpAddr = ":9090"
+
+	// resyncPeriod is how often the EndpointSlices informers do a full
+	// re-list against the apiserver as a safety net against missed
+	// watch events. 30s matches the design-doc snippet.
+	resyncPeriod = 30 * time.Second
 )
 
 func main() {
 	path := os.Getenv("VPN_PROVIDERS_PATH")
 	if path == "" {
 		path = defaultVPNProvidersPath
+	}
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		log.Fatal("POD_NAMESPACE not set — required to scope the EndpointSlices watch")
 	}
 
 	configured, err := loadConfigured(path)
@@ -36,20 +53,76 @@ func main() {
 	}
 	log.Printf("loaded vpn-providers.yaml: %d providers configured", len(configured))
 
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("in-cluster k8s config: %v", err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		log.Fatalf("kubernetes clientset: %v", err)
+	}
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
 	fc := newFleetController(configured)
 	srv := newHTTPServer(fc)
-
 	mux := http.NewServeMux()
 	srv.register(mux)
 
-	// TODO(slice-2): start EndpointSlices informers per provider, gate
-	// markReady() on every initial reconcile completing. For now mark
-	// ready immediately so /readyz returns 200 in single-binary smoke
-	// tests of the skeleton.
-	srv.markReady()
+	watcher := &sliceWatcher{
+		cs:           cs,
+		namespace:    namespace,
+		fc:           fc,
+		resyncPeriod: resyncPeriod,
+	}
+
+	// Boot one informer per configured provider; gate /readyz on every
+	// initial reconcile completing. Until that's done kube-proxy holds
+	// this Pod out of the Service backends and crawlers route to the
+	// other 2 hub Pods.
+	var wg sync.WaitGroup
+	stops := make([]func(), 0, len(configured))
+	for provider := range configured {
+		svcName := "vpn-tunnel-" + provider
+		stop, done := watcher.startProvider(ctx, svcName, provider)
+		stops = append(stops, stop)
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			select {
+			case <-done:
+				log.Printf("informer warm: provider=%s", p)
+			case <-ctx.Done():
+			}
+		}(provider)
+	}
+
+	go func() {
+		wg.Wait()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		srv.markReady()
+		log.Printf("all informers warm; /readyz now returns 200")
+	}()
+
+	httpSrv := &http.Server{Addr: httpAddr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		log.Printf("shutdown signal received; closing HTTP server + informers")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+		for _, stop := range stops {
+			stop()
+		}
+	}()
 
 	log.Printf("tundler-fleet-controller listening on %s", httpAddr)
-	if err := http.ListenAndServe(httpAddr, mux); err != nil {
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http server: %v", err)
 	}
 }
