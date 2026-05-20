@@ -1,0 +1,57 @@
+# Per-pod envoy bootstrap for the tunnel-pod sibling envoy.
+#
+# Everything dynamic (listener, route, response headers, ORIGINAL_DST
+# cluster with current exit IP) is served via ADS from the sibling
+# tundler-tunnel process on 127.0.0.1:18000. The bootstrap only knows
+# how to FIND that xDS server.
+#
+# Counterpart on the hub side: docker/config/envoy.yaml is the legacy
+# all-providers config; this file is for the new VPN-hub split.
+node:
+  id: tundler-tunnel
+  cluster: tundler-tunnel
+
+static_resources:
+  clusters:
+    # The ONLY static cluster — points at the sibling tundler-tunnel
+    # process. All other clusters (vpn-upstream) come via CDS from
+    # this xDS server.
+    - name: xds_cluster
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 18000
+
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc:
+          cluster_name: xds_cluster
+  cds_config:
+    ads: {}
+    resource_api_version: V3
+  lds_config:
+    ads: {}
+    resource_api_version: V3
+
+admin:
+  # Loopback only — used by tundler-tunnel for Layer 1 drain via its
+  # Go HTTP client (same pod netns, no curl needed).
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
