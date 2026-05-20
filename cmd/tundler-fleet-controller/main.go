@@ -70,11 +70,30 @@ func main() {
 	mux := http.NewServeMux()
 	srv.register(mux)
 
+	xdsSrv := newFleetXDSServer(fc)
+	// Seed an initial snapshot so the hub envoy gets clusters as soon as
+	// it connects — even if no EndpointSlices have arrived yet, envoy
+	// learns the cluster list (with empty endpoint sets) and is ready to
+	// pick up endpoints the moment the first reconcile lands.
+	if err := xdsSrv.rebuildSnapshot(); err != nil {
+		log.Fatalf("initial xds snapshot: %v", err)
+	}
+	go func() {
+		if err := xdsSrv.Serve(ctx, fleetXDSAddr); err != nil {
+			log.Printf("xds server: %v", err)
+		}
+	}()
+
 	watcher := &sliceWatcher{
 		cs:           cs,
 		namespace:    namespace,
 		fc:           fc,
 		resyncPeriod: resyncPeriod,
+		onReconcile: func() {
+			if err := xdsSrv.rebuildSnapshot(); err != nil {
+				log.Printf("rebuild snapshot after reconcile: %v", err)
+			}
+		},
 	}
 
 	// Boot one informer per configured provider; gate /readyz on every
