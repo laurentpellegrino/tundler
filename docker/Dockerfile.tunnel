@@ -85,6 +85,12 @@ COPY --from=builder /build/tundler-tunnel /usr/local/bin/tundler-tunnel
 COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
 COPY docker/services/tundler-entrypoint.sh /usr/local/bin/tundler-entrypoint.sh
 COPY docker/services/tundler-tunnel.service /etc/systemd/system/
+# The sibling envoy container reads its bootstrap from a k8s ConfigMap
+# (mounted into the envoy container at /etc/envoy/), NOT from this
+# image's filesystem. See the StatefulSet template in
+# ipregistry-kubernetes; the bootstrap content itself is in
+# docker/config/envoy-tunnel.yaml (committed to this repo for source-
+# of-truth so the k8s ConfigMap stays in sync).
 
 RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh && \
     systemctl enable tundler-tunnel.service && \
