@@ -49,7 +49,7 @@ func buildFleetSnapshot(version string, configured map[string]int, podAddrs map[
 	cdsResources := make([]types.Resource, 0, len(providers))
 	edsResources := make([]types.Resource, 0, len(providers))
 	for _, p := range providers {
-		clusterName := "vpn-tunnel-" + p
+		clusterName := "tundler-tunnel-" + p
 		cdsResources = append(cdsResources, buildFleetCluster(clusterName))
 
 		ips := append([]string{}, podAddrs[p]...)

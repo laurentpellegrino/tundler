@@ -16,7 +16,7 @@ import (
 // without waiting for the first tunnel-up.
 func TestNewServer_HasInitialSnapshot(t *testing.T) {
 	srv, err := NewServer(PodInputs{
-		PodName:        "vpn-tunnel-expressvpn-3",
+		PodName:        "tundler-tunnel-expressvpn-3",
 		NodeIP:         "128.140.80.11",
 		DataListenPort: 8484,
 	})
@@ -45,7 +45,7 @@ func TestNewServer_HasInitialSnapshot(t *testing.T) {
 // still present. Version string changes between consecutive pushes.
 func TestPushExitIP_UpdatesSnapshot(t *testing.T) {
 	srv, err := NewServer(PodInputs{
-		PodName:        "vpn-tunnel-expressvpn-3",
+		PodName:        "tundler-tunnel-expressvpn-3",
 		DataListenPort: 8484,
 	})
 	if err != nil {
@@ -86,7 +86,7 @@ func TestPushExitIP_UpdatesSnapshot(t *testing.T) {
 // envoy-client conversation is integration-test material.
 func TestServe_StartsAndStops(t *testing.T) {
 	srv, err := NewServer(PodInputs{
-		PodName:        "vpn-tunnel-expressvpn-3",
+		PodName:        "tundler-tunnel-expressvpn-3",
 		DataListenPort: 8484,
 	})
 	if err != nil {
