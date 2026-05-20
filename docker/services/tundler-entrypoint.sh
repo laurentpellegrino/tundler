@@ -21,6 +21,14 @@ if [[ -d /opt/providers ]]; then
     for dir in /opt/providers/*/; do
         configure="$dir/configure.sh"
         if [[ -x "$configure" ]]; then
+            # Strip `ip netns exec <netns>` prefixes from configure.sh
+            # before running it. The legacy scripts run their CLI setup
+            # inside vpnns to reach the netns-pinned daemon — in the
+            # per-pod architecture the daemon lives in the main netns,
+            # so `ip netns exec` would fail to reach it and the script
+            # would silently no-op (or hang). Stripping forces commands
+            # to run in the main netns alongside the daemon.
+            sed -E -i 's/ip netns exec [^[:space:]]+ //g' "$configure"
             echo "[tundler-entrypoint] running $configure"
             bash "$configure" || echo "[tundler-entrypoint] WARNING: $configure exited $?"
         fi
