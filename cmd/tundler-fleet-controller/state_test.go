@@ -36,13 +36,13 @@ func TestStatusSnapshot_IncludesEveryConfiguredProvider(t *testing.T) {
 
 func TestServiceForTunnelID(t *testing.T) {
 	fc := newFleetController(map[string]int{"expressvpn": 7})
-	fc.podToService["vpn-tunnel-expressvpn-0"] = "vpn-tunnel-expressvpn"
-	fc.podToService["vpn-tunnel-expressvpn-3"] = "vpn-tunnel-expressvpn"
+	fc.podToService["tundler-tunnel-expressvpn-0"] = "tundler-tunnel-expressvpn"
+	fc.podToService["tundler-tunnel-expressvpn-3"] = "tundler-tunnel-expressvpn"
 
-	if got, ok := fc.serviceForTunnelID("vpn-tunnel-expressvpn-3"); !ok || got != "vpn-tunnel-expressvpn" {
-		t.Errorf("serviceForTunnelID(known)=(%q,%v), want (vpn-tunnel-expressvpn,true)", got, ok)
+	if got, ok := fc.serviceForTunnelID("tundler-tunnel-expressvpn-3"); !ok || got != "tundler-tunnel-expressvpn" {
+		t.Errorf("serviceForTunnelID(known)=(%q,%v), want (tundler-tunnel-expressvpn,true)", got, ok)
 	}
-	if _, ok := fc.serviceForTunnelID("vpn-tunnel-foo-99"); ok {
+	if _, ok := fc.serviceForTunnelID("tundler-tunnel-foo-99"); ok {
 		t.Error("serviceForTunnelID(unknown) returned ok=true, want false")
 	}
 }

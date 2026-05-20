@@ -55,7 +55,7 @@ func (f *FleetController) replaceConfigured(next map[string]int) {
 
 // serviceForTunnelID returns the governing headless-Service name for a
 // given pod (the tunnel_id), or ok=false if the pod isn't in any
-// vpn-tunnel-* EndpointSlice subset (unknown name, crashed, evicted).
+// tundler-tunnel-* EndpointSlice subset (unknown name, crashed, evicted).
 func (f *FleetController) serviceForTunnelID(tunnelID string) (string, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

@@ -18,7 +18,7 @@ func TestBuildSnapshot_RequiresPodName(t *testing.T) {
 }
 
 func TestBuildSnapshot_RequiresPort(t *testing.T) {
-	_, err := BuildSnapshot("v1", PodInputs{PodName: "vpn-tunnel-expressvpn-3"}, "1.2.3.4")
+	_, err := BuildSnapshot("v1", PodInputs{PodName: "tundler-tunnel-expressvpn-3"}, "1.2.3.4")
 	if err == nil || !strings.Contains(err.Error(), "DataListenPort") {
 		t.Errorf("err=%v, want error mentioning DataListenPort", err)
 	}
@@ -27,7 +27,7 @@ func TestBuildSnapshot_RequiresPort(t *testing.T) {
 func TestBuildSnapshot_ContainsClusterAndListener(t *testing.T) {
 	snap, err := BuildSnapshot("v1",
 		PodInputs{
-			PodName:        "vpn-tunnel-expressvpn-3",
+			PodName:        "tundler-tunnel-expressvpn-3",
 			NodeIP:         "128.140.80.11",
 			DataListenPort: 8484,
 		},
@@ -78,7 +78,7 @@ func TestBuildSnapshot_ContainsClusterAndListener(t *testing.T) {
 func TestBuildSnapshot_ResponseHeadersIncludeTundlerSet(t *testing.T) {
 	snap, err := BuildSnapshot("v1",
 		PodInputs{
-			PodName:        "vpn-tunnel-expressvpn-3",
+			PodName:        "tundler-tunnel-expressvpn-3",
 			NodeIP:         "128.140.80.11",
 			DataListenPort: 8484,
 		},
@@ -96,14 +96,14 @@ func TestBuildSnapshot_ResponseHeadersIncludeTundlerSet(t *testing.T) {
 	// We don't unmarshal the HCM Any here; the response-headers contract
 	// is verified at the route-config level by buildRouteConfiguration's
 	// unit-internal accessor (call directly, not through the snapshot).
-	rc := buildRouteConfiguration("vpn-tunnel-expressvpn-3", "128.140.80.11", "45.83.124.18")
+	rc := buildRouteConfiguration("tundler-tunnel-expressvpn-3", "128.140.80.11", "45.83.124.18")
 	r := rc.VirtualHosts[0].Routes[0]
 	headerKeys := map[string]string{}
 	for _, h := range r.ResponseHeadersToAdd {
 		headerKeys[h.Header.Key] = h.Header.Value
 	}
 	want := map[string]string{
-		"x-tundler-tunnel-id": "vpn-tunnel-expressvpn-3",
+		"x-tundler-tunnel-id": "tundler-tunnel-expressvpn-3",
 		"x-tundler-node-ip":   "128.140.80.11",
 		"x-tundler-exit-ip":   "45.83.124.18",
 	}
@@ -124,7 +124,7 @@ func TestBuildSnapshot_ResponseHeadersIncludeTundlerSet(t *testing.T) {
 // successfully (so envoy can be configured pre-tunnel) and just omits
 // the header rather than emitting "x-tundler-exit-ip: ".
 func TestBuildSnapshot_OmitsEmptyNodeAndExitHeaders(t *testing.T) {
-	rc := buildRouteConfiguration("vpn-tunnel-expressvpn-3", "", "")
+	rc := buildRouteConfiguration("tundler-tunnel-expressvpn-3", "", "")
 	r := rc.VirtualHosts[0].Routes[0]
 	if len(r.ResponseHeadersToAdd) != 1 {
 		t.Errorf("got %d headers, want 1 (only tunnel-id when others empty)", len(r.ResponseHeadersToAdd))

@@ -31,9 +31,9 @@ func TestBuildFleetSnapshot_OneClusterPerProviderWithEndpoints(t *testing.T) {
 	if got, want := len(endpoints), 2; got != want {
 		t.Errorf("len(endpoints)=%d, want %d", got, want)
 	}
-	c, ok := clusters["vpn-tunnel-expressvpn"].(*cluster.Cluster)
+	c, ok := clusters["tundler-tunnel-expressvpn"].(*cluster.Cluster)
 	if !ok {
-		t.Fatalf("vpn-tunnel-expressvpn cluster missing or wrong type")
+		t.Fatalf("tundler-tunnel-expressvpn cluster missing or wrong type")
 	}
 	if c.GetType() != cluster.Cluster_EDS {
 		t.Errorf("cluster.Type=%v, want EDS", c.GetType())
@@ -41,8 +41,8 @@ func TestBuildFleetSnapshot_OneClusterPerProviderWithEndpoints(t *testing.T) {
 	if c.GetLbPolicy() != cluster.Cluster_ROUND_ROBIN {
 		t.Errorf("cluster.LbPolicy=%v, want ROUND_ROBIN", c.GetLbPolicy())
 	}
-	if c.GetEdsClusterConfig().GetServiceName() != "vpn-tunnel-expressvpn" {
-		t.Errorf("ServiceName=%q, want vpn-tunnel-expressvpn", c.GetEdsClusterConfig().GetServiceName())
+	if c.GetEdsClusterConfig().GetServiceName() != "tundler-tunnel-expressvpn" {
+		t.Errorf("ServiceName=%q, want tundler-tunnel-expressvpn", c.GetEdsClusterConfig().GetServiceName())
 	}
 	if c.GetOutlierDetection().GetConsecutiveGatewayFailure().GetValue() != 5 {
 		t.Errorf("ConsecutiveGatewayFailure=%d, want 5",
@@ -56,9 +56,9 @@ func TestBuildFleetSnapshot_OneClusterPerProviderWithEndpoints(t *testing.T) {
 			c.GetEdsClusterConfig().GetEdsConfig().GetConfigSourceSpecifier())
 	}
 
-	ep, ok := endpoints["vpn-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
+	ep, ok := endpoints["tundler-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
 	if !ok {
-		t.Fatalf("vpn-tunnel-expressvpn ClusterLoadAssignment missing or wrong type")
+		t.Fatalf("tundler-tunnel-expressvpn ClusterLoadAssignment missing or wrong type")
 	}
 	if got := len(ep.GetEndpoints()[0].GetLbEndpoints()); got != 2 {
 		t.Errorf("expressvpn LbEndpoints=%d, want 2", got)
@@ -91,7 +91,7 @@ func TestBuildFleetSnapshot_ProviderWithNoEndpointsStillExportsCluster(t *testin
 	if len(endpoints) != 1 {
 		t.Errorf("len(endpoints)=%d, want 1 even with no endpoints", len(endpoints))
 	}
-	ep := endpoints["vpn-tunnel-surfshark"].(*endpoint.ClusterLoadAssignment)
+	ep := endpoints["tundler-tunnel-surfshark"].(*endpoint.ClusterLoadAssignment)
 	if got := len(ep.GetEndpoints()[0].GetLbEndpoints()); got != 0 {
 		t.Errorf("LbEndpoints=%d for empty provider, want 0", got)
 	}
@@ -121,8 +121,8 @@ func TestBuildFleetSnapshot_DeterministicForGivenInputs(t *testing.T) {
 		}
 		return out
 	}
-	g1 := get(snap1.GetResources(resource.EndpointType)["vpn-tunnel-a"])
-	g2 := get(snap2.GetResources(resource.EndpointType)["vpn-tunnel-a"])
+	g1 := get(snap1.GetResources(resource.EndpointType)["tundler-tunnel-a"])
+	g2 := get(snap2.GetResources(resource.EndpointType)["tundler-tunnel-a"])
 	if !equalSlices(g1, g2) {
 		t.Errorf("non-deterministic output: %v vs %v", g1, g2)
 	}
@@ -155,9 +155,9 @@ func TestFleetXDSServer_RebuildAdvancesVersion(t *testing.T) {
 
 func TestFleetXDSServer_ReflectsFleetControllerCacheChanges(t *testing.T) {
 	fc := newFleetController(map[string]int{"expressvpn": 7})
-	fc.applyProviderReconcile("expressvpn", "vpn-tunnel-expressvpn",
+	fc.applyProviderReconcile("expressvpn", "tundler-tunnel-expressvpn",
 		[]string{"10.0.0.1"},
-		[]string{"vpn-tunnel-expressvpn-0"},
+		[]string{"tundler-tunnel-expressvpn-0"},
 	)
 	s := newFleetXDSServer(fc)
 	if err := s.rebuildSnapshot(); err != nil {
@@ -168,23 +168,23 @@ func TestFleetXDSServer_ReflectsFleetControllerCacheChanges(t *testing.T) {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
 	endpoints := snap.GetResources(resource.EndpointType)
-	ep := endpoints["vpn-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
+	ep := endpoints["tundler-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
 	if got := len(ep.GetEndpoints()[0].GetLbEndpoints()); got != 1 {
 		t.Errorf("LbEndpoints=%d, want 1", got)
 	}
 
 	// Now add a second pod via the reconcile method — rebuildSnapshot
 	// should reflect the new endpoint.
-	fc.applyProviderReconcile("expressvpn", "vpn-tunnel-expressvpn",
+	fc.applyProviderReconcile("expressvpn", "tundler-tunnel-expressvpn",
 		[]string{"10.0.0.1", "10.0.0.2"},
-		[]string{"vpn-tunnel-expressvpn-0", "vpn-tunnel-expressvpn-1"},
+		[]string{"tundler-tunnel-expressvpn-0", "tundler-tunnel-expressvpn-1"},
 	)
 	if err := s.rebuildSnapshot(); err != nil {
 		t.Fatalf("second rebuild: %v", err)
 	}
 	snap, _ = s.cache.GetSnapshot(fleetXDSNodeID)
 	endpoints = snap.GetResources(resource.EndpointType)
-	ep = endpoints["vpn-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
+	ep = endpoints["tundler-tunnel-expressvpn"].(*endpoint.ClusterLoadAssignment)
 	if got := len(ep.GetEndpoints()[0].GetLbEndpoints()); got != 2 {
 		t.Errorf("after second reconcile: LbEndpoints=%d, want 2", got)
 	}
