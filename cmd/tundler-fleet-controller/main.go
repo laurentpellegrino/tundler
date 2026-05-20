@@ -69,6 +69,7 @@ func main() {
 	srv := newHTTPServer(fc)
 	mux := http.NewServeMux()
 	srv.register(mux)
+	srv.registerRotate(mux, newHTTPRotateForwarder(namespace))
 
 	xdsSrv := newFleetXDSServer(fc)
 	// Seed an initial snapshot so the hub envoy gets clusters as soon as
