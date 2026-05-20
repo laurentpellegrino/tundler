@@ -13,7 +13,7 @@ import (
 )
 
 const bin = "piactl"
-const name = "privateinternetaccess"
+const name = "pia"
 
 // rateLimitCooldown is how long Login refuses to call piactl after PIA's
 // auth API has returned ApiRateLimitedError. Chosen to outlast PIA's typical
