@@ -42,6 +42,14 @@ func (s *httpServer) register(mux *http.ServeMux) {
 	mux.HandleFunc("/status", s.handleStatus)
 }
 
+// registerRotate attaches the /rotate handler. Kept separate from
+// register() because it needs a rotateForwarder dependency that
+// non-rotate tests don't care about.
+func (s *httpServer) registerRotate(mux *http.ServeMux, fwd rotateForwarder) {
+	h := &rotateHandler{fc: s.fc, forwarder: fwd}
+	mux.HandleFunc("/rotate", h.handleRotate)
+}
+
 func (s *httpServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	// Liveness = the process is up. Cache-warm state lives behind /readyz.
 	w.WriteHeader(http.StatusOK)
