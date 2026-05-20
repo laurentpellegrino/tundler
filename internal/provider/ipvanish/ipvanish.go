@@ -253,7 +253,17 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	}
 
 	// --cd so the config's relative `ca ca.ipvanish.com.crt` resolves.
-	if _, err := shared.RunCmd(ctx, "openvpn", "--cd", configDir(), "--config", activeConfigName, "--daemon"); err != nil {
+	// --tun-mtu / --mssfix clamp packet size below the k8s pod MTU
+	// (typically 1370 on Talos/Cilium); without these, OpenVPN's
+	// default 1500-byte MTU produces oversized UDP packets that get
+	// dropped on the path, causing the TLS handshake to never
+	// complete and the connect to time out.
+	if _, err := shared.RunCmd(ctx, "openvpn",
+		"--cd", configDir(),
+		"--config", activeConfigName,
+		"--tun-mtu", "1320",
+		"--mssfix", "1280",
+		"--daemon"); err != nil {
 		shared.Debugf("IPVanish: failed to start openvpn: %v", err)
 		return provider.Status{Connected: false, Provider: name, Location: location}
 	}
