@@ -29,6 +29,7 @@ import (
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
+	"github.com/laurentpellegrino/tundler/internal/shared"
 	"github.com/laurentpellegrino/tundler/internal/xds"
 )
 
@@ -53,6 +54,14 @@ const (
 )
 
 func main() {
+	// Provider plugins log failures via shared.Debugf, which is a no-op
+	// unless SetDebug(true) is called. In production we DO want those
+	// lines — "no servers found", "AUTH_FAILED", "failed to write
+	// config", "openvpn connection timeout" etc. are the only signal we
+	// have for connect-path failures, and silencing them turns every
+	// real-world bug into "initial connect failed" with no further info.
+	shared.SetDebug(true)
+
 	providerName := os.Getenv(envProvider)
 	if providerName == "" {
 		log.Fatalf("tundler-tunnel: %s must be set (e.g. expressvpn, nordvpn, pia)", envProvider)
