@@ -45,8 +45,12 @@ func TestBuildSnapshot_ContainsClusterAndListener(t *testing.T) {
 	if !ok {
 		t.Fatalf("cluster %q not found / wrong type: %v", ClusterName, clusters)
 	}
-	if cl.GetType() != cluster.Cluster_ORIGINAL_DST {
-		t.Errorf("cluster type=%v, want ORIGINAL_DST", cl.GetType())
+	// The cluster is now `envoy.clusters.dynamic_forward_proxy` (a custom
+	// extension), not a built-in type. The discovery_type oneof selects
+	// CustomClusterType and GetType() returns the default STATIC zero
+	// value, so check the custom-cluster name instead.
+	if got := cl.GetClusterType().GetName(); got != "envoy.clusters.dynamic_forward_proxy" {
+		t.Errorf("cluster custom name=%q, want envoy.clusters.dynamic_forward_proxy", got)
 	}
 	if cl.GetLbPolicy() != cluster.Cluster_CLUSTER_PROVIDED {
 		t.Errorf("lb_policy=%v, want CLUSTER_PROVIDED", cl.GetLbPolicy())
