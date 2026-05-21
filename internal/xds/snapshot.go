@@ -20,6 +20,9 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	dfpcluster "github.com/envoyproxy/go-control-plane/envoy/extensions/clusters/dynamic_forward_proxy/v3"
+	dfpcommon "github.com/envoyproxy/go-control-plane/envoy/extensions/common/dynamic_forward_proxy/v3"
+	dfpfilter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/dynamic_forward_proxy/v3"
 	routerpb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -58,7 +61,10 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 		return nil, errors.New("PodInputs.DataListenPort is required")
 	}
 
-	cl := buildCluster()
+	cl, err := buildCluster()
+	if err != nil {
+		return nil, fmt.Errorf("build cluster: %w", err)
+	}
 	rc := buildRouteConfiguration(pod.PodName, pod.NodeIP, currentExitIP)
 	ln, err := buildListener(pod.DataListenPort, rc)
 	if err != nil {
@@ -75,18 +81,39 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 	return snap, nil
 }
 
-// buildCluster returns an ORIGINAL_DST cluster — envoy forwards each
-// request to the URL the crawler addressed (Host header / SNI), letting
-// the VPN tunnel's iptables/routing handle the actual egress. This is
-// the design's "ORIGINAL_DST upstream cluster so envoy forwards to
-// whatever URL the crawler addressed" decision.
-func buildCluster() *cluster.Cluster {
-	return &cluster.Cluster{
-		Name:                 ClusterName,
-		ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_ORIGINAL_DST},
-		LbPolicy:             cluster.Cluster_CLUSTER_PROVIDED,
-		ConnectTimeout:       durationpb.New(2 * time.Second),
+// buildCluster returns a dynamic_forward_proxy cluster — envoy resolves
+// the destination from the request (CONNECT target or Host header) and
+// opens a connection to it. The VPN tunnel's kernel routing (default
+// route through tun0) ensures egress packets go through the VPN exit IP.
+//
+// We can't use ORIGINAL_DST here: ORIGINAL_DST reads SO_ORIGINAL_DST
+// from iptables-redirected sockets, but the crawler is using envoy as
+// an explicit HTTP proxy — there's no iptables redirect upstream of
+// envoy, so SO_ORIGINAL_DST is empty. dynamic_forward_proxy resolves
+// hostnames lazily and works for both regular HTTP requests (where
+// the Host header carries the target) and CONNECT requests (where the
+// authority carries it).
+func buildCluster() (*cluster.Cluster, error) {
+	dfpCfg, err := anypb.New(&dfpcluster.ClusterConfig{
+		ClusterImplementationSpecifier: &dfpcluster.ClusterConfig_DnsCacheConfig{
+			DnsCacheConfig: &dfpcommon.DnsCacheConfig{
+				Name:            "dynamic_forward_proxy_cache",
+				DnsLookupFamily: cluster.Cluster_V4_ONLY,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("anypb.New(ClusterConfig): %w", err)
 	}
+	return &cluster.Cluster{
+		Name:           ClusterName,
+		LbPolicy:       cluster.Cluster_CLUSTER_PROVIDED,
+		ConnectTimeout: durationpb.New(5 * time.Second),
+		ClusterDiscoveryType: &cluster.Cluster_ClusterType{ClusterType: &cluster.Cluster_CustomClusterType{
+			Name:        "envoy.clusters.dynamic_forward_proxy",
+			TypedConfig: dfpCfg,
+		}},
+	}, nil
 }
 
 // ClusterName is the upstream-cluster name referenced by the route. Kept
@@ -113,22 +140,44 @@ func buildRouteConfiguration(podName, nodeIP, exitIP string) *route.RouteConfigu
 			Header: &core.HeaderValue{Key: "x-tundler-exit-ip", Value: exitIP},
 		})
 	}
+	// Two routes:
+	//  1. CONNECT (HTTPS forward-proxy): the hub envoy forwards the
+	//     CONNECT verb here, this envoy terminates it (connect_config: {})
+	//     and TCP-tunnels to the dynamic-forward-proxy-resolved upstream.
+	//  2. prefix:/ (plain HTTP forward-proxy): regular HTTP requests
+	//     route to the same cluster, which uses the Host header.
+	connectRoute := &route.Route{
+		Match: &route.RouteMatch{
+			PathSpecifier: &route.RouteMatch_ConnectMatcher_{ConnectMatcher: &route.RouteMatch_ConnectMatcher{}},
+		},
+		Action: &route.Route_Route{
+			Route: &route.RouteAction{
+				ClusterSpecifier: &route.RouteAction_Cluster{Cluster: ClusterName},
+				UpgradeConfigs: []*route.RouteAction_UpgradeConfig{{
+					UpgradeType:   "CONNECT",
+					ConnectConfig: &route.RouteAction_UpgradeConfig_ConnectConfig{},
+				}},
+			},
+		},
+		ResponseHeadersToAdd: headers,
+	}
+	plainRoute := &route.Route{
+		Match: &route.RouteMatch{
+			PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
+		},
+		Action: &route.Route_Route{
+			Route: &route.RouteAction{
+				ClusterSpecifier: &route.RouteAction_Cluster{Cluster: ClusterName},
+			},
+		},
+		ResponseHeadersToAdd: headers,
+	}
 	return &route.RouteConfiguration{
 		Name: "tundler_tunnel_routes",
 		VirtualHosts: []*route.VirtualHost{{
 			Name:    "all",
 			Domains: []string{"*"},
-			Routes: []*route.Route{{
-				Match: &route.RouteMatch{
-					PathSpecifier: &route.RouteMatch_Prefix{Prefix: "/"},
-				},
-				Action: &route.Route_Route{
-					Route: &route.RouteAction{
-						ClusterSpecifier: &route.RouteAction_Cluster{Cluster: ClusterName},
-					},
-				},
-				ResponseHeadersToAdd: headers,
-			}},
+			Routes:  []*route.Route{connectRoute, plainRoute},
 		}},
 	}
 }
@@ -142,18 +191,46 @@ func buildListener(port int, rc *route.RouteConfiguration) (*listener.Listener, 
 	if err != nil {
 		return nil, fmt.Errorf("anypb.New(Router): %w", err)
 	}
+	// dynamic_forward_proxy HTTP filter shares the same DnsCacheConfig
+	// name as the cluster; that's how envoy wires them together. Without
+	// this filter, plain-HTTP requests would get "cluster not found" —
+	// the filter resolves the Host header and primes the cluster's DNS
+	// cache. CONNECT requests don't need it (envoy bypasses HTTP filters
+	// for upgraded streams), but it's harmless to leave installed.
+	dfpFilterAny, err := anypb.New(&dfpfilter.FilterConfig{
+		ImplementationSpecifier: &dfpfilter.FilterConfig_DnsCacheConfig{
+			DnsCacheConfig: &dfpcommon.DnsCacheConfig{
+				Name:            "dynamic_forward_proxy_cache",
+				DnsLookupFamily: cluster.Cluster_V4_ONLY,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("anypb.New(dfp FilterConfig): %w", err)
+	}
 	hcmCfg := &hcm.HttpConnectionManager{
 		CodecType:  hcm.HttpConnectionManager_AUTO,
 		StatPrefix: "ingress_http",
+		// upgrade_configs: [CONNECT] lets envoy accept HTTP/1.1 CONNECT
+		// from the hub envoy (which forwards the crawler's CONNECT
+		// verb unmodified). The matching route (connect_matcher) terminates
+		// the CONNECT and TCP-tunnels via the dynamic_forward_proxy cluster.
+		UpgradeConfigs: []*hcm.HttpConnectionManager_UpgradeConfig{{
+			UpgradeType: "CONNECT",
+		}},
 		RouteSpecifier: &hcm.HttpConnectionManager_RouteConfig{
 			RouteConfig: rc,
 		},
-		HttpFilters: []*hcm.HttpFilter{{
-			Name: "envoy.filters.http.router",
-			ConfigType: &hcm.HttpFilter_TypedConfig{
-				TypedConfig: routerAny,
+		HttpFilters: []*hcm.HttpFilter{
+			{
+				Name:       "envoy.filters.http.dynamic_forward_proxy",
+				ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: dfpFilterAny},
 			},
-		}},
+			{
+				Name:       "envoy.filters.http.router",
+				ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: routerAny},
+			},
+		},
 	}
 	hcmAny, err := anypb.New(hcmCfg)
 	if err != nil {
