@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-NETNS=${TUNDLER_NETNS:-vpnns}
 SERVICE=nordvpnd
 
-mkdir -p "/etc/systemd/system/${SERVICE}.service.d"
-cat <<EOF >"/etc/systemd/system/${SERVICE}.service.d/netns.conf"
-[Service]
-NetworkNamespacePath=/var/run/netns/${NETNS}
-BindPaths=/etc/resolv.conf.vpnns:/etc/resolv.conf
-EOF
 systemctl daemon-reload
 systemctl enable "${SERVICE}" --now
 
@@ -26,10 +19,31 @@ done
 # which is what we want operationally anyway.
 echo "n" | nordvpn login 2>/dev/null || true
 
-# CLI commands must run inside the VPN namespace to reach the daemon
-ip netns exec "${NETNS}" nordvpn set analytics disabled
-ip netns exec "${NETNS}" nordvpn set autoconnect disabled
-ip netns exec "${NETNS}" nordvpn set firewall disabled
-ip netns exec "${NETNS}" nordvpn set lan-discovery enable
-ip netns exec "${NETNS}" nordvpn set pq on
-ip netns exec "${NETNS}" nordvpn set technology NordLynx
+# Apply baseline settings BEFORE any heavy feature config fetch.
+#
+# meshnet off / notify off matter for memory: in the legacy
+# all-providers-in-one image, nordvpnd ran inside the vpnns netns
+# whose routing was blocked until tundler set up the tunnel, so the
+# daemon could not reach api.nordvpn.com / downloads.nordcdn.com at
+# startup — meshnet/nordwhisper/libtelio remote configs were never
+# downloaded and total RSS stayed well under 600 MiB. In the VPN-hub
+# architecture, nordvpnd starts in the pod's main netns with full
+# internet from boot, eagerly downloading and parsing those remote
+# configs unless we explicitly disable the corresponding features.
+# `meshnet off` skips the meshnet runtime entirely and is the single
+# biggest win; `notify off` removes the in-daemon notification ring
+# buffer.
+nordvpn set meshnet off || true
+nordvpn set notify off || true
+
+nordvpn set analytics disabled
+nordvpn set autoconnect disabled
+nordvpn set firewall disabled
+nordvpn set lan-discovery enable
+nordvpn set pq on
+nordvpn set technology NordLynx
+
+# Restart the daemon so it reloads with the disabled features in
+# effect — otherwise meshnet/notify state stays resident from the
+# initial eager load until the next pod restart.
+systemctl restart "${SERVICE}"
