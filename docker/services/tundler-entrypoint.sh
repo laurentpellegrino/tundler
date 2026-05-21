@@ -46,4 +46,35 @@ fi
 # in the pod's main netns so they can actually establish tunnels.
 rm -f /etc/systemd/system/*.service.d/netns.conf 2>/dev/null
 
+# Install a cluster-CIDR routing exception BEFORE the VPN comes up.
+#
+# The VPN clients (expressvpn, openvpn-based, etc.) all use the split-
+# default-route trick: instead of replacing the kernel default route,
+# they add `0.0.0.0/1 via tun0` + `128.0.0.0/1 via tun0`. Together those
+# eclipse the eth0 default for everything, so envoy's response packets
+# to pods in the cluster (hub envoy at 10.0.115.254, etc.) would take
+# the VPN tunnel out to the public internet → blackhole, hub envoy
+# gets `upstream_cx_connect_timeout` and returns 503 to the crawler.
+#
+# Adding a /16 route via the eth0 gateway is MORE specific than /1, so
+# the kernel picks it for traffic to cluster IPs. We do this BEFORE
+# systemd boots so the route exists at the moment any VPN connect
+# attempt rewrites the table. The route survives across rotations
+# because the VPN client doesn't touch routes outside its own /1 split.
+#
+# TUNDLER_CLUSTER_BYPASS_CIDR is set by the StatefulSet template
+# (see render-vpn-manifests.py). It MUST cover both the pod CIDR and
+# the Service CIDR — typically a single /16 catches both in EKS/AKS/
+# kubeadm clusters using contiguous 10.x.x.x allocations.
+if [[ -n "$TUNDLER_CLUSTER_BYPASS_CIDR" ]]; then
+    GW=$(ip route | awk '/^default /{print $3; exit}')
+    if [[ -n "$GW" ]]; then
+        ip route add "$TUNDLER_CLUSTER_BYPASS_CIDR" via "$GW" dev eth0 onlink 2>/dev/null \
+            && echo "[tundler-entrypoint] installed cluster-bypass route: $TUNDLER_CLUSTER_BYPASS_CIDR via $GW dev eth0" \
+            || echo "[tundler-entrypoint] WARNING: failed to install cluster-bypass route $TUNDLER_CLUSTER_BYPASS_CIDR via $GW"
+    else
+        echo "[tundler-entrypoint] WARNING: no eth0 default gateway found — cluster traffic may take the VPN path"
+    fi
+fi
+
 exec /lib/systemd/systemd
