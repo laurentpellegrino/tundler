@@ -5,8 +5,13 @@
 ENV_FILE="/etc/tundler/env"
 mkdir -p "$(dirname "$ENV_FILE")"
 
-# Export all relevant VPN provider env vars to the file
-printenv | grep -E '^(EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)' > "$ENV_FILE"
+# Export all relevant VPN provider env vars to the file. POD_ is also
+# included so the downward-API POD_NAME / POD_NAMESPACE reach the
+# tundler-tunnel Go binary via systemd; without these, the xDS snapshot
+# falls back to the local-dev default "tundler-tunnel-local" for
+# x-tundler-tunnel-id and every pod reports the same id, defeating
+# per-tunnel attribution in the crawler's RotationTracker.
+printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)' > "$ENV_FILE"
 
 # Run each installed provider's configure.sh once per pod boot. This
 # downloads OpenVPN configs (ipvanish/protonvpn/surfshark), seeds CLI
