@@ -99,22 +99,19 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 // same logical cache and rejects the listener if the two definitions
 // differ in any setting (name + lookup family + resolver list all
 // compared bytewise). Keep them in sync via this one constructor.
+//
+// We don't override resolvers. Envoy then uses the kernel resolver via
+// /etc/resolv.conf, which in-cluster points at the CoreDNS service (~/24
+// from the pod, reached via the cluster-bypass route on eth0). CoreDNS
+// resolves upstream via the cluster's configured DNS forwarder. The
+// previous patch pinned 1.1.1.1/8.8.8.8 to avoid VPN-provided DNS, but
+// envoy's c-ares failed UDP queries to those over tun0 (cause unclear —
+// possibly UDP-over-VPN MTU or 1.1.1.1 anycast quirks). CoreDNS via
+// cluster network is more reliable.
 func dnsCacheConfig() *dfpcommon.DnsCacheConfig {
 	return &dfpcommon.DnsCacheConfig{
 		Name:            "dynamic_forward_proxy_cache",
 		DnsLookupFamily: cluster.Cluster_V4_ONLY,
-		DnsResolutionConfig: &core.DnsResolutionConfig{
-			Resolvers: []*core.Address{
-				{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
-					Address:       "1.1.1.1",
-					PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
-				}}},
-				{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
-					Address:       "8.8.8.8",
-					PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
-				}}},
-			},
-		},
 	}
 }
 
