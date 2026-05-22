@@ -9,18 +9,28 @@ import (
 )
 
 func TestLivezHandler(t *testing.T) {
+	// /livez is "should this process be restarted?", NOT "is this pod
+	// ready?". So every state that the process can recover from on its
+	// own — including Failed — stays 200. Only "wedged for longer than
+	// StateMaxNonReady" triggers a 503 (tested separately below).
 	cases := []struct {
 		state State
 		want  int
 	}{
 		{StateBooting, http.StatusOK},
 		{StateLoggingIn, http.StatusOK},
+		{StateConnecting, http.StatusOK},
 		{StateReady, http.StatusOK},
-		{StateFailed, http.StatusServiceUnavailable},
+		{StateDraining, http.StatusOK},
+		{StateRotating, http.StatusOK},
+		{StateFailed, http.StatusOK}, // rotator will retry from Failed
 	}
 	for _, c := range cases {
 		t.Run(string(c.state), func(t *testing.T) {
 			st := NewStateTracker("expressvpn")
+			// Simulate "just transitioned into Ready then into c.state"
+			// so lastReadyAt is recent — i.e. NOT stuck-too-long.
+			st.Set(StateReady)
 			st.Set(c.state)
 			rr := httptest.NewRecorder()
 			livezHandler(st)(rr, httptest.NewRequest(http.MethodGet, "/livez", nil))
