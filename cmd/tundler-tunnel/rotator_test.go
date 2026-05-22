@@ -51,9 +51,12 @@ func TestRotateIfReady_HappyPath(t *testing.T) {
 
 // TestRotateIfReady_SkipsWhenNotReady: rotator must NOT touch the state
 // if the pod is mid-Connecting (initial connect or watchdog reconnect)
-// or any other non-Ready state.
+// or any other non-Ready state. StateFailed is intentionally excluded —
+// the rotator now retries from Failed so a transient provider throttle
+// can self-heal without a k8s restart (covered by
+// TestRotateIfReady_RetriesFromFailed).
 func TestRotateIfReady_SkipsWhenNotReady(t *testing.T) {
-	for _, s := range []State{StateBooting, StateLoggingIn, StateConnecting, StateDraining, StateRotating, StateFailed} {
+	for _, s := range []State{StateBooting, StateLoggingIn, StateConnecting, StateDraining, StateRotating} {
 		t.Run(string(s), func(t *testing.T) {
 			fp := &fakeProvider{
 				locations: []string{"USA"},

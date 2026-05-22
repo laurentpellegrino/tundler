@@ -44,6 +44,13 @@ type StateTracker struct {
 	rotationCountTotal    int
 	lastRotation          *RotationRecord
 	tunnelUpListener      TunnelUpListener
+	// lastReadyAt is the wall-clock time of the most recent transition
+	// into StateReady. Used by /livez to distinguish "transiently not
+	// Ready (rotating, briefly Failed)" — which is fine — from
+	// "genuinely wedged" — which warrants a k8s restart. See livezHandler
+	// and StateMaxNonReady. Zero value means "never been Ready"; the
+	// boot path treats that as "still booting, give it time".
+	lastReadyAt time.Time
 }
 
 // RotationRecord is the JSON shape under `last_rotation` in /status.
@@ -64,10 +71,14 @@ func NewStateTracker(provider string) *StateTracker {
 }
 
 func (s *StateTracker) Set(state State) {
+	now := time.Now().UTC()
 	s.mu.Lock()
 	s.state = state
-	if state == StateReady && s.loggedInAt.IsZero() {
-		s.loggedInAt = time.Now().UTC()
+	if state == StateReady {
+		if s.loggedInAt.IsZero() {
+			s.loggedInAt = now
+		}
+		s.lastReadyAt = now
 	}
 	s.mu.Unlock()
 }
@@ -76,6 +87,15 @@ func (s *StateTracker) Get() State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state
+}
+
+// LastReadyAt is the wall-clock time the pod was last in StateReady.
+// Returns the zero Time if it has never been Ready. Used by
+// livezHandler to gate the "wedged for too long" check.
+func (s *StateTracker) LastReadyAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastReadyAt
 }
 
 // RecordBootLoginJitter records the actual random duration slept before

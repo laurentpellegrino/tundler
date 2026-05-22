@@ -90,8 +90,15 @@ func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateT
 // envoyDrainController; existing tests that don't care about envoy
 // drain pass nil.
 func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration), drain drainController) {
-	if state.Get() != StateReady {
-		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready)", state.Get())
+	// Allow retry from Failed too — a previous rotation that surrendered
+	// (typically because the provider was rate-limiting account-level
+	// reconnects) might succeed minutes later when the throttle has
+	// expired. Without this, Failed pods stayed Failed until k8s killed
+	// them; with /livez now lenient, those pods can self-heal on the
+	// next periodic tick instead.
+	current := state.Get()
+	if current != StateReady && current != StateFailed {
+		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready/Failed)", current)
 		return
 	}
 

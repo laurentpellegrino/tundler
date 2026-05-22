@@ -58,14 +58,50 @@ func startServer(ctx context.Context, state *StateTracker, triggerRotation Rotat
 	return nil
 }
 
-// livezHandler returns 200 unless the pod has surrendered to Failed (per
-// the design-doc "readiness vs liveness" distinction in failed-rotation
-// handling: /livez stays 200 as long as the process is alive AND hasn't
-// surrendered — Failed means k8s should restart the pod).
+// StateMaxNonReady caps how long /livez tolerates the pod being out of
+// StateReady before reporting unhealthy. Transient transitions
+// (Draining→Rotating→Connecting→Ready) and even a brief Failed state
+// (after which the rotator will retry on the next periodic tick) stay
+// well under this window. A pod that has been wedged out of Ready for
+// longer than this almost certainly needs a k8s restart — either the
+// VPN account is throttled long enough that retry isn't getting us
+// anywhere, or the process is deadlocked. Tuned so a slow ExpressVPN
+// Lightway reconnect (30 s × 3 attempts ≈ 100 s worst case) plus the
+// envoy-drain phase still fit comfortably below the threshold.
+const StateMaxNonReady = 5 * time.Minute
+
+// livezHandler is intentionally lenient. The k8s liveness contract is
+// "should this process be restarted?" — NOT "is this pod ready to
+// serve?" (that's /readyz). So /livez stays 200 across all transient
+// non-Ready states: Booting, LoggingIn, Connecting, Draining, Rotating,
+// and even Failed (the rotator retries from Failed on its next tick).
+// The single trigger for a 503 is "non-Ready for too long" — set by
+// StateMaxNonReady. That catches genuine wedges (deadlock, exhausted
+// retries, account banned) while letting normal-but-slow rotations
+// complete without kubelet killing a working pod.
+//
+// Special case: a pod that has NEVER been Ready (lastReadyAt zero)
+// gets the full StateMaxNonReady from process start before we'd report
+// unhealthy. That accommodates the initial-login flow (which can take
+// 30-90 s with ExpressVPN) without flapping right after boot.
 func livezHandler(state *StateTracker) http.HandlerFunc {
+	processStart := time.Now()
 	return func(w http.ResponseWriter, _ *http.Request) {
-		if state.Get() == StateFailed {
-			http.Error(w, "Failed: awaiting k8s restart", http.StatusServiceUnavailable)
+		if state.Get() == StateReady {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Determine the reference point we're measuring "stuck" from.
+		// Before the first Ready, that's process start; after, it's
+		// the most recent transition into Ready.
+		ref := state.LastReadyAt()
+		if ref.IsZero() {
+			ref = processStart
+		}
+		if time.Since(ref) > StateMaxNonReady {
+			http.Error(w, fmt.Sprintf("non-Ready for %s (> %s); restart requested",
+				time.Since(ref).Round(time.Second), StateMaxNonReady),
+				http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
