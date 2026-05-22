@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL="https://www.expressvpn.works/clients/linux/expressvpn-linux-universal-5.1.0.12141_release.run"
+URL="https://www.expressvpn.works/clients/linux/expressvpn-linux-universal-14.1.1.13156_release.run"
 FILENAME="expressvpn-installer.run"
 WORKDIR="/home/tundler"
 # Map uname arch to ExpressVPN archive directory names
