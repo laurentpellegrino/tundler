@@ -93,6 +93,31 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 // hostnames lazily and works for both regular HTTP requests (where
 // the Host header carries the target) and CONNECT requests (where the
 // authority carries it).
+// dnsCacheConfig is the SINGLE source of truth for the dynamic_forward_proxy
+// DNS cache settings. Both the cluster (buildCluster) and the HTTP filter
+// (buildListener) reference the cache by name; envoy treats them as the
+// same logical cache and rejects the listener if the two definitions
+// differ in any setting (name + lookup family + resolver list all
+// compared bytewise). Keep them in sync via this one constructor.
+func dnsCacheConfig() *dfpcommon.DnsCacheConfig {
+	return &dfpcommon.DnsCacheConfig{
+		Name:            "dynamic_forward_proxy_cache",
+		DnsLookupFamily: cluster.Cluster_V4_ONLY,
+		DnsResolutionConfig: &core.DnsResolutionConfig{
+			Resolvers: []*core.Address{
+				{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
+					Address:       "1.1.1.1",
+					PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
+				}}},
+				{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
+					Address:       "8.8.8.8",
+					PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
+				}}},
+			},
+		},
+	}
+}
+
 func buildCluster() (*cluster.Cluster, error) {
 	// Pin DNS to public resolvers (Cloudflare + Google), routed through
 	// tun0 like any other egress. Without this envoy uses the kernel
@@ -104,22 +129,7 @@ func buildCluster() (*cluster.Cluster, error) {
 	// example's perspective) but on a server that's always reachable.
 	dfpCfg, err := anypb.New(&dfpcluster.ClusterConfig{
 		ClusterImplementationSpecifier: &dfpcluster.ClusterConfig_DnsCacheConfig{
-			DnsCacheConfig: &dfpcommon.DnsCacheConfig{
-				Name:            "dynamic_forward_proxy_cache",
-				DnsLookupFamily: cluster.Cluster_V4_ONLY,
-				DnsResolutionConfig: &core.DnsResolutionConfig{
-					Resolvers: []*core.Address{
-						{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
-							Address:       "1.1.1.1",
-							PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
-						}}},
-						{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
-							Address:       "8.8.8.8",
-							PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
-						}}},
-					},
-				},
-			},
+			DnsCacheConfig: dnsCacheConfig(),
 		},
 	})
 	if err != nil {
@@ -219,10 +229,7 @@ func buildListener(port int, rc *route.RouteConfiguration) (*listener.Listener, 
 	// for upgraded streams), but it's harmless to leave installed.
 	dfpFilterAny, err := anypb.New(&dfpfilter.FilterConfig{
 		ImplementationSpecifier: &dfpfilter.FilterConfig_DnsCacheConfig{
-			DnsCacheConfig: &dfpcommon.DnsCacheConfig{
-				Name:            "dynamic_forward_proxy_cache",
-				DnsLookupFamily: cluster.Cluster_V4_ONLY,
-			},
+			DnsCacheConfig: dnsCacheConfig(),
 		},
 	})
 	if err != nil {
