@@ -94,11 +94,31 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 // the Host header carries the target) and CONNECT requests (where the
 // authority carries it).
 func buildCluster() (*cluster.Cluster, error) {
+	// Pin DNS to public resolvers (Cloudflare + Google), routed through
+	// tun0 like any other egress. Without this envoy uses the kernel
+	// resolver via /etc/resolv.conf — and the VPN providers (ExpressVPN
+	// in particular) sometimes inject DNS entries that the tunnel can't
+	// actually reach, surfacing as UnresolvedAddressException storms in
+	// the crawler client. Pinning the resolver to 1.1.1.1 / 8.8.8.8
+	// keeps DNS lookups inside the VPN tunnel (still anonymous from
+	// example's perspective) but on a server that's always reachable.
 	dfpCfg, err := anypb.New(&dfpcluster.ClusterConfig{
 		ClusterImplementationSpecifier: &dfpcluster.ClusterConfig_DnsCacheConfig{
 			DnsCacheConfig: &dfpcommon.DnsCacheConfig{
 				Name:            "dynamic_forward_proxy_cache",
 				DnsLookupFamily: cluster.Cluster_V4_ONLY,
+				DnsResolutionConfig: &core.DnsResolutionConfig{
+					Resolvers: []*core.Address{
+						{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
+							Address:       "1.1.1.1",
+							PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
+						}}},
+						{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
+							Address:       "8.8.8.8",
+							PortSpecifier: &core.SocketAddress_PortValue{PortValue: 53},
+						}}},
+					},
+				},
 			},
 		},
 	})
