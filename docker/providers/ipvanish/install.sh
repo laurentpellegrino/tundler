@@ -12,11 +12,15 @@ apt-get install -y --no-install-recommends \
 
 # Download IPVanish OpenVPN configs at BUILD time. configs.ipvanish.com sits
 # behind Cloudflare and 403s requests from many cloud/datacenter egress IPs
-# (verified May 2026 from a k8s production cluster). Building this into the
-# image keeps the runtime configure.sh idempotent and offline-safe — pods
-# don't need to fetch from a CDN that may block them.
+# (verified May 2026 from a k8s production cluster AND from GitHub Actions
+# runners — same Cloudflare bot-block list). We mirror configs.zip as a
+# release asset on this repo: GitHub's release CDN isn't on that block
+# list, so the download works from both GitHub Actions and from in-cluster
+# rebuilds. To refresh: download configs.zip from configs.ipvanish.com
+# (works from residential IPs) and re-upload it to the
+# `ipvanish-configs` release.
 CONFIG_DIR=/etc/ipvanish/openvpn
-CONFIGS_URL="${IPVANISH_CONFIGS_URL:-https://configs.ipvanish.com/configs/configs.zip}"
+CONFIGS_URL="${IPVANISH_CONFIGS_URL:-https://github.com/laurentpellegrino/tundler/releases/download/ipvanish-configs/configs.zip}"
 TMP_ZIP="$(mktemp)"
 
 mkdir -p "$CONFIG_DIR"
