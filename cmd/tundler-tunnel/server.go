@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -81,22 +83,34 @@ const StateMaxNonReady = 5 * time.Minute
 // complete without kubelet killing a working pod.
 //
 // Special case: a pod that has NEVER been Ready (lastReadyAt zero)
-// gets the full StateMaxNonReady from process start before we'd report
-// unhealthy. That accommodates the initial-login flow (which can take
-// 30-90 s with ExpressVPN) without flapping right after boot.
+// gets the full StateMaxNonReady from CONTAINER FIRST START before we'd
+// report unhealthy. We use a marker file (/run/tundler/first-start) to
+// persist this across systemd-driven binary restarts inside the same
+// container — without it, every Restart=always cycle resets the clock
+// and the pod sits at 1/2 forever (observed 2026-05-23: an expressvpn
+// pod stuck for 4 h because expressvpnctl was wedged, tundler-tunnel
+// restarted every 2 min, and /livez kept flipping back to 200).
+//
+// The marker is in /run (tmpfs, cleared on container restart but
+// persisted across systemd binary restarts within a container) so
+// kubelet-driven container restarts properly reset the clock.
+const firstStartMarker = "/run/tundler/first-start"
+
 func livezHandler(state *StateTracker) http.HandlerFunc {
-	processStart := time.Now()
+	firstStart := readOrCreateFirstStartMarker()
 	return func(w http.ResponseWriter, _ *http.Request) {
 		if state.Get() == StateReady {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		// Determine the reference point we're measuring "stuck" from.
-		// Before the first Ready, that's process start; after, it's
-		// the most recent transition into Ready.
+		// Before the first Ready, that's the persisted container-first-
+		// start (NOT this binary's start — see firstStartMarker comment).
+		// After the first Ready, it's the most recent transition into
+		// Ready.
 		ref := state.LastReadyAt()
 		if ref.IsZero() {
-			ref = processStart
+			ref = firstStart
 		}
 		if time.Since(ref) > StateMaxNonReady {
 			http.Error(w, fmt.Sprintf("non-Ready for %s (> %s); restart requested",
@@ -106,6 +120,27 @@ func livezHandler(state *StateTracker) http.HandlerFunc {
 		}
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// readOrCreateFirstStartMarker returns the timestamp written into
+// firstStartMarker on the FIRST binary start within this container
+// lifecycle. Subsequent restarts of the tundler-tunnel.service unit
+// (Restart=always) read the same value, so the "never been Ready" lag
+// timer measures from container start, not from the latest binary
+// restart. On any error (read or write), falls back to time.Now() —
+// that's the only-this-binary-restart behavior, which is no worse
+// than the pre-fix code.
+func readOrCreateFirstStartMarker() time.Time {
+	if data, err := os.ReadFile(firstStartMarker); err == nil {
+		if t, err := time.Parse(time.RFC3339Nano, string(data)); err == nil {
+			return t
+		}
+	}
+	now := time.Now()
+	if err := os.MkdirAll(filepath.Dir(firstStartMarker), 0o755); err == nil {
+		_ = os.WriteFile(firstStartMarker, []byte(now.Format(time.RFC3339Nano)), 0o644)
+	}
+	return now
 }
 
 // readyzHandler returns 200 only when the pod is genuinely ready to serve
