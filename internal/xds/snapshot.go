@@ -103,15 +103,40 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 // We don't override resolvers. Envoy then uses the kernel resolver via
 // /etc/resolv.conf, which in-cluster points at the CoreDNS service (~/24
 // from the pod, reached via the cluster-bypass route on eth0). CoreDNS
-// resolves upstream via the cluster's configured DNS forwarder. The
-// previous patch pinned 1.1.1.1/8.8.8.8 to avoid VPN-provided DNS, but
-// envoy's c-ares failed UDP queries to those over tun0 (cause unclear —
-// possibly UDP-over-VPN MTU or 1.1.1.1 anycast quirks). CoreDNS via
-// cluster network is more reliable.
+// resolves upstream via the cluster's configured DNS forwarder.
+//
+// Cache tuning rationale (avoiding 503-on-CONNECT bursts):
+//
+//   - host_ttl 1h, dns_refresh_rate 30m: keep example.com's resolved IP
+//     pinned for a long time. The default 5 min / 60 s combo meant a
+//     transient resolver failure on the periodic refresh would mark
+//     the entry "failed" and every CONNECT for the next refresh
+//     window got an instant 503 with `<unresolved>`.
+//   - dns_failure_refresh_rate 1-5 s: if a refresh DOES fail, retry
+//     fast instead of waiting the full dns_refresh_rate.
+//   - preresolve_hostnames: warm the cache for example.com at envoy
+//     startup so the very first CONNECT can't ever see `<unresolved>`.
+//     Crucial because each VPN rotation pushes a new snapshot, and if
+//     envoy rebuilt the cache from scratch the first post-rotation
+//     CONNECT would 503.
 func dnsCacheConfig() *dfpcommon.DnsCacheConfig {
 	return &dfpcommon.DnsCacheConfig{
 		Name:            "dynamic_forward_proxy_cache",
 		DnsLookupFamily: cluster.Cluster_V4_ONLY,
+		HostTtl:         durationpb.New(60 * time.Minute),
+		DnsRefreshRate:  durationpb.New(30 * time.Minute),
+		DnsFailureRefreshRate: &cluster.Cluster_RefreshRate{
+			BaseInterval: durationpb.New(1 * time.Second),
+			MaxInterval:  durationpb.New(5 * time.Second),
+		},
+		PreresolveHostnames: []*core.SocketAddress{
+			{
+				Address: "example.com",
+				PortSpecifier: &core.SocketAddress_PortValue{
+					PortValue: 443,
+				},
+			},
+		},
 	}
 }
 
