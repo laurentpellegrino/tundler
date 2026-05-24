@@ -52,25 +52,50 @@ func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	shared.Debugf("PIA: Connect() - initiating connection")
 	quiet(ctx, "connect")
 
-	// Wait for connection to establish and get VPN IP
-	shared.Debugf("PIA: Connect() - waiting for VPN IP assignment")
-	for i := 0; i < 60; i++ { // Wait up to 60 seconds
+	// Poll the in-memory state populated by piactl monitor instead of
+	// spawning piactl get repeatedly. Each iteration is a few atomic
+	// reads — orders of magnitude cheaper than the old loop that paid
+	// the piactl subprocess startup cost ~3 times per second. When
+	// `piactl monitor` itself has failed enough times to flip
+	// fallbackActive, we still call p.Status() but with a wider sleep
+	// to reduce daemon contention.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
 		status := p.Status(ctx)
 		if status.Connected && status.IP != "" {
 			shared.Debugf("PIA: Connect() - connected with IP: %s", status.IP)
 			return status
 		}
-		shared.Debugf("PIA: Connect() - attempt %d: connected=%v, ip=%s", i+1, status.Connected, status.IP)
-		time.Sleep(1 * time.Second)
+		shared.Debugf("PIA: Connect() - waiting: connected=%v, ip=%s", status.Connected, status.IP)
+		sleep := 250 * time.Millisecond
+		if globalMonitor.inFallback() {
+			sleep = 1 * time.Second
+		}
+		time.Sleep(sleep)
 	}
 
 	shared.Debugf("PIA: Connect() - timeout waiting for VPN IP")
 	return p.Status(ctx)
 }
 
+// Connected reports whether the VPN tunnel is up.
+//
+// Reads from the piactl-monitor-backed in-memory state (no subprocess
+// spawn). The pre-monitor implementation returned true for anything
+// that didn't contain "disconnected", which counted transient states
+// like "Connecting" / "Unknown" as connected and led Connect() to
+// chase an IP that wasn't actually available. Now we require the
+// state to be EXACTLY "Connected" (the documented stable connected
+// state from `piactl monitor connectionstate`).
+//
+// Fallback: if the monitor has flipped to fallbackActive (subprocess
+// died too many times), we do one direct piactl get call instead.
 func (p PIA) Connected(ctx context.Context) bool {
-	out, _ := shared.RunCmd(ctx, bin, "get", "connectionstate")
-	return !strings.Contains(strings.ToLower(out), "disconnected")
+	if globalMonitor.inFallback() {
+		out, _ := shared.RunCmd(ctx, bin, "get", "connectionstate")
+		return strings.TrimSpace(out) == stateConnected
+	}
+	return globalMonitor.state() == stateConnected
 }
 
 func (p PIA) Disconnect(ctx context.Context) error {
@@ -182,6 +207,11 @@ func (p PIA) Login(ctx context.Context) error {
 	if err == nil || strings.Contains(out, "Already logged into account") {
 		shared.Debugf("PIA: Login() - login successful")
 		loggedIn = true
+		// Daemon is responsive and we're authenticated — safe to
+		// spawn the piactl monitor subprocesses now. Idempotent
+		// (sync.Once internally) so subsequent Login() calls don't
+		// re-spawn.
+		globalMonitor.start()
 		return nil
 	}
 
@@ -209,6 +239,16 @@ func (p PIA) Logout(ctx context.Context) error {
 	return err
 }
 
+// Status returns the latest VPN status. Sources:
+//   - Connection state: from globalMonitor (piactl monitor
+//     connectionstate), no subprocess spawn.
+//   - VPN IP: from globalMonitor (piactl monitor vpnip), no spawn.
+//   - Region: still requires a piactl get (region isn't on the
+//     `piactl monitor` value list we care about, and it changes
+//     rarely — once per VPN session).
+//
+// When the monitor has flipped to fallbackActive, all three values
+// come from one-shot piactl get instead.
 func (p PIA) Status(ctx context.Context) provider.Status {
 	connected := p.Connected(ctx)
 
@@ -221,8 +261,12 @@ func (p PIA) Status(ctx context.Context) provider.Status {
 		status.Location = p.ActiveLocation(ctx)
 		status.Region = status.Location
 
-		if out, err := shared.RunCmd(ctx, bin, "get", "vpnip"); err == nil {
-			status.IP = shared.FirstIPv4(out)
+		if globalMonitor.inFallback() {
+			if out, err := shared.RunCmd(ctx, bin, "get", "vpnip"); err == nil {
+				status.IP = shared.FirstIPv4(out)
+			}
+		} else {
+			status.IP = shared.FirstIPv4(globalMonitor.ip())
 		}
 	}
 
