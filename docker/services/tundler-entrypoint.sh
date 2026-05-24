@@ -24,6 +24,10 @@ printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERN
 # output was required.
 if [[ -d /opt/providers ]]; then
     for dir in /opt/providers/*/; do
+        # Glob keeps the trailing slash on each match (e.g.
+        # /opt/providers/pia/) — strip it so the configure path
+        # doesn't end up with a double slash in log lines.
+        dir="${dir%/}"
         configure="$dir/configure.sh"
         if [[ -x "$configure" ]]; then
             # Strip `ip netns exec <netns>` prefixes from configure.sh
