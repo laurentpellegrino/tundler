@@ -13,7 +13,9 @@ package xds
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -100,25 +102,25 @@ func BuildSnapshot(version string, pod PodInputs, currentExitIP string) (*cachev
 // differ in any setting (name + lookup family + resolver list all
 // compared bytewise). Keep them in sync via this one constructor.
 //
-// We don't override resolvers. Envoy then uses the kernel resolver via
-// /etc/resolv.conf, which in-cluster points at the CoreDNS service (~/24
-// from the pod, reached via the cluster-bypass route on eth0). CoreDNS
-// resolves upstream via the cluster's configured DNS forwarder.
+// Resolvers are not overridden — envoy uses the kernel resolver via
+// /etc/resolv.conf, which inside a container typically points at the
+// node's or cluster's DNS forwarder.
 //
 // Cache tuning rationale (avoiding 503-on-CONNECT bursts):
 //
-//   - host_ttl 1h, dns_refresh_rate 30m: keep example.com's resolved IP
-//     pinned for a long time. The default 5 min / 60 s combo meant a
-//     transient resolver failure on the periodic refresh would mark
+//   - host_ttl 1h, dns_refresh_rate 30m: keep an upstream's resolved
+//     IP pinned for a long time. The default 5 min / 60 s combo meant
+//     a transient resolver failure on the periodic refresh would mark
 //     the entry "failed" and every CONNECT for the next refresh
 //     window got an instant 503 with `<unresolved>`.
 //   - dns_failure_refresh_rate 1-5 s: if a refresh DOES fail, retry
 //     fast instead of waiting the full dns_refresh_rate.
-//   - preresolve_hostnames: warm the cache for example.com at envoy
-//     startup so the very first CONNECT can't ever see `<unresolved>`.
-//     Crucial because each VPN rotation pushes a new snapshot, and if
-//     envoy rebuilt the cache from scratch the first post-rotation
-//     CONNECT would 503.
+//   - preresolve_hostnames (opt-in via TUNDLER_PRERESOLVE_HOSTNAMES):
+//     warm the cache for known upstreams at envoy startup so the very
+//     first CONNECT can't see `<unresolved>`. Useful when each VPN
+//     rotation pushes a new snapshot — without pre-resolution, envoy
+//     would have to do a fresh lookup on the first post-rotation
+//     CONNECT and could 503 if the resolver is briefly slow.
 func dnsCacheConfig() *dfpcommon.DnsCacheConfig {
 	return &dfpcommon.DnsCacheConfig{
 		Name:            "dynamic_forward_proxy_cache",
@@ -129,26 +131,44 @@ func dnsCacheConfig() *dfpcommon.DnsCacheConfig {
 			BaseInterval: durationpb.New(1 * time.Second),
 			MaxInterval:  durationpb.New(5 * time.Second),
 		},
-		PreresolveHostnames: []*core.SocketAddress{
-			{
-				Address: "example.com",
-				PortSpecifier: &core.SocketAddress_PortValue{
-					PortValue: 443,
-				},
-			},
-		},
+		PreresolveHostnames: preresolveHostnames(),
 	}
 }
 
+// preresolveHostnames parses TUNDLER_PRERESOLVE_HOSTNAMES into a list
+// of envoy SocketAddresses for DnsCacheConfig.PreresolveHostnames.
+// Format: CSV of "host[:port]" entries; missing port defaults to 443.
+// Empty / unset returns nil (no pre-resolution — envoy resolves on
+// first CONNECT).
+//
+// Example:  TUNDLER_PRERESOLVE_HOSTNAMES="example.com,api.example.com:8443"
+func preresolveHostnames() []*core.SocketAddress {
+	raw := os.Getenv("TUNDLER_PRERESOLVE_HOSTNAMES")
+	if raw == "" {
+		return nil
+	}
+	var out []*core.SocketAddress
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		host, port := entry, uint32(443)
+		if i := strings.LastIndex(entry, ":"); i > 0 {
+			host = entry[:i]
+			if p, err := strconv.ParseUint(entry[i+1:], 10, 16); err == nil {
+				port = uint32(p)
+			}
+		}
+		out = append(out, &core.SocketAddress{
+			Address:       host,
+			PortSpecifier: &core.SocketAddress_PortValue{PortValue: port},
+		})
+	}
+	return out
+}
+
 func buildCluster() (*cluster.Cluster, error) {
-	// Pin DNS to public resolvers (Cloudflare + Google), routed through
-	// tun0 like any other egress. Without this envoy uses the kernel
-	// resolver via /etc/resolv.conf — and the VPN providers (ExpressVPN
-	// in particular) sometimes inject DNS entries that the tunnel can't
-	// actually reach, surfacing as UnresolvedAddressException storms in
-	// the crawler client. Pinning the resolver to 1.1.1.1 / 8.8.8.8
-	// keeps DNS lookups inside the VPN tunnel (still anonymous from
-	// example's perspective) but on a server that's always reachable.
 	dfpCfg, err := anypb.New(&dfpcluster.ClusterConfig{
 		ClusterImplementationSpecifier: &dfpcluster.ClusterConfig_DnsCacheConfig{
 			DnsCacheConfig: dnsCacheConfig(),
