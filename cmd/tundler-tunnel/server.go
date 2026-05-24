@@ -84,17 +84,24 @@ const StateMaxNonReady = 5 * time.Minute
 //
 // Special case: a pod that has NEVER been Ready (lastReadyAt zero)
 // gets the full StateMaxNonReady from CONTAINER FIRST START before we'd
-// report unhealthy. We use a marker file (/run/tundler/first-start) to
-// persist this across systemd-driven binary restarts inside the same
-// container — without it, every Restart=always cycle resets the clock
-// and the pod sits at 1/2 forever (observed 2026-05-23: an expressvpn
-// pod stuck for 4 h because expressvpnctl was wedged, tundler-tunnel
-// restarted every 2 min, and /livez kept flipping back to 200).
+// report unhealthy. We use a marker file (/var/lib/tundler/first-start)
+// to persist this across systemd-driven binary restarts inside the
+// same container — without it, every Restart=always cycle resets the
+// clock and the pod sits at 1/2 forever.
 //
-// The marker is in /run (tmpfs, cleared on container restart but
-// persisted across systemd binary restarts within a container) so
-// kubelet-driven container restarts properly reset the clock.
-const firstStartMarker = "/run/tundler/first-start"
+// The marker MUST live on the container's local rootfs (not in any
+// pod-level emptyDir). /var/lib is part of the container's writable
+// layer: it's cleared on container restart (kubelet creates a new
+// container instance with a fresh rootfs) but persists across
+// systemd-driven binary restarts within a container. We previously
+// used /run/tundler/first-start, but /run is mounted as a pod-level
+// emptyDir tmpfs in our manifests, which means the marker survived
+// container restarts too — once a pod hit one /livez kill, the stale
+// marker triggered another kill on every subsequent container start,
+// and the restart count grew unboundedly (observed 2026-05-24: PIA
+// pods accumulating 30+ tundler-tunnel restarts in a few hours
+// because of this).
+const firstStartMarker = "/var/lib/tundler/first-start"
 
 func livezHandler(state *StateTracker) http.HandlerFunc {
 	firstStart := readOrCreateFirstStartMarker()
