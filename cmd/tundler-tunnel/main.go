@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -90,10 +91,15 @@ func main() {
 		rotateIfReady(ctx, prov, state, providerName, excluded, drain)
 	}
 
-	// xDS server: serves envoy config (LDS+CDS+RDS) to the pod-local
-	// envoy on loopback :18000. Started before login so envoy can
-	// connect early; the initial snapshot has an empty x-tundler-exit-ip
-	// header until the first tunnel-up's PushExitIP arrives.
+	// xDS server: kept for backwards compatibility during the migration
+	// to static envoy config. envoy-tunnel.yaml in current images uses
+	// fully static resources + a Lua filter that reads the exit IP from
+	// /run/tundler/exit-ip (written by SetTunnelUpListener below). The
+	// xDS server still runs so that any old envoy bootstrap that
+	// references it doesn't break on rollback, but it's no longer the
+	// source of truth for envoy config. Once the static migration is
+	// confirmed stable, this server (and the entire internal/xds
+	// package) can be deleted.
 	podName := os.Getenv(envPodName)
 	if podName == "" {
 		// Local-dev fallback. Real pods get POD_NAME via downward API.
@@ -113,11 +119,18 @@ func main() {
 		}
 	}()
 
-	// Each successful tunnel-up rebuilds the envoy snapshot with the
-	// new exit IP and pushes it on the xDS stream. Envoy receives the
-	// update within ~100ms — the x-tundler-exit-ip header flips on the
-	// next response without an envoy restart.
+	// On every successful tunnel-up:
+	//   1. write /run/tundler/exit-ip — read by envoy's Lua filter for
+	//      the x-tundler-exit-ip response header. /run is a pod-level
+	//      emptyDir (tmpfs) shared with the envoy container, so the
+	//      write is visible immediately with no IPC roundtrip.
+	//   2. push the new snapshot to the xDS server (legacy path, kept
+	//      for any pod still running an xDS-bootstrap envoy until the
+	//      rollout completes).
 	state.SetTunnelUpListener(func(exitIP string) {
+		if err := writeExitIPFile(exitIP); err != nil {
+			log.Printf("tundler-tunnel: write exit-ip file (exit_ip=%s) failed: %v", exitIP, err)
+		}
 		if err := xdsServer.PushExitIP(exitIP); err != nil {
 			log.Printf("tundler-tunnel: xDS push (exit_ip=%s) failed: %v", exitIP, err)
 		}
@@ -260,4 +273,27 @@ func getEnvInt(name string, def int) int {
 		log.Fatalf("tundler-tunnel: %s=%q is not a non-negative integer", name, v)
 	}
 	return n
+}
+
+// exitIPFile is the shared-with-envoy file holding the current VPN
+// exit IP. Read by envoy's Lua filter on every response to inject the
+// x-tundler-exit-ip header. /run is a pod-level emptyDir tmpfs in
+// our k8s manifests, mounted into both this container and the envoy
+// container — so writes here are immediately visible to envoy with
+// no IPC.
+const exitIPFile = "/run/tundler/exit-ip"
+
+// writeExitIPFile updates the exit-ip file atomically so envoy's
+// Lua filter can never read a half-written line. Write to a temp
+// file in the same dir then rename — POSIX guarantees rename
+// atomicity within a filesystem.
+func writeExitIPFile(ip string) error {
+	if err := os.MkdirAll("/run/tundler", 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	tmp := exitIPFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(ip+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	return os.Rename(tmp, exitIPFile)
 }
