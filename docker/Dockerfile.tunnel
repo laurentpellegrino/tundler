@@ -62,6 +62,14 @@ RUN useradd -m -s /bin/bash tundler \
 # systemd (same trick the legacy Dockerfile uses).
 RUN rm -f /usr/sbin/policy-rc.d
 
+# Quiet libselinux's "Could not open policy file" warning that systemd
+# + journald + dbus all print on container start. The container isn't
+# running under SELinux enforcement; declaring SELINUX=disabled in
+# /etc/selinux/config tells libselinux to skip the policy.33 lookup
+# entirely. Pure cosmetic — but those messages drown out actual errors
+# in pod boot logs.
+RUN mkdir -p /etc/selinux && echo 'SELINUX=disabled' > /etc/selinux/config
+
 # Provider install scripts are shared with the legacy image — we only
 # run the one for the requested PROVIDER and drop the rest.
 COPY docker/providers /opt/providers
