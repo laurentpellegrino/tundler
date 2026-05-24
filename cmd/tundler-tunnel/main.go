@@ -25,6 +25,8 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,9 +129,15 @@ func main() {
 	//   2. push the new snapshot to the xDS server (legacy path, kept
 	//      for any pod still running an xDS-bootstrap envoy until the
 	//      rollout completes).
+	// Seed the static per-pod headers (tunnel-id, node-ip) so envoy
+	// has them on the very first request — even before the first
+	// Connect (the exit-ip header is just missing until then, which
+	// is acceptable).
+	setStaticEnvoyHeaders(podName, os.Getenv(envNodeIP))
+
 	state.SetTunnelUpListener(func(exitIP string) {
-		if err := writeExitIPFile(exitIP); err != nil {
-			log.Printf("tundler-tunnel: write exit-ip file (exit_ip=%s) failed: %v", exitIP, err)
+		if err := writeEnvoyHeadersWithExitIP(exitIP); err != nil {
+			log.Printf("tundler-tunnel: write envoy headers (exit_ip=%s) failed: %v", exitIP, err)
 		}
 		if err := xdsServer.PushExitIP(exitIP); err != nil {
 			log.Printf("tundler-tunnel: xDS push (exit_ip=%s) failed: %v", exitIP, err)
@@ -275,25 +283,79 @@ func getEnvInt(name string, def int) int {
 	return n
 }
 
-// exitIPFile is the shared-with-envoy file holding the current VPN
-// exit IP. Read by envoy's Lua filter on every response to inject the
-// x-tundler-exit-ip header. /run is a pod-level emptyDir tmpfs in
-// our k8s manifests, mounted into both this container and the envoy
-// container — so writes here are immediately visible to envoy with
-// no IPC.
-const exitIPFile = "/run/tundler/exit-ip"
+// envoyHeadersFile is the shared-with-envoy file holding the response
+// headers envoy should inject on every CONNECT/proxied request. One
+// "key: value" line per header. Read by envoy's Lua filter on every
+// response. /run is a pod-level emptyDir tmpfs mounted in both this
+// container and the envoy container — writes are visible to envoy
+// immediately with no IPC.
+//
+// We use a single file (rather than separate per-header files) because
+// the Lua filter then has to parse just one file per response; less
+// code, fewer open() syscalls.
+//
+// Why not use envoy's %ENV(...)% formatter for the static
+// per-pod headers (tunnel-id, node-ip): envoy 1.30's
+// response_headers_to_add does NOT support %ENV — boot fails with
+// "Not supported field in StreamInfo: ENV". We could plumb env via
+// a CLI templating step but going through this file is simpler and
+// uniform.
+const envoyHeadersFile = "/run/tundler/headers"
 
-// writeExitIPFile updates the exit-ip file atomically so envoy's
-// Lua filter can never read a half-written line. Write to a temp
-// file in the same dir then rename — POSIX guarantees rename
-// atomicity within a filesystem.
-func writeExitIPFile(ip string) error {
+// writeEnvoyHeaders updates the headers file atomically so envoy's
+// Lua filter never reads a half-written set. write-tmp + rename —
+// POSIX guarantees rename atomicity within a filesystem.
+//
+// Each entry is "key: value\n". Keys MUST be valid HTTP header
+// names; values MUST be free of CR/LF. Caller responsibility.
+func writeEnvoyHeaders(headers map[string]string) error {
 	if err := os.MkdirAll("/run/tundler", 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	tmp := exitIPFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(ip+"\n"), 0o644); err != nil {
+	var buf strings.Builder
+	for k, v := range headers {
+		buf.WriteString(k)
+		buf.WriteString(": ")
+		buf.WriteString(v)
+		buf.WriteByte('\n')
+	}
+	tmp := envoyHeadersFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(buf.String()), 0o644); err != nil {
 		return fmt.Errorf("write tmp: %w", err)
 	}
-	return os.Rename(tmp, exitIPFile)
+	return os.Rename(tmp, envoyHeadersFile)
+}
+
+// envoyHeadersState holds the per-pod static headers (tunnel-id,
+// node-ip) so writeEnvoyHeadersWithExitIP can re-merge them with
+// the current exit IP on every rotation without re-reading env.
+var envoyHeadersStatic = map[string]string{}
+var envoyHeadersMu sync.Mutex
+
+func setStaticEnvoyHeaders(podName, nodeIP string) {
+	envoyHeadersMu.Lock()
+	defer envoyHeadersMu.Unlock()
+	envoyHeadersStatic["x-tundler-tunnel-id"] = podName
+	if nodeIP != "" {
+		envoyHeadersStatic["x-tundler-node-ip"] = nodeIP
+	}
+	_ = writeEnvoyHeadersLocked()
+}
+
+func writeEnvoyHeadersWithExitIP(exitIP string) error {
+	envoyHeadersMu.Lock()
+	defer envoyHeadersMu.Unlock()
+	if exitIP != "" {
+		envoyHeadersStatic["x-tundler-exit-ip"] = exitIP
+	}
+	return writeEnvoyHeadersLocked()
+}
+
+func writeEnvoyHeadersLocked() error {
+	// Snapshot the map (it's small) before passing to writer.
+	snap := make(map[string]string, len(envoyHeadersStatic))
+	for k, v := range envoyHeadersStatic {
+		snap[k] = v
+	}
+	return writeEnvoyHeaders(snap)
 }

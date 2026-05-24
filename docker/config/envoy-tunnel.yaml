@@ -51,19 +51,13 @@ static_resources:
                   virtual_hosts:
                     - name: all
                       domains: ["*"]
-                      response_headers_to_add:
-                        # tunnel-id and node-ip are static per pod —
-                        # substituted from env vars at parse time. The
-                        # exit-ip is dynamic and injected by the Lua
-                        # filter below (envoy's %ENV(...)% formatter is
-                        # only resolved at parse, so a per-rotation
-                        # value can't go here).
-                        - header:
-                            key: "x-tundler-tunnel-id"
-                            value: "%ENV(POD_NAME)%"
-                        - header:
-                            key: "x-tundler-node-ip"
-                            value: "%ENV(NODE_IP)%"
+                      # x-tundler-tunnel-id, x-tundler-node-ip,
+                      # x-tundler-exit-ip are ALL injected by the Lua
+                      # filter below from /run/tundler/headers. envoy
+                      # 1.30 doesn't support %ENV(...)% in
+                      # response_headers_to_add (boot fails with
+                      # "Not supported field in StreamInfo: ENV"), so
+                      # we route everything through Lua for uniformity.
                       routes:
                         # CONNECT path (HTTPS forward-proxy)
                         - match:
@@ -94,24 +88,27 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
                       default_source_code:
-                        # Inject x-tundler-exit-ip from the shared file.
-                        # /run/tundler/exit-ip is written by tundler-
-                        # tunnel after every successful Connect. Linux
-                        # page cache makes this a sub-µs read in steady
-                        # state — no measurable impact on request
-                        # throughput. Missing file = no header, which
-                        # the hub envoy treats as "exit IP unknown"
-                        # (acceptable transient during initial boot
-                        # before first Connect).
+                        # Inject all x-tundler-* response headers from
+                        # the shared /run/tundler/headers file written
+                        # by tundler-tunnel. Format: one "key: value"
+                        # per line. Linux page cache makes this a
+                        # sub-µs read in steady state — no measurable
+                        # impact on request throughput. Missing file =
+                        # no headers added, which the hub envoy treats
+                        # as "tunnel info unknown" (acceptable
+                        # transient during initial boot before
+                        # tundler-tunnel writes the file).
                         inline_string: |
                           function envoy_on_response(response_handle)
-                            local f = io.open("/run/tundler/exit-ip", "r")
+                            local f = io.open("/run/tundler/headers", "r")
                             if not f then return end
-                            local ip = f:read("*line")
-                            f:close()
-                            if ip and ip ~= "" then
-                              response_handle:headers():add("x-tundler-exit-ip", ip)
+                            for line in f:lines() do
+                              local k, v = string.match(line, "^([%w%-]+):%s*(.+)$")
+                              if k and v then
+                                response_handle:headers():add(k, v)
+                              end
                             end
+                            f:close()
                           end
                   - name: envoy.filters.http.router
                     typed_config:
