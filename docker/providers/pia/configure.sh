@@ -1,24 +1,18 @@
 #!/usr/bin/env bash
-set -e
-
-NETNS=${TUNDLER_NETNS:-vpnns}
-SERVICE=piavpn
-
-# Configure PIA daemon to run in network namespace
-mkdir -p "/etc/systemd/system/${SERVICE}.service.d"
-cat <<EOF >"/etc/systemd/system/${SERVICE}.service.d/netns.conf"
-[Service]
-NetworkNamespacePath=/var/run/netns/${NETNS}
-BindPaths=/etc/resolv.conf.vpnns:/etc/resolv.conf
-EOF
-
-systemctl daemon-reload
-systemctl enable "${SERVICE}" --now
-
-# CLI commands must run inside the VPN namespace to reach the daemon
-ip netns exec "${NETNS}" piactl background enable
-ip netns exec "${NETNS}" piactl set allowlan true || true
-ip netns exec "${NETNS}" piactl set debuglogging true || true
-
-# Restart the service to ensure clean state
-systemctl restart "${SERVICE}" || true
+# Per-pod VPN-hub architecture:
+#
+#   - tundler-entrypoint.sh runs this BEFORE systemd takes over PID 1,
+#     so any `systemctl daemon-reload` / `--now` would fail with
+#     "Failed to connect to bus: Host is down".
+#   - tundler-entrypoint.sh later deletes every netns.conf drop-in,
+#     so writing one here is wasted.
+#   - The piavpn daemon is started by systemd at boot once the unit
+#     is enabled (symlink in /etc/systemd/system/multi-user.target.wants/).
+#   - The tundler-tunnel Go binary handles `piactl background enable`
+#     and runtime setup in its Login(), once the daemon is up.
+#
+# Only thing still useful here: `systemctl enable` — pure symlink
+# creation, works offline without d-bus, safe to call before systemd
+# is exec'd.
+systemctl enable piavpn.service 2>/dev/null || true
+exit 0

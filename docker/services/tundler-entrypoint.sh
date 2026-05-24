@@ -74,9 +74,15 @@ rm -f /etc/systemd/system/*.service.d/netns.conf 2>/dev/null
 if [[ -n "$TUNDLER_CLUSTER_BYPASS_CIDR" ]]; then
     GW=$(ip route | awk '/^default /{print $3; exit}')
     if [[ -n "$GW" ]]; then
-        ip route add "$TUNDLER_CLUSTER_BYPASS_CIDR" via "$GW" dev eth0 onlink 2>/dev/null \
+        # `ip route replace` is idempotent — succeeds whether the route
+        # already exists (e.g. lingering from a previous container in
+        # the same pod) or not. The old `ip route add` printed a
+        # spurious WARNING on the "File exists" case even though the
+        # route was correctly in place. Capture stderr on actual failure
+        # so the warning is diagnostic, not opaque.
+        ROUTE_ERR=$(ip route replace "$TUNDLER_CLUSTER_BYPASS_CIDR" via "$GW" dev eth0 onlink 2>&1) \
             && echo "[tundler-entrypoint] installed cluster-bypass route: $TUNDLER_CLUSTER_BYPASS_CIDR via $GW dev eth0" \
-            || echo "[tundler-entrypoint] WARNING: failed to install cluster-bypass route $TUNDLER_CLUSTER_BYPASS_CIDR via $GW"
+            || echo "[tundler-entrypoint] WARNING: failed to install cluster-bypass route $TUNDLER_CLUSTER_BYPASS_CIDR via $GW: $ROUTE_ERR"
     else
         echo "[tundler-entrypoint] WARNING: no eth0 default gateway found — cluster traffic may take the VPN path"
     fi
