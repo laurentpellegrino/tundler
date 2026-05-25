@@ -20,12 +20,11 @@ import (
 type RotateTrigger func()
 
 // httpListenAddr is the bind address for tundler-tunnel's control-plane API
-// (consumed by k8s probes, by the in-pod operator via `kubectl exec curl`,
-// and by tundler-fleet-controller's per-pod-DNS rotation forwarder).
+// (consumed by k8s probes and by the crawler slot pinned to this pod,
+// which POSTs /rotate via per-pod headless-service DNS).
 //
 // 0.0.0.0 (not loopback) because the headless governing Service routes
 // pod-IP traffic here for /rotate, and httpGet probes target the pod IP.
-// xDS gRPC :18000 is the loopback-only port (different concern).
 const httpListenAddr = "0.0.0.0:4242"
 
 // startServer wires the HTTP handlers and starts listening. Returns when
@@ -122,10 +121,9 @@ func statusHandler(state *StateTracker) http.HandlerFunc {
 // collapsed into a single rotation.
 const minTimeBetweenRotations = 30 * time.Second
 
-// rotateHandler implements POST /rotate. Called by tundler-fleet-controller
-// (forwarding crawler- or operator-initiated rotations via per-pod DNS to
-// pod:4242/rotate). Response shapes follow the design-doc "Response
-// contract (RFC 9457 Problem Details for errors)" section.
+// rotateHandler implements POST /rotate. Called directly by the
+// crawler slot pinned to this pod (via per-pod DNS). Response shapes
+// follow RFC 9457 (Problem Details for errors).
 //
 //	state==Ready, debounced     → 200 OK (no-op, last rotation too recent)
 //	state==Ready                → 202 Accepted (rotation runs async)
@@ -172,14 +170,14 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 			})
 		case StateFailed:
 			writeProblem(w, problemDetails{
-				Type:   "https://tundler-fleet-controller/errors/pod-failed-awaiting-restart",
+				Type:   "https://tundler-tunnel/errors/pod-failed-awaiting-restart",
 				Title:  "Pod is in Failed state",
 				Status: http.StatusConflict,
 				Detail: "the pod is awaiting k8s restart; rotation cannot proceed",
 			})
 		default: // Booting, LoggingIn, Connecting
 			writeProblem(w, problemDetails{
-				Type:   "https://tundler-fleet-controller/errors/not-yet-ready",
+				Type:   "https://tundler-tunnel/errors/not-yet-ready",
 				Title:  "Pod is not yet Ready to rotate",
 				Status: http.StatusConflict,
 				Detail: fmt.Sprintf("current state: %s", snap.State),
