@@ -82,12 +82,35 @@ func (e ExpressVPN) Disconnect(ctx context.Context) error {
 	return err
 }
 
+// Locations queries expressvpnctl for the list of available regions.
+// Wraps the call in a retry loop because the ExpressVPN daemon
+// occasionally wedges right after container start: a fresh `expressvpnd`
+// can take 10-30 s to populate its server catalog from the activation
+// API, and any `expressvpnctl get regions` call during that window hits
+// the CLI's built-in 5 s timeout, returns exit-2, and the caller
+// would otherwise see 0 locations → `no allowed locations` → exit 1
+// → systemd restart → repeat. Two retries with a 2 s gap give the
+// daemon a chance to finish loading before we declare it broken;
+// past two retries we return nil and let the caller bail (kubelet's
+// /livez 5 min grace then restarts the whole container, which clears
+// any wedged daemon state).
 func (e ExpressVPN) Locations(ctx context.Context) []string {
-	out, err := shared.RunCmd(ctx, bin, "get", "regions")
-	if err != nil {
-		return nil
+	for attempt := 0; attempt < 3; attempt++ {
+		out, err := shared.RunCmd(ctx, bin, "get", "regions")
+		if err == nil {
+			if fields := strings.Fields(out); len(fields) > 0 {
+				return fields
+			}
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
+		}
 	}
-	return strings.Fields(out)
+	return nil
 }
 
 func (e ExpressVPN) Login(ctx context.Context) error {
