@@ -1,17 +1,16 @@
-# Per-provider tunnel-pod image (PHASE 1 / Dockerfile-2)
+# Per-provider tunnel-pod image.
 #
-# Builds a tundler-<provider>:latest image for the VPN-hub architecture:
-# one image per provider, single VPN client installed, runs the
-# tundler-tunnel binary (not the legacy tundler-api). The pod's envoy
-# data-plane container runs in a sibling container — NOT in this image.
+# Builds a tundler-<provider>:latest image: one image per provider,
+# single VPN client installed, runs the tundler-tunnel binary. The
+# whole pod is a single container — VPN + Go CONNECT proxy + control
+# API all in one process under systemd.
 #
 # Build:
 #   docker build -f docker/Dockerfile.tunnel \
 #       --build-arg PROVIDER=expressvpn \
 #       -t laurentpellegrino/tundler-expressvpn:latest .
 #
-# See docs/architecture-tundler-fleet-controller.md ("Docker images from
-# the tundler repo") for the full image-family taxonomy.
+# See cmd/tundler-tunnel/README.md for the full design.
 
 # ----------------------------------------------------------------------
 # Build stage — compile tundler-tunnel
@@ -87,18 +86,11 @@ RUN set -euo pipefail && \
     done
 
 # Copy the tundler-tunnel binary + the per-pod systemd unit + shared
-# scripts. The envoy data-plane container in the pod is a SIBLING
-# container (not built into this image), so no envoy install here.
+# scripts.
 COPY --from=builder /build/tundler-tunnel /usr/local/bin/tundler-tunnel
 COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
 COPY docker/services/tundler-entrypoint.sh /usr/local/bin/tundler-entrypoint.sh
 COPY docker/services/tundler-tunnel.service /etc/systemd/system/
-# The sibling envoy container reads its bootstrap from a k8s ConfigMap
-# (mounted into the envoy container at /etc/envoy/), NOT from this
-# image's filesystem. See the StatefulSet template in
-# ipregistry-kubernetes; the bootstrap content itself is in
-# docker/config/envoy-tunnel.yaml (committed to this repo for source-
-# of-truth so the k8s ConfigMap stays in sync).
 
 RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh && \
     systemctl enable tundler-tunnel.service && \

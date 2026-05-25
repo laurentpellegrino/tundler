@@ -22,14 +22,16 @@ systemd (PID 1, from image entrypoint)
 Crawler traffic flow:
 
 ```
-crawler  ──HTTP CONNECT──▶  hub envoy (in tundler-fleet-controller pods)
-                                │  weighted-RR across providers, outlier detection
-                                ▼
-                          tundler-tunnel pod  :8485   (Go CONNECT proxy)
-                                │  bidirectional io.Copy through the VPN
-                                ▼
-                          internet via tun0
+crawler slot  ──HTTP CONNECT──▶  tundler-tunnel pod  :8485   (Go CONNECT proxy)
+   pinned to one pod via            │  bidirectional io.Copy through the VPN
+   per-pod headless DNS             ▼
+                              internet via tun0
 ```
+
+Each crawler slot is deterministically pinned to one tunnel pod (via
+the per-provider headless Service's per-pod DNS) and resolves directly
+to that pod's `:8485`. There is no shared LB or aggregator in front of
+the tunnel pods.
 
 ## Pod state machine
 
@@ -77,7 +79,8 @@ stops responding — a real "process is hung" signal.
 
 ## Failure-handling layers
 
-Three independent layers handle different failure modes.
+Two in-process layers cover transient and wedged failures. There is
+no external supervisor — the pod is self-managed.
 
 ### 1. Watchdog (in-process)
 
@@ -110,19 +113,6 @@ The 15 min threshold accommodates the watchdog's full backoff
 sequence, so a flapping recovery doesn't trip it; only a
 genuinely-stuck provider does.
 
-### 3. Hub envoy outlier detection (out-of-process)
-
-The hub envoy in the `tundler-fleet-controller` pod runs
-`ConsecutiveGatewayFailure: 5` outlier detection on each tunnel pod.
-When the crawler sees 5 consecutive gateway failures through a given
-pod, envoy ejects it from the LB pool for a cool-off period and
-steers crawl traffic to other pods. The bad pod isn't killed — it
-just stops receiving traffic until it either rotates (clean exit IP)
-or trips the wedge guard.
-
-This is where "this exit IP is banned" and "this pod is temporarily
-slow" are handled: at the LB layer, with no pod-lifecycle impact.
-
 ## Rotation
 
 Two triggers, one path:
@@ -131,9 +121,10 @@ Two triggers, one path:
   jitter; initial offset is uniformly random in
   `[0, MIN_ROTATION_SECONDS)` so a fleet that boots together doesn't
   rotate in lockstep.
-- **`POST /rotate`** from `tundler-fleet-controller`, itself driven
-  by the crawler's per-tunnel 429 tracking. Sustained 429s on a slot
-  trigger a fanout to the offending pod's `/rotate`.
+- **`POST /rotate`** from the crawler slot that owns this pod. The
+  slot tracks 429s and consecutive failures via its own AIMD token
+  bucket; when it decides to rotate, it POSTs straight to this pod's
+  `:4242/rotate` via the headless-service DNS — no aggregator hop.
 
 Both go through `rotateIfReady`. State transitions
 Ready → Draining (proxy stops accepting new CONNECTs) →

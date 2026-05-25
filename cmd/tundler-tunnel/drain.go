@@ -9,14 +9,13 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/proxy"
 )
 
-// drainController is the contract the rotator uses to perform Layer 1 +
-// Layer 2 of the three-defense-layer rotation flow:
+// drainController is the contract the rotator uses to bleed in-flight
+// CONNECT tunnels before tearing the VPN down. Two steps:
 //
-//	Layer 1: TriggerGracefulDrain — tell the proxy to stop accepting
-//	         NEW CONNECTs. Existing tunnels keep going.
-//	Layer 2: WaitForActiveConnectionsToDrain — poll the proxy's
-//	         open-tunnel count until it reaches 0 (in-flight requests
-//	         have completed) or the hard timeout elapses.
+//	TriggerGracefulDrain — flip the proxy into drain mode so new
+//	    CONNECTs get 503; existing tunnels keep going.
+//	WaitForActiveConnectionsToDrain — poll the proxy's open-tunnel
+//	    count until it reaches 0 or the hard timeout elapses.
 //
 // Both steps run BEFORE the VPN daemon Disconnect, so requests don't
 // land on a half-torn-down tunnel.
@@ -29,10 +28,7 @@ type drainController interface {
 }
 
 // proxyDrainController is the production drainController, backed by
-// the in-process Go CONNECT proxy. Replaces the previous envoy-admin
-// HTTP-based implementation: no external HTTP, no JSON parsing, no
-// network round-trip — just method calls + atomic reads on the
-// proxy.Server in the same Go process.
+// the in-process Go CONNECT proxy.
 type proxyDrainController struct {
 	srv *proxy.Server
 }
