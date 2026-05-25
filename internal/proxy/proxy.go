@@ -38,6 +38,33 @@ import (
 	"time"
 )
 
+// Hardening defaults — see the inline comments at usage sites.
+const (
+	// maxConcurrent caps how many tunnels can be open at once. Protects
+	// against a misbehaving client fork-bombing CONNECT requests and
+	// exhausting the pod's fd ulimit. 2000 is comfortably above the
+	// expected steady-state (~ a few dozen) while well under typical
+	// ulimit (~65535). New CONNECTs over the cap get 503 immediately.
+	maxConcurrent = 2000
+	// maxTunnelDuration is the absolute lifetime of a tunneled
+	// connection — kills connections leaked by half-open peers or
+	// broken NATs. Generous vs. the crawler's actual tunnel lifetime
+	// (sub-second to seconds; max-life on the pool is 2 s).
+	maxTunnelDuration = 10 * time.Minute
+	// requestBufSize sets the bufio.Reader buffer for parsing the
+	// CONNECT request line + headers. Default 4 KB can ErrBufferFull
+	// on pathological clients with many proxy headers; 16 KB is the
+	// same size envoy uses internally.
+	requestBufSize = 16 * 1024
+	// connectParseTimeout bounds how long we wait for the client to
+	// send the full CONNECT request line + headers. Sane clients send
+	// them in one packet; this catches slow-loris-style stalls.
+	connectParseTimeout = 5 * time.Second
+	// upstreamDialTimeout bounds the TCP dial to the upstream. The
+	// VPN tunnel's path can be slow; envoy default is 5 s, we go 8 s.
+	upstreamDialTimeout = 8 * time.Second
+)
+
 // Server is the HTTP CONNECT proxy.
 type Server struct {
 	addr    string
@@ -49,12 +76,17 @@ type Server struct {
 
 	listener net.Listener
 
+	// concurrency limiter — buffered chan as semaphore. Acquired
+	// non-blockingly before handle(); failed acquires return 503.
+	sem chan struct{}
+
 	// stats
-	totalConnect  atomic.Uint64
-	totalSuccess  atomic.Uint64
-	totalError    atomic.Uint64
-	totalDraining atomic.Uint64
-	openTunnels   atomic.Int64
+	totalConnect    atomic.Uint64
+	totalSuccess    atomic.Uint64
+	totalError      atomic.Uint64
+	totalDraining   atomic.Uint64
+	totalOverloaded atomic.Uint64
+	openTunnels     atomic.Int64
 }
 
 // New constructs a Server bound (but not yet listening) at addr.
@@ -66,6 +98,7 @@ func New(addr, podName, nodeIP string) *Server {
 		addr:    addr,
 		podName: podName,
 		nodeIP:  nodeIP,
+		sem:     make(chan struct{}, maxConcurrent),
 	}
 	s.exitIP.Store("")
 	return s
@@ -88,21 +121,23 @@ func (s *Server) SetDraining(draining bool) { s.draining.Store(draining) }
 // reporting and exposing via the existing /status JSON endpoint.
 func (s *Server) Stats() Stats {
 	return Stats{
-		TotalConnect:  s.totalConnect.Load(),
-		TotalSuccess:  s.totalSuccess.Load(),
-		TotalError:    s.totalError.Load(),
-		TotalDraining: s.totalDraining.Load(),
-		OpenTunnels:   s.openTunnels.Load(),
+		TotalConnect:    s.totalConnect.Load(),
+		TotalSuccess:    s.totalSuccess.Load(),
+		TotalError:      s.totalError.Load(),
+		TotalDraining:   s.totalDraining.Load(),
+		TotalOverloaded: s.totalOverloaded.Load(),
+		OpenTunnels:     s.openTunnels.Load(),
 	}
 }
 
 // Stats is the counter snapshot returned by Server.Stats.
 type Stats struct {
-	TotalConnect  uint64 `json:"total_connect"`
-	TotalSuccess  uint64 `json:"total_success"`
-	TotalError    uint64 `json:"total_error"`
-	TotalDraining uint64 `json:"total_draining"`
-	OpenTunnels   int64  `json:"open_tunnels"`
+	TotalConnect    uint64 `json:"total_connect"`
+	TotalSuccess    uint64 `json:"total_success"`
+	TotalError      uint64 `json:"total_error"`
+	TotalDraining   uint64 `json:"total_draining"`
+	TotalOverloaded uint64 `json:"total_overloaded"`
+	OpenTunnels     int64  `json:"open_tunnels"`
 }
 
 // Serve binds and runs the proxy until ctx is cancelled. Blocks
@@ -140,17 +175,32 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // handle services one client connection: parse CONNECT, dial
 // upstream, write 200 + headers, splice bytes both ways until either
-// side EOFs.
+// side EOFs OR maxTunnelDuration is hit (whichever first).
 func (s *Server) handle(client net.Conn) {
 	defer client.Close()
 	s.totalConnect.Add(1)
 
-	// Bound the parse phase. The request line + headers should be in
-	// the first packet from a sane client; 5 s is generous. Reset
-	// later to a longer idle for the tunnel.
-	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Try to acquire a concurrency token NON-BLOCKINGLY. If the
+	// semaphore is full we'd rather fail fast with 503 than queue
+	// the client and let it time out. The crawler then retries on
+	// another slot.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	default:
+		s.totalOverloaded.Add(1)
+		writeError(client, 503, "Service Unavailable (overloaded)")
+		return
+	}
 
-	br := bufio.NewReader(client)
+	// Bound the parse phase. The request line + headers should be in
+	// the first packet from a sane client; connectParseTimeout is
+	// generous. Reset to maxTunnelDuration once the tunnel is up.
+	_ = client.SetReadDeadline(time.Now().Add(connectParseTimeout))
+
+	// 16 KB buffer (vs Go's default 4 KB) to tolerate clients that
+	// stack many proxy headers — matches envoy's request buffer size.
+	br := bufio.NewReaderSize(client, requestBufSize)
 	target, err := parseConnect(br)
 	if err != nil {
 		s.totalError.Add(1)
@@ -166,7 +216,7 @@ func (s *Server) handle(client net.Conn) {
 
 	// Dial upstream. Go's default resolver caches via the host's
 	// nsswitch + glibc cache; sufficient for our load.
-	upstream, err := net.DialTimeout("tcp", target, 8*time.Second)
+	upstream, err := net.DialTimeout("tcp", target, upstreamDialTimeout)
 	if err != nil {
 		s.totalError.Add(1)
 		writeError(client, 502, "Bad Gateway")
@@ -186,10 +236,14 @@ func (s *Server) handle(client net.Conn) {
 	s.openTunnels.Add(1)
 	defer s.openTunnels.Add(-1)
 
-	// Clear deadline for the long-lived tunnel phase. Per-side idle
-	// is handled by io.Copy returning when either side closes;
-	// nothing else needs a timer.
-	_ = client.SetReadDeadline(time.Time{})
+	// Absolute deadline on the tunnel — protects against leaked
+	// half-open connections (broken NAT, killed peer). Generous vs.
+	// crawler's actual tunnel lifetime (sub-second to a few seconds;
+	// HttpFetchService caps connection life at 2 s). Anything still
+	// alive after this is almost certainly leaked.
+	tunnelDeadline := time.Now().Add(maxTunnelDuration)
+	_ = client.SetReadDeadline(tunnelDeadline)
+	_ = upstream.SetReadDeadline(tunnelDeadline)
 
 	// Bidirectional splice. Two goroutines so both directions can
 	// proceed independently; wait for both to finish before
