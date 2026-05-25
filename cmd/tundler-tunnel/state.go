@@ -5,10 +5,8 @@ import (
 	"time"
 )
 
-// State is the tundler-tunnel pod's lifecycle position. Drives the /readyz
-// and /livez HTTP probes and the /status JSON. Maps directly to the
-// "state" field in the Tundler-hub /status response schema documented in
-// architecture-tundler-fleet-controller.md (the per-pod schema).
+// State is the tundler-tunnel pod's lifecycle position. Drives the
+// /readyz HTTP probe and the /status JSON.
 type State string
 
 const (
@@ -16,20 +14,21 @@ const (
 	StateLoggingIn  State = "LoggingIn"  // calling provider.Login()
 	StateConnecting State = "Connecting" // calling provider.Connect() + waiting for tunnel up
 	StateReady      State = "Ready"      // tunnel up; serving traffic
-	StateDraining   State = "Draining"   // rotation start: /readyz→503 + Layer 1 envoy drain in progress
+	StateDraining   State = "Draining"   // rotation start: /readyz→503; proxy drain in progress
 	StateRotating   State = "Rotating"   // Disconnect done; reconnecting to new location
-	StateFailed     State = "Failed"     // surrendered; /livez flips to 503 so k8s restarts
+	StateFailed     State = "Failed"     // surrendered; watchdog will retry with backoff
 )
 
-// StateTracker is the source of truth for the /status JSON and the probe
-// outcomes. All mutating accessors use a write lock; the JSON snapshotter
-// uses a read lock. Safe for concurrent use from the HTTP handlers and the
-// main goroutine.
+// StateTracker is the source of truth for the /status JSON and the
+// probe outcomes. All mutating accessors use a write lock; the JSON
+// snapshotter uses a read lock. Safe for concurrent use from the HTTP
+// handlers and the main goroutine.
+//
 // TunnelUpListener is called from RecordTunnelUp after the tracker's
-// fields are updated. Used by main to wire the xDS server's PushExitIP
-// without coupling cmd/tundler-tunnel to the xds package directly.
-// Invoked outside the tracker's lock; safe for the listener to call
-// back into the tracker (no deadlock).
+// fields are updated. Used by main to wire proxy.Server.SetExitIP so
+// the in-process CONNECT proxy emits the fresh exit IP in its
+// response headers. Invoked outside the tracker's lock; safe for the
+// listener to call back into the tracker (no deadlock).
 type TunnelUpListener func(exitIP string)
 
 type StateTracker struct {
@@ -129,8 +128,8 @@ func (s *StateTracker) RecordTunnelUp(location, exitIP string) {
 
 // SetTunnelUpListener registers a callback fired on every RecordTunnelUp
 // (initial connect, watchdog reconnect, rotation success). Production
-// wires this to xds.Server.PushExitIP so the pod-local envoy gets a
-// fresh snapshot with the updated x-tundler-exit-ip header.
+// wires this to proxy.Server.SetExitIP so the in-process CONNECT proxy
+// emits the fresh exit IP in its `x-tundler-exit-ip` response header.
 //
 // Safe to call concurrently with RecordTunnelUp. Setting nil clears the
 // listener.

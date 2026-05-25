@@ -1,21 +1,9 @@
-// Command tundler-tunnel is the simplified single-provider tundler runtime
-// that runs in each per-provider tunnel pod of the VPN-hub architecture.
-// See docs/architecture-tundler-fleet-controller.md in ipregistry-crawl.
-//
-// Implemented slices so far:
-//   - boot-login-jitter + Login() + idle (slice a)
-//   - HTTP server on :4242 with /readyz, /livez, /status (slice a')
-//   - Connect to random allowed location + record current_location/exit_ip (slice b'.1)
-//   - Watchdog reconnect on unexpected tunnel drop (slice b'.2)
-//   - Hourly random rotation timer (Ready → Draining → Rotating → Ready) (slice c'.1)
-//   - Failed-rotation retry-with-different-location (ROTATION_RETRY_MAX) (slice c'.2)
-//   - POST /rotate HTTP handler (consumed by tundler-fleet-controller) (slice d'.1)
-//   - internal/xds SnapshotBuilder + gRPC Server on :18000 (slice e'.1 + e'.2)
-//   - Self-monitor (Trigger C): sliding-window 429-rate → auto-rotate (slice f'.1)
-//
-// Future slices: Layer 1+2 envoy drain hooks (call envoy admin's
-// /drain_listeners + poll downstream_cx_active), per-provider Dockerfile
-// + CI matrix.
+// Command tundler-tunnel is the single-provider VPN runtime that runs
+// in each per-provider tunnel pod. One Go binary owns the VPN
+// provider, the HTTP CONNECT proxy on :8485, the control API on :4242
+// (/livez /readyz /status /rotate), the watchdog, the hourly rotator,
+// and the wedge guard. See cmd/tundler-tunnel/README.md for the full
+// design.
 package main
 
 import (

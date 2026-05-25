@@ -70,11 +70,8 @@ func startServer(ctx context.Context, state *StateTracker, triggerRotation Rotat
 // the same container, preserving forensic logs and not touching the
 // kubelet-visible restart count.
 //
-// /readyz remains the right probe for "should this pod be in the LB
-// pool right now?" — see readyzHandler below. The hub envoy's
-// ConsecutiveGatewayFailure outlier detection (xds_snapshot.go) is
-// the second line of defense for steering traffic away from a
-// transiently bad pod.
+// /readyz remains the right probe for "should this pod accept traffic
+// right now?" — see readyzHandler below.
 func livezHandler(state *StateTracker) http.HandlerFunc {
 	_ = state // reserved for future structured liveness checks
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -82,11 +79,13 @@ func livezHandler(state *StateTracker) http.HandlerFunc {
 	}
 }
 
-// readyzHandler returns 200 only when the pod is genuinely ready to serve
-// traffic — currently means state==Ready (logged in). Future slices will
-// also gate on tunnel-up; when rotation lands, /readyz flips to 503 the
-// instant tundler-tunnel decides to rotate (Draining), and stays 503 until
-// rotation succeeds or surrenders.
+// readyzHandler returns 200 only when the pod is genuinely ready to
+// serve traffic — state==Ready. During rotation /readyz flips to 503
+// the instant tundler-tunnel transitions out of Ready (Draining), and
+// stays 503 until rotation succeeds (back to Ready) or surrenders
+// (Failed). The crawler slot pinned to this pod resolves Ready state
+// via headless-service DNS (publishNotReadyAddresses=false) and skips
+// dispatch while unready.
 func readyzHandler(state *StateTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		s := state.Get()
@@ -98,8 +97,7 @@ func readyzHandler(state *StateTracker) http.HandlerFunc {
 	}
 }
 
-// statusHandler returns the JSON snapshot per the
-// "Tundler-hub /status response schema" section of the design doc.
+// statusHandler returns the JSON snapshot of the tracker state.
 func statusHandler(state *StateTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
