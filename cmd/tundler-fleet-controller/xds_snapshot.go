@@ -22,10 +22,12 @@ import (
 // this string; envoy and fleet-controller must agree.
 const fleetXDSNodeID = "tundler-fleet-controller"
 
-// tunnelDataPort is the port each tunnel-pod exposes for envoy traffic.
-// Matches the EXPOSE in docker/Dockerfile.tunnel and the listener bound
-// by tundler-tunnel's xDS snapshot in internal/xds.
-const tunnelDataPort = 8484
+// tunnelDataPort is the port each tunnel-pod exposes for crawler
+// traffic. After the envoy → in-process Go proxy migration (phase 4),
+// this is the listener bound by the proxy.Server in tundler-tunnel.
+// Must match proxyListenPort in cmd/tundler-tunnel/main.go AND the
+// Service `proxy` port in ipregistry-kubernetes's render-vpn-manifests.py.
+const tunnelDataPort = 8485
 
 // buildFleetSnapshot composes a CDS+EDS snapshot for the hub-Pod envoy.
 // One Cluster per configured provider (CDS), one ClusterLoadAssignment
