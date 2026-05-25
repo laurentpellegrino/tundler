@@ -45,11 +45,9 @@ type StateTracker struct {
 	lastRotation          *RotationRecord
 	tunnelUpListener      TunnelUpListener
 	// lastReadyAt is the wall-clock time of the most recent transition
-	// into StateReady. Used by /livez to distinguish "transiently not
-	// Ready (rotating, briefly Failed)" — which is fine — from
-	// "genuinely wedged" — which warrants a k8s restart. See livezHandler
-	// and StateMaxNonReady. Zero value means "never been Ready"; the
-	// boot path treats that as "still booting, give it time".
+	// into StateReady. Used by /status for tunnel_age_seconds — the
+	// wedge-guard goroutine owns the "stuck out of Ready" detection
+	// (see runWedgeGuard in main.go), not /livez.
 	lastReadyAt time.Time
 }
 

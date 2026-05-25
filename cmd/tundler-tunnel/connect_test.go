@@ -70,6 +70,16 @@ func (f *fakeProvider) Version(_ context.Context) (string, error) {
 
 func (f *fakeProvider) drop() { f.connected.Store(false) }
 
+// withWatchdogBackoff overrides watchdogMinBackoff/watchdogMaxBackoff
+// for the duration of a test and returns a restore func meant to be
+// `defer`-ed. Lets tests exercise the retry loop in milliseconds
+// instead of the production 5s/60s values.
+func withWatchdogBackoff(min, max time.Duration) func() {
+	prevMin, prevMax := watchdogMinBackoff, watchdogMaxBackoff
+	watchdogMinBackoff, watchdogMaxBackoff = min, max
+	return func() { watchdogMinBackoff, watchdogMaxBackoff = prevMin, prevMax }
+}
+
 func (f *fakeProvider) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -202,10 +212,18 @@ func TestWatchdog_SkipsWhenNotReady(t *testing.T) {
 	}
 }
 
-// TestWatchdog_ReconnectFailureMarksFailed: if Connect returns
-// !Connected during a reconnect, watchdog transitions to Failed and
-// exits its loop (relying on the liveness probe to trigger restart).
-func TestWatchdog_ReconnectFailureMarksFailed(t *testing.T) {
+// TestWatchdog_ReconnectFailureMarksFailedAndRetries: if Connect
+// returns !Connected during a reconnect, watchdog transitions to
+// Failed but STAYS ALIVE. The runtime trigger that ultimately decides
+// to give up is runWedgeGuard (out-of-band, threshold-based) — the
+// watchdog itself retries forever with exponential backoff. The old
+// "watchdog exits on first failure" behavior would park the pod in
+// Failed until the hourly rotator picked it up, which gave /livez time
+// to flip and kubelet time to kill.
+func TestWatchdog_ReconnectFailureMarksFailedAndRetries(t *testing.T) {
+	// Dial backoff down so the test runs in ms, not seconds.
+	defer withWatchdogBackoff(1*time.Millisecond, 5*time.Millisecond)()
+
 	fp := &fakeProvider{
 		locations: []string{"USA"},
 		connectOK: false, // reconnect will fail
@@ -222,16 +240,86 @@ func TestWatchdog_ReconnectFailureMarksFailed(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// watchdog returned — good (it should after marking Failed)
-	case <-time.After(500 * time.Millisecond):
-		cancel()
-		<-done
-		t.Fatal("watchdog did not return after reconnect failure")
+	// Wait for the first reconnect attempt + Failed transition.
+	deadline := time.After(500 * time.Millisecond)
+	for fp.callCount() < 1 || st.Get() != StateFailed {
+		select {
+		case <-deadline:
+			t.Fatalf("watchdog did not mark Failed within 500ms (calls=%d, state=%s)",
+				fp.callCount(), st.Get())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
-	if st.Get() != StateFailed {
-		t.Errorf("state=%s after reconnect failure, want Failed", st.Get())
+	// Now the key assertion: goroutine must still be alive (no
+	// premature return). Cancel the context and verify it exits
+	// cleanly only because of cancellation.
+	select {
+	case <-done:
+		t.Fatal("watchdog returned after first failure; expected it to keep retrying")
+	case <-time.After(50 * time.Millisecond):
 	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog did not exit after ctx cancel")
+	}
+}
+
+// TestWatchdog_RecoversFromFailed: once the provider becomes Connected
+// again, the watchdog (in retry-from-Failed mode) transitions the
+// pod back to Ready. This is the path that replaces the old
+// "watchdog gives up, hourly rotator picks up next tick" recovery —
+// now recovery happens within a few backoff cycles.
+func TestWatchdog_RecoversFromFailed(t *testing.T) {
+	defer withWatchdogBackoff(1*time.Millisecond, 5*time.Millisecond)()
+
+	fp := &fakeProvider{
+		locations: []string{"USA"},
+		connectIP: "1.1.1.1",
+		connectOK: false, // start with failing reconnect
+	}
+	st := NewStateTracker("fake")
+	st.Set(StateFailed)
+	fp.connected.Store(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond)
+		close(done)
+	}()
+
+	// Wait for at least one failed attempt to land us in Failed.
+	deadline := time.After(500 * time.Millisecond)
+	for fp.callCount() < 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("watchdog did not attempt reconnect (calls=%d)", fp.callCount())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Now flip the provider to "will connect successfully" and wait
+	// for the watchdog to retry and reach Ready.
+	fp.mu.Lock()
+	fp.connectOK = true
+	fp.mu.Unlock()
+	fp.connected.Store(true)
+
+	deadline = time.After(time.Second)
+	for st.Get() != StateReady {
+		select {
+		case <-deadline:
+			t.Fatalf("watchdog did not recover to Ready (state=%s, calls=%d)",
+				st.Get(), fp.callCount())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	<-done
 }
