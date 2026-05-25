@@ -32,6 +32,7 @@ import (
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
+	"github.com/laurentpellegrino/tundler/internal/proxy"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 	"github.com/laurentpellegrino/tundler/internal/xds"
 )
@@ -54,6 +55,13 @@ const (
 	xdsListenAddr   = "127.0.0.1:18000" // loopback-only per design-doc tunnel-pod envoy config
 	envoyAdminURL   = "http://127.0.0.1:9901"
 	dataListenPort  = 8484 // matches the bake-time envoy bootstrap
+	// Phase 1 of envoy → in-process Go proxy migration. The new
+	// proxy runs on a SEPARATE port alongside envoy so we can route
+	// a single test pod's slot at the new port via crawler config
+	// and compare behavior side-by-side before flipping the whole
+	// fleet. Once verified, the new proxy moves to 8484 and the
+	// envoy container is removed from the pod.
+	proxyListenPort = 8485
 )
 
 func main() {
@@ -135,7 +143,23 @@ func main() {
 	// is acceptable).
 	setStaticEnvoyHeaders(podName, os.Getenv(envNodeIP))
 
+	// Phase 1 of envoy → in-process proxy migration. Start the
+	// Go CONNECT proxy on 0.0.0.0:8485 alongside envoy on 8484 so
+	// we can compare behavior side-by-side via crawler-side port
+	// switch before retiring envoy.
+	nodeIP := os.Getenv(envNodeIP)
+	proxySrv := proxy.New(fmt.Sprintf("0.0.0.0:%d", proxyListenPort), podName, nodeIP)
+	go func() {
+		if err := proxySrv.Serve(ctx); err != nil {
+			log.Printf("tundler-tunnel: proxy server: %v", err)
+		}
+	}()
+
 	state.SetTunnelUpListener(func(exitIP string) {
+		// In-process proxy: just a pointer-swap, no IPC.
+		proxySrv.SetExitIP(exitIP)
+		// Legacy paths kept for the envoy container (still running
+		// in parallel during the migration).
 		if err := writeEnvoyHeadersWithExitIP(exitIP); err != nil {
 			log.Printf("tundler-tunnel: write envoy headers (exit_ip=%s) failed: %v", exitIP, err)
 		}
