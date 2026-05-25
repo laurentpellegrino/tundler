@@ -25,8 +25,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -34,7 +32,6 @@ import (
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
 	"github.com/laurentpellegrino/tundler/internal/proxy"
 	"github.com/laurentpellegrino/tundler/internal/shared"
-	"github.com/laurentpellegrino/tundler/internal/xds"
 )
 
 const (
@@ -45,22 +42,14 @@ const (
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
 	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
-	envSelfMonitorIntervalSec = "SELF_MONITOR_INTERVAL_SECONDS"
-	envSelfMonitorWindowSamples = "SELF_MONITOR_WINDOW_SAMPLES"
-	envSelfMonitorThresholdPct  = "SELF_MONITOR_THRESHOLD_PERCENT"
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
 	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
 
-	xdsListenAddr   = "127.0.0.1:18000" // loopback-only per design-doc tunnel-pod envoy config
-	envoyAdminURL   = "http://127.0.0.1:9901"
-	dataListenPort  = 8484 // matches the bake-time envoy bootstrap
-	// Phase 1 of envoy → in-process Go proxy migration. The new
-	// proxy runs on a SEPARATE port alongside envoy so we can route
-	// a single test pod's slot at the new port via crawler config
-	// and compare behavior side-by-side before flipping the whole
-	// fleet. Once verified, the new proxy moves to 8484 and the
-	// envoy container is removed from the pod.
+	// Port the in-process Go CONNECT proxy listens on (replaces the
+	// sibling envoy container retired in phase 4). The Service
+	// publishes the same port; the crawler's TunnelSlot.proxyUrl
+	// points here.
 	proxyListenPort = 8485
 )
 
@@ -92,61 +81,15 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// /rotate handler invokes this closure in a goroutine; rotateIfReady
-	// guards on state==Ready internally so this is safe to call even if
-	// the hourly rotator timer is racing with an HTTP-driven rotation.
-	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
-	drain := newEnvoyDrainController(envoyAdminURL)
-	triggerRotation := func() {
-		rotateIfReady(ctx, prov, state, providerName, excluded, drain)
-	}
-
-	// xDS server: kept for backwards compatibility during the migration
-	// to static envoy config. envoy-tunnel.yaml in current images uses
-	// fully static resources + a Lua filter that reads the exit IP from
-	// /run/tundler/exit-ip (written by SetTunnelUpListener below). The
-	// xDS server still runs so that any old envoy bootstrap that
-	// references it doesn't break on rollback, but it's no longer the
-	// source of truth for envoy config. Once the static migration is
-	// confirmed stable, this server (and the entire internal/xds
-	// package) can be deleted.
+	// In-process Go HTTP CONNECT proxy — replaces the sibling envoy
+	// container retired in phase 4 of the migration. Single process
+	// for the whole tunnel pod: VPN provider + proxy + HTTP control
+	// API, all sharing the same Go runtime + state.
 	podName := os.Getenv(envPodName)
 	if podName == "" {
 		// Local-dev fallback. Real pods get POD_NAME via downward API.
 		podName = "tundler-tunnel-local"
 	}
-	xdsServer, err := xds.NewServer(xds.PodInputs{
-		PodName:        podName,
-		NodeIP:         os.Getenv(envNodeIP),
-		DataListenPort: dataListenPort,
-	})
-	if err != nil {
-		log.Fatalf("tundler-tunnel: xDS server init: %v", err)
-	}
-	go func() {
-		if err := xdsServer.Serve(ctx, xdsListenAddr); err != nil {
-			log.Printf("tundler-tunnel: xDS server: %v", err) // not fatal; envoy will reconnect
-		}
-	}()
-
-	// On every successful tunnel-up:
-	//   1. write /run/tundler/exit-ip — read by envoy's Lua filter for
-	//      the x-tundler-exit-ip response header. /run is a pod-level
-	//      emptyDir (tmpfs) shared with the envoy container, so the
-	//      write is visible immediately with no IPC roundtrip.
-	//   2. push the new snapshot to the xDS server (legacy path, kept
-	//      for any pod still running an xDS-bootstrap envoy until the
-	//      rollout completes).
-	// Seed the static per-pod headers (tunnel-id, node-ip) so envoy
-	// has them on the very first request — even before the first
-	// Connect (the exit-ip header is just missing until then, which
-	// is acceptable).
-	setStaticEnvoyHeaders(podName, os.Getenv(envNodeIP))
-
-	// Phase 1 of envoy → in-process proxy migration. Start the
-	// Go CONNECT proxy on 0.0.0.0:8485 alongside envoy on 8484 so
-	// we can compare behavior side-by-side via crawler-side port
-	// switch before retiring envoy.
 	nodeIP := os.Getenv(envNodeIP)
 	proxySrv := proxy.New(fmt.Sprintf("0.0.0.0:%d", proxyListenPort), podName, nodeIP)
 	go func() {
@@ -156,17 +99,21 @@ func main() {
 	}()
 
 	state.SetTunnelUpListener(func(exitIP string) {
-		// In-process proxy: just a pointer-swap, no IPC.
+		// In-process pointer swap — read by proxy.handle on every
+		// subsequent CONNECT, no IPC, no file IO.
 		proxySrv.SetExitIP(exitIP)
-		// Legacy paths kept for the envoy container (still running
-		// in parallel during the migration).
-		if err := writeEnvoyHeadersWithExitIP(exitIP); err != nil {
-			log.Printf("tundler-tunnel: write envoy headers (exit_ip=%s) failed: %v", exitIP, err)
-		}
-		if err := xdsServer.PushExitIP(exitIP); err != nil {
-			log.Printf("tundler-tunnel: xDS push (exit_ip=%s) failed: %v", exitIP, err)
-		}
 	})
+
+	// /rotate handler invokes this closure in a goroutine; rotateIfReady
+	// guards on state==Ready internally so this is safe to call even if
+	// the hourly rotator timer is racing with an HTTP-driven rotation.
+	// The drain controller now backs onto the in-process proxy (no more
+	// envoy admin HTTP calls).
+	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+	drain := newProxyDrainController(proxySrv)
+	triggerRotation := func() {
+		rotateIfReady(ctx, prov, state, providerName, excluded, drain)
+	}
 
 	go func() {
 		if err := startServer(ctx, state, triggerRotation); err != nil {
@@ -213,18 +160,17 @@ func main() {
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
 	go runRotator(ctx, prov, state, providerName, excluded, minRotation, drain)
 
-	// Self-monitor (Trigger C): poll envoy admin /stats; if our exit
-	// IP's 429-rate exceeds the threshold over the window, rotate
-	// proactively. Same RotateTrigger as /rotate so the underlying
-	// rotation lifecycle is reused.
-	mp := defaultMonitorParams()
-	mp.interval = time.Duration(getEnvInt(envSelfMonitorIntervalSec, int(mp.interval.Seconds()))) * time.Second
-	mp.windowSamples = getEnvInt(envSelfMonitorWindowSamples, mp.windowSamples)
-	mp.threshold = float64(getEnvInt(envSelfMonitorThresholdPct, int(mp.threshold*100))) / 100.0
-	go runSelfMonitor(ctx, fetchEnvoyStats(envoyAdminURL), state, triggerRotation, mp)
+	// Self-monitor (Trigger C, envoy-admin-driven) was removed when
+	// envoy was retired. The crawler's slot-level AIMD + per-tunnel
+	// 429 tracking now drives proactive rotation: when a slot sees
+	// sustained 429s it POSTs /rotate on the fleet-controller, which
+	// fans out to the affected tundler-tunnel's /rotate. Same
+	// triggerRotation flow as before, just sourced from the crawler
+	// side where the actual upstream-response visibility lives.
+	_ = triggerRotation // referenced by /rotate handler in startServer
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s self-monitor=%s/window=%d/threshold=%.0f%%",
-		watchdogInterval, minRotation, mp.interval, mp.windowSamples, mp.threshold*100)
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
+		watchdogInterval, minRotation)
 
 	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
 	// (Trigger C) and Layer 1+2 envoy drain hooks.
@@ -307,79 +253,3 @@ func getEnvInt(name string, def int) int {
 	return n
 }
 
-// envoyHeadersFile is the shared-with-envoy file holding the response
-// headers envoy should inject on every CONNECT/proxied request. One
-// "key: value" line per header. Read by envoy's Lua filter on every
-// response. /run is a pod-level emptyDir tmpfs mounted in both this
-// container and the envoy container — writes are visible to envoy
-// immediately with no IPC.
-//
-// We use a single file (rather than separate per-header files) because
-// the Lua filter then has to parse just one file per response; less
-// code, fewer open() syscalls.
-//
-// Why not use envoy's %ENV(...)% formatter for the static
-// per-pod headers (tunnel-id, node-ip): envoy 1.30's
-// response_headers_to_add does NOT support %ENV — boot fails with
-// "Not supported field in StreamInfo: ENV". We could plumb env via
-// a CLI templating step but going through this file is simpler and
-// uniform.
-const envoyHeadersFile = "/run/tundler/headers"
-
-// writeEnvoyHeaders updates the headers file atomically so envoy's
-// Lua filter never reads a half-written set. write-tmp + rename —
-// POSIX guarantees rename atomicity within a filesystem.
-//
-// Each entry is "key: value\n". Keys MUST be valid HTTP header
-// names; values MUST be free of CR/LF. Caller responsibility.
-func writeEnvoyHeaders(headers map[string]string) error {
-	if err := os.MkdirAll("/run/tundler", 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
-	}
-	var buf strings.Builder
-	for k, v := range headers {
-		buf.WriteString(k)
-		buf.WriteString(": ")
-		buf.WriteString(v)
-		buf.WriteByte('\n')
-	}
-	tmp := envoyHeadersFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(buf.String()), 0o644); err != nil {
-		return fmt.Errorf("write tmp: %w", err)
-	}
-	return os.Rename(tmp, envoyHeadersFile)
-}
-
-// envoyHeadersState holds the per-pod static headers (tunnel-id,
-// node-ip) so writeEnvoyHeadersWithExitIP can re-merge them with
-// the current exit IP on every rotation without re-reading env.
-var envoyHeadersStatic = map[string]string{}
-var envoyHeadersMu sync.Mutex
-
-func setStaticEnvoyHeaders(podName, nodeIP string) {
-	envoyHeadersMu.Lock()
-	defer envoyHeadersMu.Unlock()
-	envoyHeadersStatic["x-tundler-tunnel-id"] = podName
-	if nodeIP != "" {
-		envoyHeadersStatic["x-tundler-node-ip"] = nodeIP
-	}
-	_ = writeEnvoyHeadersLocked()
-}
-
-func writeEnvoyHeadersWithExitIP(exitIP string) error {
-	envoyHeadersMu.Lock()
-	defer envoyHeadersMu.Unlock()
-	if exitIP != "" {
-		envoyHeadersStatic["x-tundler-exit-ip"] = exitIP
-	}
-	return writeEnvoyHeadersLocked()
-}
-
-func writeEnvoyHeadersLocked() error {
-	// Snapshot the map (it's small) before passing to writer.
-	snap := make(map[string]string, len(envoyHeadersStatic))
-	for k, v := range envoyHeadersStatic {
-		snap[k] = v
-	}
-	return writeEnvoyHeaders(snap)
-}

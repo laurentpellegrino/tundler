@@ -117,6 +117,15 @@ func (s *Server) SetExitIP(ip string) { s.exitIP.Store(ip) }
 // crawler's slot logic.
 func (s *Server) SetDraining(draining bool) { s.draining.Store(draining) }
 
+// IsDraining reports the current drain flag. Test seam (also useful
+// for /status).
+func (s *Server) IsDraining() bool { return s.draining.Load() }
+
+// IncOpenTunnels adjusts the open-tunnel counter by delta. Test
+// seam for the drain controller — production handle() uses this
+// internally to track active tunnels.
+func (s *Server) IncOpenTunnels(delta int64) { s.openTunnels.Add(delta) }
+
 // Stats returns a snapshot of cumulative counters. Useful for log
 // reporting and exposing via the existing /status JSON endpoint.
 func (s *Server) Stats() Stats {
