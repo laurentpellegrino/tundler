@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -60,94 +58,28 @@ func startServer(ctx context.Context, state *StateTracker, triggerRotation Rotat
 	return nil
 }
 
-// StateMaxNonReady caps how long /livez tolerates the pod being out of
-// StateReady before reporting unhealthy. Transient transitions
-// (Draining→Rotating→Connecting→Ready) and even a brief Failed state
-// (after which the rotator will retry on the next periodic tick) stay
-// well under this window. A pod that has been wedged out of Ready for
-// longer than this almost certainly needs a k8s restart — either the
-// VPN account is throttled long enough that retry isn't getting us
-// anywhere, or the process is deadlocked. Tuned so a slow ExpressVPN
-// Lightway reconnect (30 s × 3 attempts ≈ 100 s worst case) plus the
-// envoy-drain phase still fit comfortably below the threshold.
-const StateMaxNonReady = 5 * time.Minute
-
-// livezHandler is intentionally lenient. The k8s liveness contract is
-// "should this process be restarted?" — NOT "is this pod ready to
-// serve?" (that's /readyz). So /livez stays 200 across all transient
-// non-Ready states: Booting, LoggingIn, Connecting, Draining, Rotating,
-// and even Failed (the rotator retries from Failed on its next tick).
-// The single trigger for a 503 is "non-Ready for too long" — set by
-// StateMaxNonReady. That catches genuine wedges (deadlock, exhausted
-// retries, account banned) while letting normal-but-slow rotations
-// complete without kubelet killing a working pod.
+// livezHandler answers the kubelet liveness probe. Liveness is "is
+// this process responsive?" — the act of serving this 200 IS the
+// liveness signal kubelet wants. We deliberately do NOT inspect VPN
+// state here: a rotation in progress, a brief Failed window, or even
+// a stuck VPN daemon are not reasons to have kubelet recreate the
+// CONTAINER (which wipes /var/log/journal and starts the kubelet
+// restart counter ticking). Instead, runWedgeGuard (in main.go) calls
+// os.Exit(1) when state stays not-Ready continuously past its
+// threshold; systemd's Restart=always then respawns the binary inside
+// the same container, preserving forensic logs and not touching the
+// kubelet-visible restart count.
 //
-// Special case: a pod that has NEVER been Ready (lastReadyAt zero)
-// gets the full StateMaxNonReady from CONTAINER FIRST START before we'd
-// report unhealthy. We use a marker file (/var/lib/tundler/first-start)
-// to persist this across systemd-driven binary restarts inside the
-// same container — without it, every Restart=always cycle resets the
-// clock and the pod sits at 1/2 forever.
-//
-// The marker MUST live on the container's local rootfs (not in any
-// pod-level emptyDir). /var/lib is part of the container's writable
-// layer: it's cleared on container restart (kubelet creates a new
-// container instance with a fresh rootfs) but persists across
-// systemd-driven binary restarts within a container. We previously
-// used /run/tundler/first-start, but /run is mounted as a pod-level
-// emptyDir tmpfs in our manifests, which means the marker survived
-// container restarts too — once a pod hit one /livez kill, the stale
-// marker triggered another kill on every subsequent container start,
-// and the restart count grew unboundedly (observed 2026-05-24: PIA
-// pods accumulating 30+ tundler-tunnel restarts in a few hours
-// because of this).
-const firstStartMarker = "/var/lib/tundler/first-start"
-
+// /readyz remains the right probe for "should this pod be in the LB
+// pool right now?" — see readyzHandler below. The hub envoy's
+// ConsecutiveGatewayFailure outlier detection (xds_snapshot.go) is
+// the second line of defense for steering traffic away from a
+// transiently bad pod.
 func livezHandler(state *StateTracker) http.HandlerFunc {
-	firstStart := readOrCreateFirstStartMarker()
+	_ = state // reserved for future structured liveness checks
 	return func(w http.ResponseWriter, _ *http.Request) {
-		if state.Get() == StateReady {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		// Determine the reference point we're measuring "stuck" from.
-		// Before the first Ready, that's the persisted container-first-
-		// start (NOT this binary's start — see firstStartMarker comment).
-		// After the first Ready, it's the most recent transition into
-		// Ready.
-		ref := state.LastReadyAt()
-		if ref.IsZero() {
-			ref = firstStart
-		}
-		if time.Since(ref) > StateMaxNonReady {
-			http.Error(w, fmt.Sprintf("non-Ready for %s (> %s); restart requested",
-				time.Since(ref).Round(time.Second), StateMaxNonReady),
-				http.StatusServiceUnavailable)
-			return
-		}
 		w.WriteHeader(http.StatusOK)
 	}
-}
-
-// readOrCreateFirstStartMarker returns the timestamp written into
-// firstStartMarker on the FIRST binary start within this container
-// lifecycle. Subsequent restarts of the tundler-tunnel.service unit
-// (Restart=always) read the same value, so the "never been Ready" lag
-// timer measures from container start, not from the latest binary
-// restart. On any error (read or write), falls back to time.Now() —
-// that's the only-this-binary-restart behavior, which is no worse
-// than the pre-fix code.
-func readOrCreateFirstStartMarker() time.Time {
-	if data, err := os.ReadFile(firstStartMarker); err == nil {
-		if t, err := time.Parse(time.RFC3339Nano, string(data)); err == nil {
-			return t
-		}
-	}
-	now := time.Now()
-	if err := os.MkdirAll(filepath.Dir(firstStartMarker), 0o755); err == nil {
-		_ = os.WriteFile(firstStartMarker, []byte(now.Format(time.RFC3339Nano)), 0o644)
-	}
-	return now
 }
 
 // readyzHandler returns 200 only when the pod is genuinely ready to serve
@@ -175,11 +107,29 @@ func statusHandler(state *StateTracker) http.HandlerFunc {
 	}
 }
 
+// minTimeBetweenRotations caps how rapidly the /rotate endpoint will
+// trigger fresh rotations. The crawler's per-tunnel 429 tracking can
+// fan out a burst of /rotate POSTs against the same pod when an exit
+// IP gets banned by a downstream WAF: each new IP that also fails
+// triggers another /rotate, and rotation-on-rotation overlaps were
+// the dominant cause of pod thrash before this guard. After a
+// rotation completes, we refuse to start another for this long, so
+// the new exit IP gets at least one usable window before getting
+// rotated away.
+//
+// Tuned conservatively: short enough that genuine "this IP is also
+// banned" cases recover in well under a minute end-to-end (one
+// debounce window plus one rotation), long enough that
+// near-simultaneous burst /rotate calls from multiple slots get
+// collapsed into a single rotation.
+const minTimeBetweenRotations = 30 * time.Second
+
 // rotateHandler implements POST /rotate. Called by tundler-fleet-controller
 // (forwarding crawler- or operator-initiated rotations via per-pod DNS to
 // pod:4242/rotate). Response shapes follow the design-doc "Response
 // contract (RFC 9457 Problem Details for errors)" section.
 //
+//	state==Ready, debounced     → 200 OK (no-op, last rotation too recent)
 //	state==Ready                → 202 Accepted (rotation runs async)
 //	state==Draining/Rotating    → 200 OK (idempotent: already in progress)
 //	state==Failed               → 409 Conflict, application/problem+json
@@ -195,6 +145,16 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		snap := state.Snapshot()
 		switch snap.State {
 		case StateReady:
+			if since, recent := timeSinceLastRotation(snap); recent {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"state":   string(StateReady),
+					"message": fmt.Sprintf("rotation debounced (last completed %s ago, min %s)",
+						since.Round(time.Second), minTimeBetweenRotations),
+				})
+				return
+			}
 			go trigger()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
@@ -245,4 +205,20 @@ func writeProblem(w http.ResponseWriter, p problemDetails) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(p.Status)
 	_ = json.NewEncoder(w).Encode(p)
+}
+
+// timeSinceLastRotation reports how long ago the last rotation
+// completed and whether that's within the debounce window. Returns
+// (0, false) when there's no prior rotation or the timestamp can't
+// be parsed (defensive — never block /rotate on a malformed snapshot).
+func timeSinceLastRotation(snap Snapshot) (time.Duration, bool) {
+	if snap.LastRotation == nil || snap.LastRotation.CompletedAt == "" {
+		return 0, false
+	}
+	completed, err := time.Parse(time.RFC3339, snap.LastRotation.CompletedAt)
+	if err != nil {
+		return 0, false
+	}
+	since := time.Since(completed)
+	return since, since < minTimeBetweenRotations
 }

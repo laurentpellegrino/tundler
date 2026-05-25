@@ -40,17 +40,32 @@ const (
 	envExcludedLocations     = "EXCLUDED_LOCATIONS"
 	envWatchdogIntervalSec   = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
+	envWedgeGuardSec         = "WEDGE_GUARD_THRESHOLD_SECONDS"
 	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
 	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
+	defaultWedgeGuardSec     = 900  // 15 min — tunable via WEDGE_GUARD_THRESHOLD_SECONDS
 
 	// Port the in-process Go CONNECT proxy listens on (replaces the
 	// sibling envoy container retired in phase 4). The Service
 	// publishes the same port; the crawler's TunnelSlot.proxyUrl
 	// points here.
 	proxyListenPort = 8485
+)
+
+// Watchdog reconnect backoff. The watchdog keeps retrying forever
+// (no early exit on failure) — a single transient piactl/expressvpnctl
+// blip used to permanently park the pod in Failed until the hourly
+// rotator picked it up. With this loop, recovery happens within ~60s
+// of the daemon recovering.
+//
+// vars (not consts) so tests can dial them down without going through
+// a full dependency-injection refactor.
+var (
+	watchdogMinBackoff = 5 * time.Second
+	watchdogMaxBackoff = 60 * time.Second
 )
 
 func main() {
@@ -160,6 +175,18 @@ func main() {
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
 	go runRotator(ctx, prov, state, providerName, excluded, minRotation, drain)
 
+	// Wedge guard: if state stays continuously not-Ready for longer
+	// than WEDGE_GUARD_THRESHOLD_SECONDS (default 15 min), the watchdog
+	// has exhausted its retries on something genuinely broken (VPN
+	// account banned, daemon deadlocked, network partition). Exit so
+	// systemd Restart=always respawns this binary INSIDE the same
+	// container — that re-runs Login + Connect from scratch, often
+	// clearing a wedged provider daemon. Doing it this way (not
+	// kubelet liveness 503) preserves /var/log/journal across the
+	// recovery and keeps the kubelet-visible restart count quiet.
+	wedgeThreshold := time.Duration(getEnvInt(envWedgeGuardSec, defaultWedgeGuardSec)) * time.Second
+	go runWedgeGuard(ctx, state, wedgeThreshold)
+
 	// Self-monitor (Trigger C, envoy-admin-driven) was removed when
 	// envoy was retired. The crawler's slot-level AIMD + per-tunnel
 	// 429 tracking now drives proactive rotation: when a slot sees
@@ -169,8 +196,8 @@ func main() {
 	// side where the actual upstream-response visibility lives.
 	_ = triggerRotation // referenced by /rotate handler in startServer
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s",
-		watchdogInterval, minRotation)
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s wedge_guard=%s",
+		watchdogInterval, minRotation, wedgeThreshold)
 
 	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
 	// (Trigger C) and Layer 1+2 envoy drain hooks.
@@ -178,55 +205,120 @@ func main() {
 	log.Printf("tundler-tunnel: shutting down")
 }
 
-// runWatchdog periodically polls the provider's Connected() state. When it
-// detects the tunnel is down while we believe ourselves Ready, it calls
-// connectTunnel to reconnect to a (possibly different) random allowed
-// location. Watchdog only acts when state==Ready — it stays out of the
-// way during transitions managed by other code (Connecting, Draining,
-// Rotating in future slices).
+// runWatchdog periodically polls the provider's Connected() state and
+// drives recovery when either the tunnel has dropped while we think
+// ourselves Ready, or a previous attempt left us parked in Failed.
 //
-// On reconnect failure the watchdog flips state to Failed; /livez will
-// pick up the change within one probe period and k8s CrashLoopBackOff
-// restarts the pod (which re-runs Login + Connect from scratch with a
-// fresh boot-login jitter).
+// Crucially the goroutine STAYS ALIVE across reconnect failures: a
+// failed attempt sets state=Failed and sleeps with exponential
+// backoff, then ticks back around and tries again. The earlier
+// behavior (set Failed + return) meant a single transient
+// piactl/expressvpnctl blip permanently parked the pod in Failed
+// until the hourly rotator picked it up — typically the entire
+// budget of /livez tolerance, ending in a kubelet kill.
+//
+// Other code paths (initial connect, in-flight rotation) own the
+// connection during Booting/LoggingIn/Connecting/Draining/Rotating;
+// the watchdog stays out of the way then.
+//
+// Truly unrecoverable wedges (account banned, daemon deadlock) are
+// caught by runWedgeGuard, which exits the process after the wedge
+// threshold; systemd then respawns the binary fresh.
 func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	backoff := watchdogMinBackoff
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if state.Get() != StateReady {
-				// Some other code path is managing the connection
-				// (initial connect, future rotation logic). Stay out.
+			current := state.Get()
+			// Stay out of the way while some other code path drives
+			// the connection. /rotate handlers, initial connect, and
+			// in-flight rotations all transition through these.
+			if current != StateReady && current != StateFailed {
 				continue
 			}
-			if prov.Connected(ctx) {
+			// Healthy Ready: nothing to do; reset backoff.
+			if current == StateReady && prov.Connected(ctx) {
+				backoff = watchdogMinBackoff
 				continue
 			}
-			log.Printf("tundler-tunnel: watchdog detected tunnel down — reconnecting")
+			log.Printf("tundler-tunnel: watchdog reconnect attempt (state=%s)", current)
 			if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
-				log.Printf("tundler-tunnel: watchdog reconnect failed: %v", err)
+				log.Printf("tundler-tunnel: watchdog reconnect failed: %v (next retry in %s)",
+					err, backoff)
 				state.Set(StateFailed)
-				// Don't os.Exit from a goroutine — let the liveness
-				// probe pick up the Failed state and let k8s do the
-				// restart. The probe period (10s with failureThreshold=3
-				// = 30s) is the worst case before restart.
-				return
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < watchdogMaxBackoff {
+					backoff *= 2
+					if backoff > watchdogMaxBackoff {
+						backoff = watchdogMaxBackoff
+					}
+				}
+				continue
+			}
+			backoff = watchdogMinBackoff
+		}
+	}
+}
+
+// runWedgeGuard exits the process when state stays continuously NOT
+// Ready for longer than threshold. Designed to catch genuine wedges
+// (account banned, deadlocked provider daemon, network partition)
+// that the resilient watchdog cannot recover from on its own.
+//
+// Exiting (vs the old kubelet /livez 503 → SIGKILL) keeps the failure
+// inside the container: systemd's Restart=always respawns the binary
+// fresh, /var/log/journal survives so we can post-mortem the wedge,
+// and kubelet's restart count stays clean.
+//
+// nonReadySince is reset every time state re-enters Ready, so a
+// flaky-but-recovering watchdog never trips the guard.
+func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Duration) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	var nonReadySince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if state.Get() == StateReady {
+				if !nonReadySince.IsZero() {
+					log.Printf("tundler-tunnel: wedge guard cleared after %s",
+						time.Since(nonReadySince).Round(time.Second))
+					nonReadySince = time.Time{}
+				}
+				continue
+			}
+			if nonReadySince.IsZero() {
+				nonReadySince = time.Now()
+				continue
+			}
+			elapsed := time.Since(nonReadySince)
+			if elapsed > threshold {
+				log.Printf("tundler-tunnel: wedge guard tripped — state=%s for %s (> %s); exiting for systemd respawn",
+					state.Get(), elapsed.Round(time.Second), threshold)
+				os.Exit(1)
 			}
 		}
 	}
 }
 
-// failAndExit transitions the tracker to Failed (so /livez flips to 503 on
-// the next probe period and k8s CrashLoopBackOff kicks in), gives probes a
-// moment to pick up the new state, then exits non-zero. Mirrors the
-// initial-login failure handling for any other unrecoverable startup
-// error (connect timeout, no allowed location, etc.).
+// failAndExit is the unrecoverable-startup-error path: initial Login
+// or initial Connect could not establish a baseline tunnel. We exit
+// non-zero so systemd's Restart=always tries again with a fresh
+// boot-login jitter; the wedge guard only catches RUNTIME wedges
+// after we've reached Ready at least once.
 func failAndExit(state *StateTracker) {
 	state.Set(StateFailed)
-	time.Sleep(2 * time.Second) // one probe period margin
+	time.Sleep(2 * time.Second) // let an in-flight /status probe see Failed
 	os.Exit(1)
 }
 
