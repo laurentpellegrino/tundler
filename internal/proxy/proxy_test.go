@@ -167,6 +167,37 @@ func TestConnect_BadRequest(t *testing.T) {
 	}
 }
 
+func TestConnect_Overloaded503(t *testing.T) {
+	// Drop maxConcurrent for the duration of this test by filling
+	// the semaphore manually. Server uses the package-level constant
+	// for sem capacity, so the only way to test "full" is to fill it.
+	srv := New("placeholder", "pod", "")
+	// Fill the semaphore — pretend maxConcurrent connections are
+	// already in flight.
+	for i := 0; i < cap(srv.sem); i++ {
+		srv.sem <- struct{}{}
+	}
+	addr, cancel := startServer(t, srv)
+	defer cancel()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	conn.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	line, _ := br.ReadString('\n')
+	if !strings.HasPrefix(line, "HTTP/1.1 503") {
+		t.Fatalf("expected 503 overloaded, got: %s", strings.TrimSpace(line))
+	}
+	if srv.Stats().TotalOverloaded == 0 {
+		t.Fatalf("TotalOverloaded counter not incremented")
+	}
+}
+
 func TestSetExitIP_TakesEffectOnNextResponse(t *testing.T) {
 	srv := New("placeholder", "pod", "")
 	srv.SetExitIP("1.2.3.4")
