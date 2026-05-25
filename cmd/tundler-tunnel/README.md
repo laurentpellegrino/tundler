@@ -65,17 +65,28 @@ the tunnel pods.
 
 ## Probe semantics (k8s)
 
-| probe     | what it answers                                | implementation                                          |
-|-----------|------------------------------------------------|---------------------------------------------------------|
-| `/livez`  | "is this *process* responsive?"                | always 200 — serving the response IS the signal         |
-| `/readyz` | "should this pod be in the LB pool right now?" | 200 iff `state == Ready`                                |
-| startup   | "has initial connect finished?"                | same as `/readyz`, with a generous `failureThreshold`   |
+| probe     | path     | failure → action          | what it catches                                                                  |
+|-----------|----------|---------------------------|----------------------------------------------------------------------------------|
+| startup   | `/readyz`| container restart         | wedged-at-boot: pod never reaches `state == Ready` within ~10 min                |
+| liveness  | `/livez` | container restart         | Go HTTP server actually hung (the act of serving 200 IS the signal)              |
+| readiness | `/readyz`| removed from LB pool      | rotation in progress, brief Failed window, anything not `state == Ready`         |
 
-`/livez` returns 200 unconditionally. VPN-state policy lives in the
-**wedge guard** (below), which decides when to exit the process so
-systemd can respawn it. Keeping the liveness probe trivial means
-kubelet only restarts the container when the Go HTTP server itself
-stops responding — a real "process is hung" signal.
+`/livez` returns 200 unconditionally. VPN-state policy lives elsewhere:
+
+- **Startup probe** (kubelet, `failureThreshold × periodSeconds ≈ 10 min`)
+  catches *wedged-at-boot*. When the provider daemon (e.g. `expressvpnd`)
+  is stuck, the binary can't reach Ready no matter how many times systemd
+  respawns it — the daemon is in its own systemd unit and survives binary
+  restarts. Only a fresh container rootfs reliably clears it, which is
+  what kubelet's container restart does.
+- **Wedge guard** (in-process, see below) catches *runtime wedges* — pod
+  was Ready, then lost it for too long. Exits the binary so systemd
+  respawns it inside the same container; preserves the journal and avoids
+  the container-restart counter.
+
+Keeping `/livez` trivial means the only thing that triggers a
+*liveness*-driven container restart is the Go HTTP server itself hanging
+— a real "process is hung" signal.
 
 ## Failure-handling layers
 
