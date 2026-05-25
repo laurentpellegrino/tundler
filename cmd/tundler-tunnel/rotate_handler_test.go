@@ -146,6 +146,70 @@ func TestRotateHandler_NotYetReadyReturns409Problem(t *testing.T) {
 	}
 }
 
+// TestRotateHandler_DebouncesWithinWindow: a /rotate POST issued while
+// the previous rotation completed less than minTimeBetweenRotations ago
+// returns 200 OK with a debounce message and does NOT spawn a new
+// rotation. Prevents crawler 429 fanouts from triggering back-to-back
+// rotations.
+func TestRotateHandler_DebouncesWithinWindow(t *testing.T) {
+	st := NewStateTracker("fake")
+	st.RecordTunnelUp("USA", "1.2.3.4")
+	st.Set(StateReady)
+	// Simulate a rotation that completed 5s ago (well inside the 30s window).
+	st.RecordRotation("1.2.3.4", "5.6.7.8", "success", 1*time.Second)
+
+	triggered := false
+	h := rotateHandler(st, func() { triggered = true })
+
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequest(http.MethodPost, "/rotate", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("got %d, want 200 OK (debounced)", rr.Code)
+	}
+	if triggered {
+		t.Error("trigger should NOT fire when within debounce window")
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(body["message"], "debounced") {
+		t.Errorf("message=%q, want debounce hint", body["message"])
+	}
+}
+
+// TestRotateHandler_AllowsAfterDebounceWindow: once minTimeBetweenRotations
+// has elapsed, a new /rotate POST triggers as usual.
+func TestRotateHandler_AllowsAfterDebounceWindow(t *testing.T) {
+	st := NewStateTracker("fake")
+	st.RecordTunnelUp("USA", "1.2.3.4")
+	st.Set(StateReady)
+	// Record a rotation, then back-date its CompletedAt so it falls
+	// outside the debounce window. RecordRotation uses time.Now(), so we
+	// rewrite the timestamp via a fresh assignment.
+	st.RecordRotation("1.2.3.4", "5.6.7.8", "success", 1*time.Second)
+	st.mu.Lock()
+	st.lastRotation.CompletedAt = time.Now().
+		Add(-2 * minTimeBetweenRotations).Format(time.RFC3339)
+	st.mu.Unlock()
+
+	triggered := make(chan struct{}, 1)
+	h := rotateHandler(st, func() { triggered <- struct{}{} })
+
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequest(http.MethodPost, "/rotate", nil))
+
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("got %d, want 202 Accepted", rr.Code)
+	}
+	select {
+	case <-triggered:
+	case <-time.After(500 * time.Millisecond):
+		t.Error("trigger should fire once debounce window has elapsed")
+	}
+}
+
 func TestRotateHandler_MethodNotAllowed(t *testing.T) {
 	st := NewStateTracker("fake")
 	st.Set(StateReady)
