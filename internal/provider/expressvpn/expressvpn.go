@@ -83,30 +83,44 @@ func (e ExpressVPN) Disconnect(ctx context.Context) error {
 }
 
 // Locations queries expressvpnctl for the list of available regions.
-// Wraps the call in a retry loop because the ExpressVPN daemon
-// occasionally wedges right after container start: a fresh `expressvpnd`
-// can take 10-30 s to populate its server catalog from the activation
-// API, and any `expressvpnctl get regions` call during that window hits
-// the CLI's built-in 5 s timeout, returns exit-2, and the caller
-// would otherwise see 0 locations → `no allowed locations` → exit 1
-// → systemd restart → repeat. Two retries with a 2 s gap give the
-// daemon a chance to finish loading before we declare it broken;
-// past two retries we return nil and let the caller bail (kubelet's
-// /livez 5 min grace then restarts the whole container, which clears
-// any wedged daemon state).
+//
+// Cold-start behaviour: a fresh expressvpnd reports only a single
+// placeholder region — "smart" — while it asynchronously downloads
+// the full ~212-region catalog from ExpressVPN's backend (typically
+// takes 10–45 s depending on backend latency). We can't connect to
+// "smart" usefully because the daemon's auto-pick consistently lands
+// on a saturated edge from cloud-provider IP ranges, so we exclude
+// it via EXCLUDED_LOCATIONS — but then a cold-start daemon hands us
+// back exactly one region which we then filter out, leaving zero
+// candidates and triggering failAndExit.
+//
+// To survive cold start we keep retrying until the daemon reports at
+// least 5 regions. The 5-region threshold is generous: even a
+// partially-loaded catalog has dozens of entries within seconds.
+// Up to 12 attempts with 5 s between them = ~60 s total budget,
+// matched to the worst-case observed cold-start window.
 func (e ExpressVPN) Locations(ctx context.Context) []string {
-	for attempt := 0; attempt < 3; attempt++ {
+	const (
+		maxAttempts        = 12
+		retryGap           = 5 * time.Second
+		minLoadedThreshold = 5
+	)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		out, err := shared.RunCmd(ctx, bin, "get", "regions")
 		if err == nil {
-			if fields := strings.Fields(out); len(fields) > 0 {
+			fields := strings.Fields(out)
+			if len(fields) >= minLoadedThreshold {
 				return fields
 			}
+			if len(fields) > 0 {
+				shared.Debugf("ExpressVPN: Locations() got %d regions (looks like cold-start cache, retrying)", len(fields))
+			}
 		}
-		if attempt < 2 {
+		if attempt < maxAttempts-1 {
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(2 * time.Second):
+			case <-time.After(retryGap):
 			}
 		}
 	}
