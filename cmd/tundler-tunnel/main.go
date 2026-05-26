@@ -299,15 +299,32 @@ func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Dura
 	}
 }
 
+// exitUnrecoverable is the exit code that tells systemd "don't restart
+// this binary — escalate to kubelet via /livez ECONNREFUSED." Paired
+// with `RestartPreventExitStatus=2` in tundler-tunnel.service. Used by
+// failAndExit, called from the initial-Login / initial-Connect path
+// when the provider daemon (expressvpnd / piad / openvpn) is wedged
+// in a way the in-binary watchdog can't recover from. Triggering a
+// container restart (instead of the systemd-respawn loop that ran
+// 437× on tundler-tunnel-expressvpn-1 over 9.5 h) gets us back to
+// Ready in ~30 s (one livenessProbe failureThreshold cycle).
+//
+// Distinct from the wedge guard's `os.Exit(1)`, which DOES want a
+// systemd respawn — the runtime "was Ready, lost it" case is often
+// just stale Go state and a fresh process inside the same container
+// can recover. If that respawn ALSO hits a daemon wedge, its
+// failAndExit will exit 2 and escalate from there.
+const exitUnrecoverable = 2
+
 // failAndExit is the unrecoverable-startup-error path: initial Login
 // or initial Connect could not establish a baseline tunnel. We exit
-// non-zero so systemd's Restart=always tries again with a fresh
-// boot-login jitter; the wedge guard only catches RUNTIME wedges
-// after we've reached Ready at least once.
+// with exitUnrecoverable so systemd does NOT respawn (per
+// RestartPreventExitStatus=2); kubelet then container-restarts the
+// pod once livenessProbe sees /livez ECONNREFUSED.
 func failAndExit(state *StateTracker) {
 	state.Set(StateFailed)
 	time.Sleep(2 * time.Second) // let an in-flight /status probe see Failed
-	os.Exit(1)
+	os.Exit(exitUnrecoverable)
 }
 
 func registryKeys() []string {

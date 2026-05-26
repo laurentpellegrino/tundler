@@ -1,6 +1,5 @@
 [Unit]
-Description=tundler-tunnel — simplified per-provider VPN runtime + xDS server
-After=network-online.target
+Description=tundler-tunnel — per-provider VPN runtime
 
 [Service]
 Environment=HOME=/root
@@ -10,6 +9,17 @@ EnvironmentFile=/etc/tundler/env
 ExecStartPre=/usr/local/bin/setup-netns.sh
 ExecStart=/usr/local/bin/tundler-tunnel
 Restart=always
+RestartSec=5
+# Exit code 2 = "binary classified the failure as unrecoverable from
+# inside the container; escalate to kubelet." Paired with the constant
+# exitUnrecoverable in cmd/tundler-tunnel/main.go. systemd stops
+# respawning the binary, the HTTP server on :4242 goes away, kubelet's
+# livenessProbe sees ECONNREFUSED, the container is recreated → fresh
+# rootfs → fresh provider daemon. Without this, a daemon-level wedge
+# (expressvpnd / piad stuck) drives a systemd respawn loop that the
+# binary itself can't break out of — observed 437 respawns over 9.5 h
+# on tundler-tunnel-expressvpn-1 before this fix.
+RestartPreventExitStatus=2
 StandardError=journal+console
 StandardOutput=journal+console
 Type=simple
