@@ -58,14 +58,48 @@ func (e ExpressVPN) Connect(ctx context.Context, location string) provider.Statu
 	ticker := time.NewTicker(pollEvery)
 	defer ticker.Stop()
 
+	// IPC-wedge tolerance: the ExpressVPN daemon has been observed to
+	// stop answering expressvpnctl queries immediately after a
+	// successful state transition to Connected — the tunnel is up
+	// (tun0 installed, routes in place, packets flow) but our polls
+	// to confirm read empty. Pre-fix, the loop's `Connected && IP
+	// != ""` gate stayed false and we discarded a working tunnel,
+	// failAndExit'd, kubelet-restarted, repeated.
+	//
+	// Track whether we ever observed Connected during this window.
+	// If the deadline expires with the flag set, trust the earlier
+	// signal: return Connected=true with whatever IP we managed to
+	// capture (often empty). The rest of the system tolerates an
+	// empty exit IP — leak detection reads it from /status (which
+	// reflects whatever we stored here), and the next rotation will
+	// query a fresh IP when the daemon's IPC has hopefully recovered.
+	var sawConnected bool
+	var bestIP string
+
 	for {
 		st := e.Status(ctx)
-		if st.Connected && st.IP != "" { // tunnel really up
+		if st.Connected && st.IP != "" { // happy path: full envelope captured
 			return st
+		}
+		if st.Connected {
+			sawConnected = true
+			if st.IP != "" {
+				bestIP = st.IP
+			}
 		}
 
 		select {
 		case <-waitCtx.Done(): // ctx cancelled or maxWait reached
+			if sawConnected {
+				shared.Debugf("ExpressVPN: Connect() returning Connected=true with IP=%q after CLI IPC wedge (daemon reported Connected during polling but later queries timed out)", bestIP)
+				return provider.Status{
+					Connected: true,
+					IP:        bestIP,
+					Location:  location,
+					Region:    location,
+					Provider:  name,
+				}
+			}
 			return st // best-effort status (likely disconnected)
 		case <-ticker.C:
 		}
