@@ -87,6 +87,41 @@ type Server struct {
 	totalDraining   atomic.Uint64
 	totalOverloaded atomic.Uint64
 	openTunnels     atomic.Int64
+
+	// Upstream-dial outcome tracking — the watchdog's source of truth
+	// for "is the tunnel actually delivering packets right now?"
+	//
+	// Each call to net.DialTimeout in handle() flows through
+	// recordDial, which updates these three atomics. The watchdog
+	// reads TunnelHealth() and decides whether to attempt a reconnect
+	// based on real traffic outcomes, NOT on a synthetic poll through
+	// the VPN daemon's CLI (which can wedge while the data plane is
+	// fine — see the expressvpn-1 incident write-up).
+	//
+	// lastDialAtUnixNano is the wall-clock time of the most recent
+	// dial completion (success or failure). Zero means "no dial yet."
+	// The watchdog treats "no dial recently" as "no signal" and
+	// abstains.
+	//
+	// lastDialOK records the outcome of the most recent dial. Useful
+	// shorthand for "is the very latest signal positive?"
+	//
+	// consecutiveDialFails is the streak of failures since the last
+	// success — reset on any success. The watchdog only attempts a
+	// reconnect when this exceeds a small threshold (so a single
+	// transient upstream blip doesn't trigger needless rotation).
+	lastDialAtUnixNano   atomic.Int64
+	lastDialOK           atomic.Bool
+	consecutiveDialFails atomic.Int64
+}
+
+// TunnelHealth is the proxy's view of recent upstream-dial outcomes,
+// consumed by the watchdog instead of the per-provider CLI Connected()
+// probe. See Server.RecentTunnelHealth.
+type TunnelHealth struct {
+	LastDialAt          time.Time
+	LastDialSucceeded   bool
+	ConsecutiveFailures int64
 }
 
 // New constructs a Server bound (but not yet listening) at addr.
@@ -125,6 +160,45 @@ func (s *Server) IsDraining() bool { return s.draining.Load() }
 // seam for the drain controller — production handle() uses this
 // internally to track active tunnels.
 func (s *Server) IncOpenTunnels(delta int64) { s.openTunnels.Add(delta) }
+
+// recordDial logs the outcome of one upstream dial. Called from
+// handle() right after net.DialTimeout returns — success means we
+// got a TCP connection to the upstream through the VPN tunnel,
+// failure means we didn't (timeout, refused, route missing, etc.).
+//
+// All three fields are atomic so this is safe to call from many
+// goroutines without locking.
+func (s *Server) recordDial(success bool) {
+	s.lastDialAtUnixNano.Store(time.Now().UnixNano())
+	s.lastDialOK.Store(success)
+	if success {
+		s.consecutiveDialFails.Store(0)
+	} else {
+		s.consecutiveDialFails.Add(1)
+	}
+}
+
+// SeedDialOutcome is a TEST SEAM: drives the dial-outcome state from
+// outside handle() so the watchdog tests can exercise health
+// transitions without spinning up real upstreams. Production code
+// reaches recordDial via handle() — never call SeedDialOutcome from
+// non-test code.
+func (s *Server) SeedDialOutcome(success bool) { s.recordDial(success) }
+
+// RecentTunnelHealth snapshots the current upstream-dial state for
+// the watchdog. Returned LastDialAt is the zero value when no dial
+// has happened yet — the watchdog treats that as "no signal."
+func (s *Server) RecentTunnelHealth() TunnelHealth {
+	var t time.Time
+	if ns := s.lastDialAtUnixNano.Load(); ns != 0 {
+		t = time.Unix(0, ns)
+	}
+	return TunnelHealth{
+		LastDialAt:          t,
+		LastDialSucceeded:   s.lastDialOK.Load(),
+		ConsecutiveFailures: s.consecutiveDialFails.Load(),
+	}
+}
 
 // Stats returns a snapshot of cumulative counters. Useful for log
 // reporting and exposing via the existing /status JSON endpoint.
@@ -226,6 +300,7 @@ func (s *Server) handle(client net.Conn) {
 	// Dial upstream. Go's default resolver caches via the host's
 	// nsswitch + glibc cache; sufficient for our load.
 	upstream, err := net.DialTimeout("tcp", target, upstreamDialTimeout)
+	s.recordDial(err == nil)
 	if err != nil {
 		s.totalError.Add(1)
 		writeError(client, 502, "Bad Gateway")
