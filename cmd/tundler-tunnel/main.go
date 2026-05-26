@@ -139,7 +139,7 @@ func main() {
 	}
 
 	go func() {
-		if err := startServer(ctx, state, triggerRotation); err != nil {
+		if err := startServer(ctx, state, triggerRotation, podName, nodeIP); err != nil {
 			log.Fatalf("tundler-tunnel: HTTP server: %v", err)
 		}
 	}()

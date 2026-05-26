@@ -69,7 +69,7 @@ func TestStatusHandler_BootingShape(t *testing.T) {
 	st.RecordBootLoginJitter(47 * time.Second)
 
 	rr := httptest.NewRecorder()
-	statusHandler(st)(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
+	statusHandler(st, "", "")(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("/status got %d, want 200", rr.Code)
@@ -102,7 +102,7 @@ func TestStatusHandler_ReadyEmitsLoggedInAt(t *testing.T) {
 	st.Set(StateReady)
 
 	rr := httptest.NewRecorder()
-	statusHandler(st)(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
+	statusHandler(st, "", "")(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
 
 	var snap map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
@@ -126,7 +126,7 @@ func TestStatusHandler_TunnelUpFields(t *testing.T) {
 	st.Set(StateReady)
 
 	rr := httptest.NewRecorder()
-	statusHandler(st)(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
+	statusHandler(st, "", "")(rr, httptest.NewRequest(http.MethodGet, "/status", nil))
 
 	var snap map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
