@@ -30,11 +30,11 @@ const httpListenAddr = "0.0.0.0:4242"
 // startServer wires the HTTP handlers and starts listening. Returns when
 // ctx is cancelled or the server hits an error. Server lifecycle is the
 // caller's responsibility — main passes its own context.
-func startServer(ctx context.Context, state *StateTracker, triggerRotation RotateTrigger) error {
+func startServer(ctx context.Context, state *StateTracker, triggerRotation RotateTrigger, tunnelID, nodeIP string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", livezHandler(state))
 	mux.HandleFunc("/readyz", readyzHandler(state))
-	mux.HandleFunc("/status", statusHandler(state))
+	mux.HandleFunc("/status", statusHandler(state, tunnelID, nodeIP))
 	mux.HandleFunc("/rotate", rotateHandler(state, triggerRotation))
 
 	srv := &http.Server{
@@ -96,11 +96,27 @@ func readyzHandler(state *StateTracker) http.HandlerFunc {
 	}
 }
 
-// statusHandler returns the JSON snapshot of the tracker state.
-func statusHandler(state *StateTracker) http.HandlerFunc {
+// statusHandler returns the JSON snapshot of the tracker state, plus
+// the pod's static identity fields (tunnel_id = POD_NAME via downward
+// API, node_ip = TUNDLER_TUNNEL_NODE_IP). The leak detector reads
+// node_ip + current_exit_ip out-of-band here to compare against the
+// actual source IP a probe to checkip.amazonaws.com reports — that
+// comparison used to ride on response_headers_to_add at the hub
+// envoy, which is gone, so we surface the identity through /status
+// instead.
+func statusHandler(state *StateTracker, tunnelID, nodeIP string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
+		snap := state.Snapshot()
+		// Anonymous struct embeds Snapshot so existing fields keep
+		// their JSON tags; the two new fields appear at the same
+		// nesting level.
+		resp := struct {
+			Snapshot
+			TunnelID string `json:"tunnel_id,omitempty"`
+			NodeIP   string `json:"node_ip,omitempty"`
+		}{snap, tunnelID, nodeIP}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(state.Snapshot())
+		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
