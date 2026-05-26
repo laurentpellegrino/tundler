@@ -5,13 +5,29 @@
 ENV_FILE="/etc/tundler/env"
 mkdir -p "$(dirname "$ENV_FILE")"
 
-# Export all relevant VPN provider env vars to the file. POD_ is also
-# included so the downward-API POD_NAME / POD_NAMESPACE reach the
-# tundler-tunnel Go binary via systemd; without these, the xDS snapshot
-# falls back to the local-dev default "tundler-tunnel-local" for
-# x-tundler-tunnel-id and every pod reports the same id, defeating
-# per-tunnel attribution in the crawler's RotationTracker.
-printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)' > "$ENV_FILE"
+# Filter the container's process env down to what tundler-tunnel needs
+# (and only that) before handing it to systemd via EnvironmentFile.
+# systemd-managed services do NOT inherit container env by default —
+# they get a clean environment plus whatever the unit declares. Anything
+# not matched here is silently invisible to the Go binary.
+#
+# Categories matched:
+#   POD_                — downward API (POD_NAME, POD_NAMESPACE)
+#   EXPRESSVPN_, ...    — per-provider credentials
+#   TUNDLER_            — pod identity + routing
+#                          (TUNDLER_TUNNEL_PROVIDER, TUNDLER_TUNNEL_NODE_IP,
+#                           TUNDLER_CLUSTER_BYPASS_CIDR, TUNDLER_PROXY_PORT,
+#                           TUNDLER_PRERESOLVE_HOSTNAMES)
+#   The tail alternation — explicit tundler-tunnel config knobs that
+#                          don't share a common prefix yet. Each
+#                          corresponds to a const in
+#                          cmd/tundler-tunnel/main.go. Keep this list in
+#                          sync when adding a new knob — otherwise the
+#                          binary silently uses the compiled-in default
+#                          and the operator wonders why the env var has
+#                          no effect (see the 2026-05-26
+#                          EXCLUDED_LOCATIONS=smart incident).
+printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_|BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS)=' > "$ENV_FILE"
 
 # Run each installed provider's configure.sh once per pod boot. This
 # downloads OpenVPN configs (ipvanish/protonvpn/surfshark), seeds CLI
