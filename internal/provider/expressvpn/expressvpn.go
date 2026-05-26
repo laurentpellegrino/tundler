@@ -88,32 +88,31 @@ func (e ExpressVPN) Disconnect(ctx context.Context) error {
 // placeholder region — "smart" — while it asynchronously downloads
 // the full ~212-region catalog from ExpressVPN's backend (typically
 // takes 10–45 s depending on backend latency). We can't connect to
-// "smart" usefully because the daemon's auto-pick consistently lands
-// on a saturated edge from cloud-provider IP ranges, so we exclude
-// it via EXCLUDED_LOCATIONS — but then a cold-start daemon hands us
-// back exactly one region which we then filter out, leaving zero
+// "smart" usefully (its auto-pick chronically lands on saturated
+// edges from cloud-provider IP ranges, so we exclude it via
+// EXCLUDED_LOCATIONS) — but then a cold-start daemon hands us back
+// exactly one region which the picker filters out, leaving zero
 // candidates and triggering failAndExit.
 //
-// To survive cold start we keep retrying until the daemon reports at
-// least 5 regions. The 5-region threshold is generous: even a
-// partially-loaded catalog has dozens of entries within seconds.
-// Up to 12 attempts with 5 s between them = ~60 s total budget,
-// matched to the worst-case observed cold-start window.
+// Detection: the daemon-still-loading signal is unambiguous — the
+// response is literally [smart]. Treat that case (and CLI failures /
+// empty output) as "retry"; treat anything else as a real catalog
+// and return it. Up to 12 attempts × 5 s = 60 s budget matches the
+// worst-case observed cold-start window.
 func (e ExpressVPN) Locations(ctx context.Context) []string {
 	const (
-		maxAttempts        = 12
-		retryGap           = 5 * time.Second
-		minLoadedThreshold = 5
+		maxAttempts = 12
+		retryGap    = 5 * time.Second
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		out, err := shared.RunCmd(ctx, bin, "get", "regions")
 		if err == nil {
 			fields := strings.Fields(out)
-			if len(fields) >= minLoadedThreshold {
+			if !isColdStartPlaceholder(fields) {
 				return fields
 			}
 			if len(fields) > 0 {
-				shared.Debugf("ExpressVPN: Locations() got %d regions (looks like cold-start cache, retrying)", len(fields))
+				shared.Debugf("ExpressVPN: Locations() got cold-start placeholder %v, retrying", fields)
 			}
 		}
 		if attempt < maxAttempts-1 {
@@ -125,6 +124,13 @@ func (e ExpressVPN) Locations(ctx context.Context) []string {
 		}
 	}
 	return nil
+}
+
+// isColdStartPlaceholder reports whether the regions response looks
+// like a freshly-booted daemon's placeholder (just "smart") rather
+// than a real catalog. Empty input is also treated as "not loaded".
+func isColdStartPlaceholder(fields []string) bool {
+	return len(fields) == 0 || (len(fields) == 1 && fields[0] == "smart")
 }
 
 func (e ExpressVPN) Login(ctx context.Context) error {
