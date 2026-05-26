@@ -48,9 +48,21 @@ func (e ExpressVPN) Connect(ctx context.Context, location string) provider.Statu
 	}
 
 	// 2. block until the tunnel is ready (or ctx/timeout is hit)
+	//
+	// pollEvery=2s is deliberate. Each poll forks expressvpnctl, which
+	// opens a fresh IPC connection to expressvpn-daemon and serializes
+	// through its request handler. At the previous 250 ms cadence we
+	// hammered the daemon with ~6 round-trips per second for the
+	// entire connect window — that pressure right around the daemon's
+	// own internal Connected-state transition is the leading
+	// hypothesis for the IPC wedges we keep observing
+	// (data plane up, control plane locked). Polling every 2 s is
+	// still plenty for a state machine whose transitions happen in
+	// seconds; in exchange the daemon spends ~95% less time servicing
+	// our diagnostic queries during the most lock-sensitive phase.
 	const (
-		pollEvery = 250 * time.Millisecond // how often to poll
-		maxWait   = 30 * time.Second       // safety cap
+		pollEvery = 2 * time.Second
+		maxWait   = 30 * time.Second // safety cap
 	)
 	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
