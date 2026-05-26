@@ -14,7 +14,7 @@ systemd (PID 1, from image entrypoint)
       ├─ goroutine: HTTP control API  (:4242 /livez /readyz /status /rotate)
       ├─ goroutine: CONNECT proxy     (:8485 — outbound HTTP CONNECT data plane)
       ├─ goroutine: watchdog          (tunnel-health poller)
-      ├─ goroutine: rotator           (hourly random rotation + /rotate trigger)
+      ├─ goroutine: rotator           (windowed random rotation + /rotate trigger)
       ├─ goroutine: wedge guard       (restart trigger)
       └─ provider-specific subprocesses (piactl monitor / expressvpnctl background)
 ```
@@ -128,10 +128,13 @@ genuinely-stuck provider does.
 
 Two triggers, one path:
 
-- **Hourly timer.** `MIN_ROTATION_SECONDS` (default 3600) ± 10 %
-  jitter; initial offset is uniformly random in
-  `[0, MIN_ROTATION_SECONDS)` so a fleet that boots together doesn't
-  rotate in lockstep.
+- **Random-window timer.** Each interval is a fresh uniform random
+  pick from `[MIN_ROTATION_SECONDS, MAX_ROTATION_SECONDS]` (defaults
+  7200..14400 — 2 h to 4 h). The initial boot offset is sampled from
+  the same window so a fleet that boots together is spread across the
+  full window from the first rotation onward — no synchronized
+  stampede after one min-window elapses either. Set
+  `MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS` for a fixed cadence.
 - **`POST /rotate`** from the crawler slot that owns this pod. The
   slot tracks 429s and consecutive failures via its own AIMD token
   bucket; when it decides to rotate, it POSTs straight to this pod's
@@ -188,7 +191,8 @@ response-header IP without locking.
 | `BOOT_LOGIN_JITTER_SECONDS`       | 60      | random 0..N s wait before first `Login()`                  |
 | `EXCLUDED_LOCATIONS`              | —       | space-separated locations to filter out                    |
 | `TUNNEL_WATCHDOG_INTERVAL_SECONDS`| 30      | watchdog tick period                                       |
-| `MIN_ROTATION_SECONDS`            | 3600    | rotation cadence (± 10 % jitter)                           |
+| `MIN_ROTATION_SECONDS`            | 7200    | rotation cadence: lower bound of uniform window (2 h)      |
+| `MAX_ROTATION_SECONDS`            | 14400   | rotation cadence: upper bound of uniform window (4 h)      |
 | `ROTATION_RETRY_MAX`              | 3       | per-rotation location-retry budget                         |
 | `ROTATION_ATTEMPT_TIMEOUT_SECONDS`| 20      | per-attempt timeout in `connectWithRetry`                  |
 | `WEDGE_GUARD_THRESHOLD_SECONDS`   | 900     | non-Ready window before `os.Exit(1)` + systemd respawn     |

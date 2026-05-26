@@ -19,22 +19,21 @@ const (
 	drainWaitTimeout = 30 * time.Second
 )
 
-// runRotator fires a tunnel rotation every `minInterval ± jitter`,
-// picking a fresh random allowed location each time. Lifecycle:
-// Ready → Draining → Rotating → Ready / Failed.
+// runRotator fires a tunnel rotation every uniform random pick in
+// [minInterval, maxInterval], picking a fresh allowed location each
+// time. Lifecycle: Ready → Draining → Rotating → Ready / Failed.
 //
-// The initial sleep before the first rotation is uniformly random in
-// [0, minInterval) so a fleet of N pods that boot together don't all
-// rotate at the same minute.
+// The initial sleep before the first rotation is also sampled from
+// the same window, so a fleet of N pods that boot together is spread
+// across the full window from the first rotation onward — no
+// synchronized stampede min-window-seconds later either.
 //
 // Skipped if state != Ready/Failed (e.g., a previous rotation is in
 // flight, or the watchdog is reconnecting).
-func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval time.Duration, drain drainController) {
-	// Initial offset: random 0..minInterval. Prevents the entire fleet
-	// from rotating at the same minute when they all boot together.
-	initialOffset := time.Duration(rand.Int64N(int64(minInterval)))
-	log.Printf("tundler-tunnel: rotator armed; first rotation in %s (then every ~%s)",
-		initialOffset.Round(time.Second), minInterval)
+func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval, maxInterval time.Duration, drain drainController) {
+	initialOffset := pickRotationInterval(minInterval, maxInterval)
+	log.Printf("tundler-tunnel: rotator armed; first rotation in %s (then every random %s..%s)",
+		initialOffset.Round(time.Second), minInterval, maxInterval)
 
 	timer := time.NewTimer(initialOffset)
 	defer timer.Stop()
@@ -45,10 +44,8 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 			return
 		case <-timer.C:
 			rotateIfReady(ctx, prov, state, providerName, excluded, drain)
-			// Subsequent rotations: minInterval ± up to 10% jitter so
-			// pods slowly desynchronize even if they boot at the same
-			// moment. (Design doc says "every hour ± jitter".)
-			next := jitterInterval(minInterval)
+			next := pickRotationInterval(minInterval, maxInterval)
+			log.Printf("tundler-tunnel: next rotation in %s", next.Round(time.Second))
 			timer.Reset(next)
 		}
 	}
@@ -127,9 +124,15 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 		previousIP, newIP, time.Since(started).Round(time.Second))
 }
 
-// jitterInterval returns base ± up to 10% (uniform). Helps the fleet
-// desynchronize over time even after a synchronized boot.
-func jitterInterval(base time.Duration) time.Duration {
-	pct := (rand.Float64() - 0.5) * 0.2 // [-0.1, +0.1]
-	return base + time.Duration(float64(base)*pct)
+// pickRotationInterval returns a uniform random duration in [min, max].
+// When min == max it returns exactly that value (no rand call). When
+// max < min the caller should have already clamped them (main does);
+// this helper still returns min defensively rather than panic on a
+// negative argument to rand.Int64N.
+func pickRotationInterval(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	span := int64(max - min)
+	return min + time.Duration(rand.Int64N(span))
 }

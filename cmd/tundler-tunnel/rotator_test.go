@@ -103,39 +103,22 @@ func TestRotateIfReady_FailureMarksFailed(t *testing.T) {
 	}
 }
 
-// TestRotator_InitialOffsetSpread: 50 independent runRotator timers
-// should produce a spread of initial-offset values whose stddev > 10s
-// when minInterval=60s. Proves the fleet doesn't all rotate at once.
-//
-// This is the "Jittered initial rotation timer" test from the design
-// doc's testing strategy, scaled down for a unit test (60s instead of
-// 1h so the test completes in real time — but the proportions hold).
-func TestRotator_InitialOffsetSpread(t *testing.T) {
+// TestPickRotationInterval_SpreadAcrossWindow: with min=60s, max=240s
+// (the same 1:2 ratio as the production 2h..4h default), picks should
+// span the full window with a stddev close to the theoretical
+// (max-min)/√12. Proves a fleet of N pods that boot at the same instant
+// will produce a true random spread of first-rotation times rather
+// than clustering near one edge of the window.
+func TestPickRotationInterval_SpreadAcrossWindow(t *testing.T) {
 	const (
-		n           = 200
-		minInterval = 60 * time.Second
-		minStdDev   = 12.0 // ~70% of theoretical 60/√12 ≈ 17.3
+		n         = 200
+		min       = 60 * time.Second
+		max       = 240 * time.Second
+		minStdDev = 36.0 // ~70% of theoretical (240-60)/√12 ≈ 51.96
 	)
-	// We can't easily instrument runRotator without changing its API,
-	// so instead we sample the underlying random source directly the
-	// same way runRotator does: rand.Int64N(int64(minInterval)).
 	samples := make([]float64, n)
 	for i := range samples {
-		samples[i] = (jitterInterval(minInterval) - minInterval).Seconds()
-		// jitterInterval returns ±10%; convert to seconds-from-base.
-		// Distribution width ~ ±6s for a 60s base, so the stddev
-		// comparison below uses a smaller threshold.
-	}
-	// For jitterInterval (±10%), spread is tiny. The MAIN concern of
-	// the design-doc test is the INITIAL offset, which uses
-	// rand.Int64N(minInterval) — that's a separate distribution.
-	// Replicate the initial-offset distribution here:
-	for i := range samples {
-		// Mirror the runRotator initial-offset formula.
-		// Using time.Duration(rand.Int64N(int64(minInterval))).
-		// We can't import math/rand/v2 in a value-only context cleanly;
-		// reuse pickJitter which has the same property (uniform [0,N)).
-		samples[i] = pickJitter(int(minInterval.Seconds())).Seconds()
+		samples[i] = pickRotationInterval(min, max).Seconds()
 	}
 
 	var sum float64
@@ -150,24 +133,34 @@ func TestRotator_InitialOffsetSpread(t *testing.T) {
 	stdDev := math.Sqrt(sumSq / float64(n))
 
 	if stdDev < minStdDev {
-		t.Errorf("initial-offset stddev = %.2fs over %d samples, want > %.1fs", stdDev, n, minStdDev)
+		t.Errorf("pickRotationInterval stddev = %.2fs over %d samples, want > %.1fs", stdDev, n, minStdDev)
 	}
 }
 
-// TestJitterInterval_StaysWithinTenPercent: every jittered interval is
-// within ±10% of base. Prevents a regression where the jitter widens
-// accidentally and causes rotation cadence to drift wildly.
-func TestJitterInterval_StaysWithinTenPercent(t *testing.T) {
-	const base = 60 * time.Second
-	// Integer math: ±10% as base*9/10 and base*11/10 — avoids constant
-	// overflow rules when converting float64 const to time.Duration.
-	b := int64(base)
-	minAllowed := time.Duration(b * 9 / 10)
-	maxAllowed := time.Duration(b * 11 / 10)
+// TestPickRotationInterval_StaysWithinBounds: every pick is in
+// [min, max). Prevents regressions that would let rotation drift
+// outside the operator-configured window.
+func TestPickRotationInterval_StaysWithinBounds(t *testing.T) {
+	const (
+		min = 60 * time.Second
+		max = 240 * time.Second
+	)
 	for i := 0; i < 1000; i++ {
-		got := jitterInterval(base)
-		if got < minAllowed || got > maxAllowed {
-			t.Fatalf("jitterInterval(%s) = %s, want in [%s, %s]", base, got, minAllowed, maxAllowed)
+		got := pickRotationInterval(min, max)
+		if got < min || got >= max {
+			t.Fatalf("pickRotationInterval(%s, %s) = %s, want in [%s, %s)", min, max, got, min, max)
+		}
+	}
+}
+
+// TestPickRotationInterval_EqualBoundsReturnsExact: when an operator
+// pins min == max for a fixed cadence, the helper must not divide by
+// zero (rand.Int64N(0) would panic) and must return exactly that value.
+func TestPickRotationInterval_EqualBoundsReturnsExact(t *testing.T) {
+	const fixed = 60 * time.Second
+	for i := 0; i < 100; i++ {
+		if got := pickRotationInterval(fixed, fixed); got != fixed {
+			t.Fatalf("pickRotationInterval(%s, %s) = %s, want exactly %s", fixed, fixed, got, fixed)
 		}
 	}
 }
