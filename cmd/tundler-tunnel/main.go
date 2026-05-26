@@ -56,6 +56,26 @@ var (
 	watchdogMaxBackoff = 60 * time.Second
 )
 
+// Watchdog health-check tunables: how the watchdog decides whether the
+// tunnel is alive from observed CONNECT-proxy traffic.
+//
+//	dialFailureThreshold — how many consecutive upstream-dial
+//	    failures the proxy must rack up before the watchdog suspects
+//	    the tunnel itself and attempts a reconnect. A single failure
+//	    is noise (the upstream is just down for that one host);
+//	    sustained consecutive failures means dials don't make it past
+//	    tun0 at all.
+//	dialSilenceWindow — if the proxy hasn't completed a dial in this
+//	    long, the watchdog has no signal either way and abstains. The
+//	    crawler runs ~continuously in our deployment so silence is
+//	    unusual; when it does happen (idle slot, fresh boot), we'd
+//	    rather wait for real traffic to speak than poke a possibly-
+//	    wedged CLI.
+const (
+	dialFailureThreshold = 5
+	dialSilenceWindow    = 2 * time.Minute
+)
+
 func main() {
 	// Provider plugins log failures via shared.Debugf, which is a no-op
 	// unless SetDebug(true) is called. In production we DO want those
@@ -154,7 +174,7 @@ func main() {
 	// says drops should reconnect WITHOUT a re-login (login is one-shot;
 	// session token cached by the VPN client).
 	watchdogInterval := time.Duration(getEnvInt(envWatchdogIntervalSec, defaultWatchdogIntervSec)) * time.Second
-	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval)
+	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv)
 
 	// Start the hourly rotator: every MIN_ROTATION_SECONDS (default 1h)
 	// ± 10% jitter, pick a fresh random location and rotate. Initial
@@ -193,26 +213,34 @@ func main() {
 	log.Printf("tundler-tunnel: shutting down")
 }
 
-// runWatchdog periodically polls the provider's Connected() state and
-// drives recovery when either the tunnel has dropped while we think
-// ourselves Ready, or a previous attempt left us parked in Failed.
+// runWatchdog observes the CONNECT proxy's actual dial outcomes
+// instead of asking the VPN daemon. The reasoning: the daemon's CLI
+// (expressvpnctl, piactl, etc.) is exactly the channel that wedges
+// on us, and asking a wedged daemon "are you connected?" is the
+// pathology we built our way into. The proxy is in the same Go
+// process — it knows whether real CONNECT requests through tun0 are
+// currently delivering packets or not. That's the ground truth.
 //
-// Crucially the goroutine STAYS ALIVE across reconnect failures: a
-// failed attempt sets state=Failed and sleeps with exponential
-// backoff, then ticks back around and tries again. The earlier
-// behavior (set Failed + return) meant a single transient
-// piactl/expressvpnctl blip permanently parked the pod in Failed
-// until the hourly rotator picked it up — typically the entire
-// budget of /livez tolerance, ending in a kubelet kill.
+// Decision table the watchdog uses each tick:
 //
-// Other code paths (initial connect, in-flight rotation) own the
-// connection during Booting/LoggingIn/Connecting/Draining/Rotating;
-// the watchdog stays out of the way then.
+//	state == Ready, dialSilent → no signal, do nothing
+//	state == Ready, last dial succeeded → tunnel is fine, do nothing
+//	state == Ready, ConsecutiveFailures >= threshold → tunnel suspect
+//	                                                    → attempt reconnect
+//	state == Failed → always attempt reconnect (with backoff)
+//	other states (Booting / LoggingIn / Connecting / Draining /
+//	              Rotating) → another code path owns the lifecycle,
+//	                          stay out of the way
 //
-// Truly unrecoverable wedges (account banned, daemon deadlock) are
+// The goroutine STAYS ALIVE across reconnect failures: a failed
+// attempt sets state=Failed and sleeps with exponential backoff,
+// then ticks back around. Truly unrecoverable wedges (the proxy can
+// dial nothing, the daemon's CLI keeps timing out on Connect) are
 // caught by runWedgeGuard, which exits the process after the wedge
-// threshold; systemd then respawns the binary fresh.
-func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration) {
+// threshold; systemd then respawns the binary fresh, and if the new
+// binary also can't initial-connect, failAndExit exits 2 and kubelet
+// container-restarts the pod.
+func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	backoff := watchdogMinBackoff
@@ -228,12 +256,13 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 			if current != StateReady && current != StateFailed {
 				continue
 			}
-			// Healthy Ready: nothing to do; reset backoff.
-			if current == StateReady && prov.Connected(ctx) {
+			if current == StateReady && tunnelLooksHealthy(proxySrv) {
 				backoff = watchdogMinBackoff
 				continue
 			}
-			log.Printf("tundler-tunnel: watchdog reconnect attempt (state=%s)", current)
+			h := proxySrv.RecentTunnelHealth()
+			log.Printf("tundler-tunnel: watchdog reconnect attempt (state=%s, consecutiveDialFails=%d, lastDialAt=%s)",
+				current, h.ConsecutiveFailures, h.LastDialAt.Format(time.RFC3339))
 			if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
 				log.Printf("tundler-tunnel: watchdog reconnect failed: %v (next retry in %s)",
 					err, backoff)
@@ -254,6 +283,31 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 			backoff = watchdogMinBackoff
 		}
 	}
+}
+
+// tunnelLooksHealthy is the watchdog's "should I leave this alone?"
+// predicate, based on what the in-process CONNECT proxy has actually
+// observed on its upstream dials. Returns true iff:
+//
+//	- no dial has happened recently (within dialSilenceWindow) — no
+//	  signal to act on; or
+//	- the very latest dial succeeded — proof the tunnel is currently
+//	  delivering packets; or
+//	- consecutive failures are below dialFailureThreshold — a few
+//	  failures could just be unreachable hosts, not a tunnel problem.
+//
+// Returns false (i.e. "go ahead, try to reconnect") only when there's
+// recent traffic AND a sustained failure pattern that the proxy
+// observed end-to-end.
+func tunnelLooksHealthy(proxySrv *proxy.Server) bool {
+	h := proxySrv.RecentTunnelHealth()
+	if h.LastDialAt.IsZero() || time.Since(h.LastDialAt) > dialSilenceWindow {
+		return true
+	}
+	if h.LastDialSucceeded {
+		return true
+	}
+	return h.ConsecutiveFailures < dialFailureThreshold
 }
 
 // runWedgeGuard exits the process when state stays continuously NOT

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
+	"github.com/laurentpellegrino/tundler/internal/proxy"
 )
 
 // fakeProvider implements provider.VPNProvider for tests. Connect/Connected
@@ -143,8 +144,10 @@ func TestConnectTunnel_ConnectFails(t *testing.T) {
 	}
 }
 
-// TestWatchdog_DetectsDropAndReconnects: the watchdog notices the
-// provider went disconnected and triggers a reconnect that succeeds.
+// TestWatchdog_DetectsDropAndReconnects: when the proxy reports
+// sustained upstream-dial failures, the watchdog triggers a reconnect.
+// This is the slot path's primary signal — the proxy sees real
+// CONNECT requests fail through tun0, the watchdog reacts.
 func TestWatchdog_DetectsDropAndReconnects(t *testing.T) {
 	fp := &fakeProvider{
 		locations: []string{"USA", "UK", "Germany"},
@@ -154,16 +157,18 @@ func TestWatchdog_DetectsDropAndReconnects(t *testing.T) {
 	st := NewStateTracker("fake")
 	st.Set(StateReady)
 	st.RecordTunnelUp("USA", "1.2.3.4")
-	fp.connected.Store(true)
 
-	// Drop the tunnel — watchdog should reconnect to one of the locations.
-	fp.drop()
+	// Drive the proxy's dial-failure counter past the threshold.
+	proxySrv := proxy.New("", "", "")
+	for i := 0; i < dialFailureThreshold+1; i++ {
+		proxySrv.SeedDialOutcome(false)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond)
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv)
 		close(done)
 	}()
 	// Wait until the watchdog has triggered at least one reconnect.
@@ -187,8 +192,9 @@ func TestWatchdog_DetectsDropAndReconnects(t *testing.T) {
 	}
 }
 
-// TestWatchdog_SkipsWhenNotReady: when state != Ready, the watchdog must
-// not call Connect — some other code path owns the connection lifecycle.
+// TestWatchdog_SkipsWhenNotReady: when state != Ready/Failed, the
+// watchdog must not call Connect — some other code path owns the
+// lifecycle.
 func TestWatchdog_SkipsWhenNotReady(t *testing.T) {
 	fp := &fakeProvider{
 		locations: []string{"USA"},
@@ -196,19 +202,86 @@ func TestWatchdog_SkipsWhenNotReady(t *testing.T) {
 	}
 	st := NewStateTracker("fake")
 	st.Set(StateConnecting) // simulate initial connect in progress
-	fp.connected.Store(false)
+
+	proxySrv := proxy.New("", "", "")
+	// Even if the proxy were seeing failures, watchdog must not act
+	// from Connecting state. Verify by seeding a high failure count.
+	for i := 0; i < dialFailureThreshold+5; i++ {
+		proxySrv.SeedDialOutcome(false)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond)
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv)
 		close(done)
 	}()
 	<-done
 
 	if got := fp.callCount(); got != 0 {
 		t.Errorf("watchdog called Connect %d times, want 0 (state was Connecting)", got)
+	}
+}
+
+// TestWatchdog_StaysOutOfWayWhenProxyHealthy: even from StateReady,
+// the watchdog must NOT act when the proxy's recent dials have all
+// succeeded. This is the case that today's expressvpn-1-style daemon
+// IPC wedge breaks if you ask the daemon — but the proxy knows the
+// truth and tells us "tunnel is fine, don't touch it."
+func TestWatchdog_StaysOutOfWayWhenProxyHealthy(t *testing.T) {
+	fp := &fakeProvider{
+		locations: []string{"USA"},
+		connectOK: true,
+	}
+	st := NewStateTracker("fake")
+	st.Set(StateReady)
+	st.RecordTunnelUp("USA", "1.2.3.4")
+
+	proxySrv := proxy.New("", "", "")
+	proxySrv.SeedDialOutcome(true) // recent dial succeeded → all healthy
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		close(done)
+	}()
+	<-done
+
+	if got := fp.callCount(); got != 0 {
+		t.Errorf("watchdog called Connect %d times on a healthy proxy, want 0", got)
+	}
+}
+
+// TestWatchdog_AbstainsWhenProxySilent: with no dial activity at all,
+// the watchdog has no signal and must abstain from action even if
+// state is Ready. The slot would observe any real tunnel breakage
+// the moment it tries to dispatch a request.
+func TestWatchdog_AbstainsWhenProxySilent(t *testing.T) {
+	fp := &fakeProvider{
+		locations: []string{"USA"},
+		connectOK: true,
+	}
+	st := NewStateTracker("fake")
+	st.Set(StateReady)
+	st.RecordTunnelUp("USA", "1.2.3.4")
+
+	// No SeedDialOutcome calls → LastDialAt is the zero value.
+	proxySrv := proxy.New("", "", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		close(done)
+	}()
+	<-done
+
+	if got := fp.callCount(); got != 0 {
+		t.Errorf("watchdog called Connect %d times on a silent proxy, want 0", got)
 	}
 }
 
@@ -230,13 +303,19 @@ func TestWatchdog_ReconnectFailureMarksFailedAndRetries(t *testing.T) {
 	}
 	st := NewStateTracker("fake")
 	st.Set(StateReady)
-	fp.connected.Store(false) // already down
 
+	proxySrv := proxy.New("", "", "")
+	// Seed dial failures past threshold so the watchdog has reason to
+	// act from StateReady; without this, tunnelLooksHealthy returns
+	// true on a silent proxy and the watchdog correctly abstains.
+	for i := 0; i < dialFailureThreshold+1; i++ {
+		proxySrv.SeedDialOutcome(false)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
 		close(done)
 	}()
 
@@ -285,11 +364,12 @@ func TestWatchdog_RecoversFromFailed(t *testing.T) {
 	st.Set(StateFailed)
 	fp.connected.Store(false)
 
+	proxySrv := proxy.New("", "", "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
 		close(done)
 	}()
 
