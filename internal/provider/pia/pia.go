@@ -59,14 +59,25 @@ func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	// `piactl monitor` itself has failed enough times to flip
 	// fallbackActive, we still call p.Status() but with a wider sleep
 	// to reduce daemon contention.
+	//
+	// Log throttle: we used to emit one "waiting: connected=… ip=…"
+	// per poll (every 250 ms), which produced ~30 noise lines in the
+	// typical 8 s connect window. The poll itself runs every 250 ms
+	// for fast first-success detection; the LOG runs at most once per
+	// 5 s so journals stay readable. The state values we'd log
+	// rarely change between sub-second polls anyway.
 	deadline := time.Now().Add(60 * time.Second)
+	lastLog := time.Time{}
 	for time.Now().Before(deadline) {
 		status := p.Status(ctx)
 		if status.Connected && status.IP != "" {
 			shared.Debugf("PIA: Connect() - connected with IP: %s", status.IP)
 			return status
 		}
-		shared.Debugf("PIA: Connect() - waiting: connected=%v, ip=%s", status.Connected, status.IP)
+		if time.Since(lastLog) >= 5*time.Second {
+			shared.Debugf("PIA: Connect() - waiting: connected=%v, ip=%s", status.Connected, status.IP)
+			lastLog = time.Now()
+		}
 		sleep := 250 * time.Millisecond
 		if globalMonitor.inFallback() {
 			sleep = 1 * time.Second
