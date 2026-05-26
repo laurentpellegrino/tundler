@@ -194,9 +194,14 @@ func main() {
 	// the first rotation onward (no synchronized stampede).
 	//
 	// Operator-visible behavior:
-	//   MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS → fixed cadence
-	//   MIN_ROTATION_SECONDS <  MAX_ROTATION_SECONDS → randomized within window
-	//   MIN_ROTATION_SECONDS >  MAX_ROTATION_SECONDS → falls back to min == max (logged)
+	//   MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS == 0 → periodic rotation disabled
+	//   MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS      → fixed cadence
+	//   MIN_ROTATION_SECONDS <  MAX_ROTATION_SECONDS      → randomized within window
+	//   MIN_ROTATION_SECONDS >  MAX_ROTATION_SECONDS      → falls back to min == max (logged)
+	//
+	// The disabled mode keeps /rotate available — crawler-driven rotation
+	// (AIMD-triggered POST /rotate) still works; only the scheduled
+	// timer is silenced. Useful for debug pods or single-shot tunnels.
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
 	maxRotation := time.Duration(getEnvInt(envMaxRotationSec, defaultMaxRotationSec)) * time.Second
 	if maxRotation < minRotation {
@@ -204,7 +209,12 @@ func main() {
 			maxRotation, minRotation)
 		maxRotation = minRotation
 	}
-	go runRotator(ctx, prov, state, providerName, excluded, minRotation, maxRotation, drain)
+	rotationEnabled := minRotation > 0 || maxRotation > 0
+	if rotationEnabled {
+		go runRotator(ctx, prov, state, providerName, excluded, minRotation, maxRotation, drain)
+	} else {
+		log.Printf("tundler-tunnel: periodic rotation disabled (MIN_ROTATION_SECONDS=MAX_ROTATION_SECONDS=0); /rotate still honored")
+	}
 
 	// Wedge guard: if state stays continuously not-Ready for longer
 	// than WEDGE_GUARD_THRESHOLD_SECONDS (default 15 min), the watchdog
@@ -227,8 +237,12 @@ func main() {
 	// side where the actual upstream-response visibility lives.
 	_ = triggerRotation // referenced by /rotate handler in startServer
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=[%s..%s] wedge_guard=%s",
-		watchdogInterval, minRotation, maxRotation, wedgeThreshold)
+	rotationDesc := fmt.Sprintf("[%s..%s]", minRotation, maxRotation)
+	if !rotationEnabled {
+		rotationDesc = "disabled"
+	}
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s wedge_guard=%s",
+		watchdogInterval, rotationDesc, wedgeThreshold)
 
 	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
 	// (Trigger C) and Layer 1+2 envoy drain hooks.

@@ -134,7 +134,10 @@ Two triggers, one path:
   the same window so a fleet that boots together is spread across the
   full window from the first rotation onward — no synchronized
   stampede after one min-window elapses either. Set
-  `MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS` for a fixed cadence.
+  `MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS` for a fixed cadence,
+  or both to `0` to disable scheduled rotation entirely (e.g. for
+  debug pods); `POST /rotate` from the crawler still works in that
+  mode.
 - **`POST /rotate`** from the crawler slot that owns this pod. The
   slot tracks 429s and consecutive failures via its own AIMD token
   bucket; when it decides to rotate, it POSTs straight to this pod's
