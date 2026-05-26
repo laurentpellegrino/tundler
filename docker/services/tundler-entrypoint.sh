@@ -27,7 +27,13 @@ mkdir -p "$(dirname "$ENV_FILE")"
 #                          and the operator wonders why the env var has
 #                          no effect (see the 2026-05-26
 #                          EXCLUDED_LOCATIONS=smart incident).
-printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_|BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS)=' | sort > "$ENV_FILE"
+# Two alternation groups so the prefix entries (POD_, TUNDLER_, ...)
+# match var names of any length while the explicit-name entries
+# (EXCLUDED_LOCATIONS, ...) match exactly one var each. Without this
+# split, a trailing '=' anchor on the union would have required
+# 'TUNDLER_' to be followed immediately by '=' — turning TUNDLER_
+# into a single literal var instead of a prefix.
+printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)|^(BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS)=' | sort > "$ENV_FILE"
 
 # Run each installed provider's configure.sh once per pod boot. This
 # downloads OpenVPN configs (ipvanish/protonvpn/surfshark), seeds CLI
