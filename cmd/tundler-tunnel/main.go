@@ -28,12 +28,22 @@ const (
 	envExcludedLocations     = "EXCLUDED_LOCATIONS"
 	envWatchdogIntervalSec   = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
+	envMaxRotationSec        = "MAX_ROTATION_SECONDS"
 	envWedgeGuardSec         = "WEDGE_GUARD_THRESHOLD_SECONDS"
 	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
-	defaultMinRotationSec    = 3600 // 1h, per design-doc "Hourly random rotation"
+	// Rotation cadence: each interval (and the initial boot offset) is
+	// a uniform random pick from [MIN_ROTATION_SECONDS, MAX_ROTATION_SECONDS].
+	// Default 2-4 hours: long enough that we don't burn provider account
+	// session limits churning IPs, short enough that any given exit IP
+	// doesn't accumulate enough crawl footprint to be flagged by
+	// per-IP fingerprinting heuristics. Operators can narrow the window
+	// (e.g. min=max for a fixed cadence) or widen it (e.g. 1h-8h for
+	// extra unpredictability).
+	defaultMinRotationSec = 7200  // 2h
+	defaultMaxRotationSec = 14400 // 4h
 	defaultWedgeGuardSec     = 900  // 15 min — tunable via WEDGE_GUARD_THRESHOLD_SECONDS
 
 	// Port the in-process Go CONNECT proxy listens on (replaces the
@@ -176,12 +186,25 @@ func main() {
 	watchdogInterval := time.Duration(getEnvInt(envWatchdogIntervalSec, defaultWatchdogIntervSec)) * time.Second
 	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv)
 
-	// Start the hourly rotator: every MIN_ROTATION_SECONDS (default 1h)
-	// ± 10% jitter, pick a fresh random location and rotate. Initial
-	// offset is uniformly random in [0, MIN_ROTATION_SECONDS) so a fleet
-	// that boots together doesn't rotate in lockstep.
+	// Start the rotator: each interval is a fresh uniform random pick
+	// from [MIN_ROTATION_SECONDS, MAX_ROTATION_SECONDS] (defaults 2h-4h),
+	// at which point we pick a fresh allowed location and rotate. The
+	// initial boot offset is sampled from the same window, so a fleet
+	// that boots together is spread across the full max-window from
+	// the first rotation onward (no synchronized stampede).
+	//
+	// Operator-visible behavior:
+	//   MIN_ROTATION_SECONDS == MAX_ROTATION_SECONDS → fixed cadence
+	//   MIN_ROTATION_SECONDS <  MAX_ROTATION_SECONDS → randomized within window
+	//   MIN_ROTATION_SECONDS >  MAX_ROTATION_SECONDS → falls back to min == max (logged)
 	minRotation := time.Duration(getEnvInt(envMinRotationSec, defaultMinRotationSec)) * time.Second
-	go runRotator(ctx, prov, state, providerName, excluded, minRotation, drain)
+	maxRotation := time.Duration(getEnvInt(envMaxRotationSec, defaultMaxRotationSec)) * time.Second
+	if maxRotation < minRotation {
+		log.Printf("tundler-tunnel: MAX_ROTATION_SECONDS (%s) < MIN_ROTATION_SECONDS (%s); clamping max=min",
+			maxRotation, minRotation)
+		maxRotation = minRotation
+	}
+	go runRotator(ctx, prov, state, providerName, excluded, minRotation, maxRotation, drain)
 
 	// Wedge guard: if state stays continuously not-Ready for longer
 	// than WEDGE_GUARD_THRESHOLD_SECONDS (default 15 min), the watchdog
@@ -204,8 +227,8 @@ func main() {
 	// side where the actual upstream-response visibility lives.
 	_ = triggerRotation // referenced by /rotate handler in startServer
 
-	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=%s wedge_guard=%s",
-		watchdogInterval, minRotation, wedgeThreshold)
+	log.Printf("tundler-tunnel: holding tunnel; watchdog=%s rotation=[%s..%s] wedge_guard=%s",
+		watchdogInterval, minRotation, maxRotation, wedgeThreshold)
 
 	// Hold the tunnel until SIGTERM. Future slices add the self-monitor
 	// (Trigger C) and Layer 1+2 envoy drain hooks.
