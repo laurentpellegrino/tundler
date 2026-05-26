@@ -1,0 +1,19 @@
+[Unit]
+Description=Forward tundler-tunnel journal to PID 1 stdout (for kubectl logs)
+After=systemd-journald.service
+# tundler-tunnel.service may not exist yet when this unit fires; that's
+# fine — journalctl -f blocks until matching entries appear.
+
+[Service]
+Type=simple
+# Tail tundler-tunnel.service entries in plain "message-only" format
+# so kubectl logs output is the same Go log line we'd see in
+# journalctl -u tundler-tunnel. Redirect via /bin/sh -c so the shell
+# evaluates /proc/1/fd/1 fresh on every (re)start — that's container
+# PID 1's stdout, which is exactly what kubelet collects.
+ExecStart=/bin/sh -c 'exec journalctl --follow --unit=tundler-tunnel.service --no-pager --output=cat >/proc/1/fd/1 2>&1'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

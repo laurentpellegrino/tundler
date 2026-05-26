@@ -91,9 +91,11 @@ COPY --from=builder /build/tundler-tunnel /usr/local/bin/tundler-tunnel
 COPY docker/services/setup-netns.sh /usr/local/bin/setup-netns.sh
 COPY docker/services/tundler-entrypoint.sh /usr/local/bin/tundler-entrypoint.sh
 COPY docker/services/tundler-tunnel.service /etc/systemd/system/
+COPY docker/services/journal-stdout.service /etc/systemd/system/
 
 RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh && \
     systemctl enable tundler-tunnel.service && \
+    systemctl enable journal-stdout.service && \
     systemctl set-default multi-user.target && \
     systemctl mask getty@tty1.service console-getty.service
 
