@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
 	"strings"
 	"time"
 
@@ -428,7 +429,39 @@ type logicalsResponse struct {
 }
 
 func (c *apiClient) fetchLogicals(ctx context.Context, cookie cookieState) (*logicalsResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/vpn/v1/logicals", nil)
+	// Proton's /vpn/v1/logicals returns Type=1 (standard) servers by
+	// default — the gated SecureCore tier (Type=2) is only included
+	// when explicitly requested. Plus-tier accounts include
+	// SecureCore in their plan but the API still filters by Type. Hit
+	// both endpoints and merge, deduplicating by logical-server ID
+	// when present (Name is the readable identifier and stays stable
+	// across both responses).
+	standard, err := c.fetchLogicalsForType(ctx, cookie, 0)
+	if err != nil {
+		return nil, err
+	}
+	secureCore, err := c.fetchLogicalsForType(ctx, cookie, 2)
+	if err != nil {
+		// SecureCore probe is best-effort — Plus account is required,
+		// and Proton may have changed the Type param semantics. Log
+		// loudly to stderr but proceed with whatever we have so we
+		// don't break the standard-tier refresh on a SecureCore
+		// probe error.
+		fmt.Fprintf(os.Stderr, "proton-updater: SecureCore probe failed (?Type=2): %v — continuing with standard tier only\n", err)
+		return standard, nil
+	}
+	merged := mergeLogicals(standard, secureCore)
+	fmt.Fprintf(os.Stderr, "proton-updater: fetched %d standard + %d secure-core (after merge: %d unique logicals)\n",
+		len(standard.LogicalServers), len(secureCore.LogicalServers), len(merged.LogicalServers))
+	return merged, nil
+}
+
+func (c *apiClient) fetchLogicalsForType(ctx context.Context, cookie cookieState, serverType int) (*logicalsResponse, error) {
+	url := c.base + "/vpn/v1/logicals"
+	if serverType > 0 {
+		url += fmt.Sprintf("?Type=%d", serverType)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -442,6 +475,28 @@ func (c *apiClient) fetchLogicals(ctx context.Context, cookie cookieState) (*log
 		return nil, fmt.Errorf("logicals code %d", resp.Code)
 	}
 	return &resp, nil
+}
+
+// mergeLogicals deduplicates by Name (stable Proton-side identifier
+// like "IS#1" or "SE-CH#3"). When the same Name appears in both
+// responses, the SecureCore response wins so the Features bitfield
+// reflects the most specific tier classification.
+func mergeLogicals(standard, secureCore *logicalsResponse) *logicalsResponse {
+	out := &logicalsResponse{Code: 1000}
+	seen := make(map[string]int, len(standard.LogicalServers)+len(secureCore.LogicalServers))
+	for _, ls := range standard.LogicalServers {
+		seen[ls.Name] = len(out.LogicalServers)
+		out.LogicalServers = append(out.LogicalServers, ls)
+	}
+	for _, ls := range secureCore.LogicalServers {
+		if idx, ok := seen[ls.Name]; ok {
+			out.LogicalServers[idx] = ls // SecureCore response wins on dupes
+			continue
+		}
+		seen[ls.Name] = len(out.LogicalServers)
+		out.LogicalServers = append(out.LogicalServers, ls)
+	}
+	return out
 }
 
 // -----------------------------------------------------------------
