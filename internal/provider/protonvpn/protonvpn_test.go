@@ -2,31 +2,12 @@ package protonvpn
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
-func resetTestState(t *testing.T) {
-	t.Helper()
-	serverCacheMu.Lock()
-	serverCache = nil
-	serverCacheTime = time.Time{}
-	activeServer = nil
-	loggedIn = false
-	serverCacheMu.Unlock()
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
-}
-
-func writeServersFile(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "servers.json")
-	data := `{
+const testServersJSON = `{
   "protonvpn": {
     "servers": [
       {
@@ -62,15 +43,41 @@ func writeServersFile(t *testing.T) string {
     ]
   }
 }`
-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
-		t.Fatalf("write test servers file: %v", err)
-	}
-	return path
+
+// resetTestState clears the parsed-catalog memo so the next
+// fetchServers re-parses embeddedServers, and clears the connection
+// state vars between tests.
+func resetTestState(t *testing.T) {
+	t.Helper()
+	serverCacheMu.Lock()
+	serverCache = nil
+	serverCacheOK = false
+	serverCacheErr = nil
+	activeServer = nil
+	loggedIn = false
+	serverCacheMu.Unlock()
+	activeMu.Lock()
+	activeLocation = ""
+	activeMu.Unlock()
+}
+
+// useTestServers swaps the embedded catalog for a deterministic test
+// fixture, restoring the real bytes on test cleanup. Combined with
+// resetTestState's cache reset, this gives each test a fresh, known
+// server set.
+func useTestServers(t *testing.T) {
+	t.Helper()
+	original := embeddedServers
+	embeddedServers = []byte(testServersJSON)
+	t.Cleanup(func() {
+		embeddedServers = original
+		resetTestState(t)
+	})
 }
 
 func TestLoginRequiresOpenVPNCredentials(t *testing.T) {
 	resetTestState(t)
-	t.Setenv("PROTON_SERVERS_FILE", writeServersFile(t))
+	useTestServers(t)
 	t.Setenv("PROTON_OPENVPN_USERNAME", "")
 	t.Setenv("PROTON_OPENVPN_PASSWORD", "")
 
@@ -85,7 +92,7 @@ func TestLoginRequiresOpenVPNCredentials(t *testing.T) {
 
 func TestLoginLoadsOpenVPNServerMetadata(t *testing.T) {
 	resetTestState(t)
-	t.Setenv("PROTON_SERVERS_FILE", writeServersFile(t))
+	useTestServers(t)
 	t.Setenv("PROTON_OPENVPN_USERNAME", "user")
 	t.Setenv("PROTON_OPENVPN_PASSWORD", "pass")
 	t.Setenv("PROTON_OPENVPN_PROTOCOL", "udp")
@@ -107,7 +114,7 @@ func TestLoginLoadsOpenVPNServerMetadata(t *testing.T) {
 
 func TestFetchServersHonorsProtocol(t *testing.T) {
 	resetTestState(t)
-	t.Setenv("PROTON_SERVERS_FILE", writeServersFile(t))
+	useTestServers(t)
 	t.Setenv("PROTON_OPENVPN_PROTOCOL", "tcp")
 
 	servers, err := fetchServers(context.Background())

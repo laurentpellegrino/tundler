@@ -2,11 +2,10 @@ package protonvpn
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,11 +21,18 @@ import (
 const (
 	name             = "protonvpn"
 	defaultProtocol  = "udp"
-	defaultServers   = "/etc/protonvpn/servers.json"
 	defaultConfigDir = "/etc/protonvpn/openvpn"
-	serversURL       = "https://raw.githubusercontent.com/qdm12/gluetun/master/internal/storage/servers.json"
-	cacheExpiry      = 24 * time.Hour
 )
+
+// embeddedServers is the ProtonVPN server catalog, refreshed daily
+// by the proton-updater workflow (see cmd/proton-updater/ and
+// .github/workflows/update-proton-servers.yml) and baked into the
+// binary at build time so the tunnel pod never has to touch the
+// ProtonVPN account API at runtime. var (not const) so tests can
+// override it via useTestServers.
+//
+//go:embed servers.json
+var embeddedServers []byte
 
 type ProtonVPN struct{}
 
@@ -49,13 +55,19 @@ type serversFile struct {
 }
 
 var (
-	serverCache     []protonServer
-	serverCacheMu   sync.RWMutex
-	serverCacheTime time.Time
-	activeServer    *protonServer
-	activeLocation  string
-	activeMu        sync.RWMutex
-	loggedIn        bool
+	// serverCache holds the protocol-filtered subset of embeddedServers,
+	// built once on first access (via initServers). Stays valid for the
+	// process lifetime — the catalog only refreshes when a new image is
+	// rolled out, so there's no reason to invalidate at runtime.
+	serverCache    []protonServer
+	serverCacheMu  sync.Mutex
+	serverCacheErr error
+	serverCacheOK  bool
+
+	activeServer   *protonServer
+	activeLocation string
+	activeMu       sync.RWMutex
+	loggedIn       bool
 )
 
 func init() { provider.Registry[name] = ProtonVPN{} }
@@ -92,13 +104,6 @@ func getPort(protocol string) string {
 	return "1194"
 }
 
-func serversPath() string {
-	if path := os.Getenv("PROTON_SERVERS_FILE"); path != "" {
-		return path
-	}
-	return defaultServers
-}
-
 func configDir() string {
 	if dir := os.Getenv("PROTON_OPENVPN_CONFIG_DIR"); dir != "" {
 		return dir
@@ -106,39 +111,28 @@ func configDir() string {
 	return defaultConfigDir
 }
 
-func fetchServers(ctx context.Context) ([]protonServer, error) {
-	serverCacheMu.RLock()
-	if len(serverCache) > 0 && time.Since(serverCacheTime) < cacheExpiry {
-		servers := append([]protonServer(nil), serverCache...)
-		serverCacheMu.RUnlock()
-		return servers, nil
-	}
-	serverCacheMu.RUnlock()
-
+// fetchServers returns the protocol-filtered ProtonVPN OpenVPN server
+// list from the embedded catalog. Result is cached for the process
+// lifetime — there's nothing dynamic to invalidate at runtime, the
+// catalog only changes when a fresh image rolls out. ctx accepted for
+// API symmetry with the previous HTTP-fetching version; not used.
+func fetchServers(_ context.Context) ([]protonServer, error) {
 	serverCacheMu.Lock()
 	defer serverCacheMu.Unlock()
 
-	if len(serverCache) > 0 && time.Since(serverCacheTime) < cacheExpiry {
-		return append([]protonServer(nil), serverCache...), nil
+	if serverCacheOK {
+		return append([]protonServer(nil), serverCache...), serverCacheErr
 	}
-
-	data, err := os.ReadFile(serversPath())
-	if err != nil || len(data) == 0 {
-		data, err = downloadServers(ctx)
-		if err != nil {
-			return nil, err
-		}
-		_ = os.MkdirAll(filepath.Dir(serversPath()), 0755)
-		_ = os.WriteFile(serversPath(), data, 0644)
-	}
+	serverCacheOK = true
 
 	var parsed serversFile
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return nil, fmt.Errorf("failed to parse ProtonVPN server metadata: %w", err)
+	if err := json.Unmarshal(embeddedServers, &parsed); err != nil {
+		serverCacheErr = fmt.Errorf("failed to parse embedded ProtonVPN server metadata: %w", err)
+		return nil, serverCacheErr
 	}
 
-	var servers []protonServer
 	proto := getProtocol()
+	servers := make([]protonServer, 0, len(parsed.ProtonVPN.Servers))
 	for _, srv := range parsed.ProtonVPN.Servers {
 		if srv.VPN != "openvpn" || srv.Hostname == "" {
 			continue
@@ -152,34 +146,12 @@ func fetchServers(ctx context.Context) ([]protonServer, error) {
 		servers = append(servers, srv)
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("no ProtonVPN OpenVPN servers found")
+		serverCacheErr = fmt.Errorf("no ProtonVPN OpenVPN servers found in embedded catalog (size=%d bytes)", len(embeddedServers))
+		return nil, serverCacheErr
 	}
-
 	serverCache = servers
-	serverCacheTime = time.Now()
-	shared.Debugf("ProtonVPN: cached %d OpenVPN servers", len(servers))
-
-	return append([]protonServer(nil), servers...), nil
-}
-
-func downloadServers(ctx context.Context) ([]byte, error) {
-	url := os.Getenv("PROTON_SERVERS_URL")
-	if url == "" {
-		url = serversURL
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download ProtonVPN server metadata: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download ProtonVPN server metadata: HTTP %d", resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
+	shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog", len(servers))
+	return append([]protonServer(nil), serverCache...), nil
 }
 
 func findServers(servers []protonServer, location string) []protonServer {
