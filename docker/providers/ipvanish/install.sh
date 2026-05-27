@@ -10,15 +10,18 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     unzip
 
-# Download IPVanish OpenVPN configs at BUILD time. configs.ipvanish.com sits
-# behind Cloudflare and 403s requests from many cloud/datacenter egress IPs
-# (verified May 2026 from a k8s production cluster AND from GitHub Actions
-# runners — same Cloudflare bot-block list). We mirror configs.zip as a
-# release asset on this repo: GitHub's release CDN isn't on that block
-# list, so the download works from both GitHub Actions and from in-cluster
-# rebuilds. To refresh: download configs.zip from configs.ipvanish.com
-# (works from residential IPs) and re-upload it to the
-# `ipvanish-configs` release.
+# Download IPVanish OpenVPN configs at BUILD time. configs.ipvanish.com
+# sits behind Cloudflare and 403s requests from many cloud/datacenter
+# egress IPs (verified May 2026 from a k8s production cluster AND from
+# GitHub Actions runners — same Cloudflare bot-block list). We mirror
+# configs.zip as a release asset on this repo: GitHub's release CDN
+# isn't on that block list, so the download works from both GitHub
+# Actions and from in-cluster rebuilds. To refresh, from a residential
+# IP:
+#   curl -sLo configs.zip https://configs.ipvanish.com/configs/configs.zip
+#   gh release upload ipvanish-configs configs.zip --clobber --repo laurentpellegrino/tundler
+# (the trailing /configs/ path matters — the bare /configs.zip URL
+# IPVanish previously served at the root now 404s).
 CONFIG_DIR=/etc/ipvanish/openvpn
 CONFIGS_URL="${IPVANISH_CONFIGS_URL:-https://github.com/laurentpellegrino/tundler/releases/download/ipvanish-configs/configs.zip}"
 TMP_ZIP="$(mktemp)"
