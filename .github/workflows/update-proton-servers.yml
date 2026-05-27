@@ -1,0 +1,90 @@
+name: Update ProtonVPN servers
+
+# Refreshes internal/provider/protonvpn/servers.json by authenticating
+# against ProtonVPN's account API (SRP v4) and fetching /vpn/v1/logicals.
+# Runs daily; commits the file into main if (and only if) the resulting
+# JSON differs from what's currently committed.
+#
+# The runtime tunnel binary does NOT call the Proton account API — it
+# only reads the embedded servers.json. Keeping the SRP code out of
+# production minimises blast radius if Proton changes their auth flow:
+# this workflow fails loudly here, in CI, rather than silently
+# breaking tunnel pods at runtime.
+#
+# Security: no untrusted input is interpolated into any run: step.
+# The only external inputs are the two OpenBao secrets, which are
+# passed through env (not string interpolation).
+#
+# OpenBao path: vpn/protonvpn (properties: username, password) under
+# the ipregistry/production namespace. vault-action pulls them via
+# the same JWT/OIDC flow used by ipregistry-crawl's build-publish
+# workflow — if this is the FIRST run from this repo, the OpenBao
+# role's bound_subject list may need to include
+# `repo:laurentpellegrino/tundler:*` for the OIDC token to be accepted.
+
+on:
+  schedule:
+    # 06:00 UTC daily — well after Proton's nightly catalog churn but
+    # early enough that any downstream image rebuild lands before
+    # business hours in EU/US.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit the regenerated servers.json
+  id-token: write   # required for vault-action JWT auth
+
+concurrency:
+  group: update-proton-servers
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fetch ProtonVPN account credentials from OpenBao
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://bao.elaunira.com
+          method: jwt
+          path: github-actions
+          role: github-actions
+          namespace: ipregistry/production
+          jwtGithubAudience: https://github.com/ipregistry
+          secrets: |
+            kv/data/vpn/protonvpn username | PROTON_ACCOUNT_USERNAME ;
+            kv/data/vpn/protonvpn password | PROTON_ACCOUNT_PASSWORD
+
+      - name: Run proton-updater
+        run: |
+          mkdir -p internal/provider/protonvpn
+          go run ./cmd/proton-updater \
+            > internal/provider/protonvpn/servers.json.new
+          python3 -c "import json; json.load(open('internal/provider/protonvpn/servers.json.new'))"
+          mv internal/provider/protonvpn/servers.json.new \
+             internal/provider/protonvpn/servers.json
+
+      - name: Commit changes
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add internal/provider/protonvpn/servers.json
+          if git diff --staged --quiet; then
+            echo "ProtonVPN servers.json unchanged; skipping commit."
+            exit 0
+          fi
+          SUMMARY=$(python3 -c "import json; d=json.load(open('internal/provider/protonvpn/servers.json'))['protonvpn']['servers']; countries=sorted({s['country'] for s in d}); print(f'{len(d)} servers across {len(countries)} countries')")
+          git commit -m "protonvpn: refresh embedded servers.json ($SUMMARY)"
+          git push origin main
