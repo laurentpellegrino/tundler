@@ -1,0 +1,47 @@
+name: Setup Cloudflare WARP
+description: |
+  Install Cloudflare WARP (free consumer tier) on the runner and
+  route outbound traffic through it. Useful when a workflow needs
+  to talk to an HTTP endpoint that Cloudflare's bot heuristics
+  block on GitHub Actions runner IPs (e.g. configs.ipvanish.com,
+  api.proton.me anti-abuse). The runner's egress IP appears as
+  Cloudflare's own network for the rest of the job.
+
+  No cleanup step: GitHub Actions ephemeral runners are torn down
+  at job end so there's no shared state to leak. If migrating to
+  self-hosted runners, add a manual `warp-cli disconnect` step.
+
+  Implementation note: WARP runs locally as a service. There is
+  no Zero Trust enrolment, no account, and no secret —
+  `registration new` is anonymous on the free tier.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        # Add Cloudflare's apt repo
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor \
+              --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" \
+          | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        sudo apt-get -qq update
+        sudo apt-get -qq install -y cloudflare-warp
+        # Anonymous registration on the free tier (no account)
+        sudo warp-cli --accept-tos registration new
+        sudo warp-cli --accept-tos mode warp
+        sudo warp-cli --accept-tos connect
+        # Block until traffic is actually flowing through WARP.
+        for _ in $(seq 1 30); do
+          if curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -q '^warp=on'; then
+            echo "WARP connected"
+            curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|colo)='
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "::error::WARP failed to connect within 60s"
+        sudo warp-cli --accept-tos status || true
+        exit 1
