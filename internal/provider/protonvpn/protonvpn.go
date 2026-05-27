@@ -238,8 +238,12 @@ func pickRandomServer(servers []protonServer) *protonServer {
 	return &server
 }
 
+// isOpenVPNConnected returns true once openvpn has finished tunnel
+// setup (link UP + routes pushed). Uses RunCmdSilent so the connect-
+// poll loop doesn't spam journald with "Cannot find device tun0"
+// while the tunnel is still coming up.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmd(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
