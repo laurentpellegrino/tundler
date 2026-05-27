@@ -101,10 +101,52 @@ func (n NordVPN) Login(ctx context.Context) error {
 	if n.LoggedIn(ctx) {
 		return nil
 	}
+	// nordvpnd refuses to honor `nordvpn login --token …` until the
+	// analytics-consent state is set (the daemon ships with
+	// "consent: undefined" and gates all auth IPC behind it). The
+	// per-provider configure.sh used to handle this at pod boot but
+	// it runs BEFORE systemd starts the daemon, so the `nordvpn` CLI
+	// can't reach the daemon and the call silently fails. Apply it
+	// here at login time when the daemon is guaranteed to be up.
+	//
+	// The same applies to the baseline `nordvpn set …` config —
+	// meshnet/notify off, NordLynx, no analytics, etc. Without these,
+	// the daemon eagerly downloads the meshnet/libtelio/nordwhisper
+	// remote configs which slows boot and burns memory.
+	configureDaemon(ctx)
 	if _, err := shared.RunCmd(ctx, bin, "login", "--token", token); err != nil {
 		return fmt.Errorf("nordvpn login failed: %w", err)
 	}
 	return nil
+}
+
+// configureDaemon applies the baseline nordvpnd config that has to
+// happen post-daemon-start but pre-login. Errors are non-fatal —
+// each setting is best-effort, and the worst case (a setting that
+// doesn't take) leaves nordvpnd in its default state for that knob.
+func configureDaemon(ctx context.Context) {
+	// Decline the analytics-consent prompt that gates all subsequent
+	// IPC. Piping "n" into the interactive `nordvpn login` (no args)
+	// dismisses the prompt without progressing into the OAuth flow.
+	cmd := []string{"sh", "-c", `printf "n\n" | nordvpn login 2>/dev/null || true`}
+	_, _ = shared.RunCmd(ctx, cmd[0], cmd[1:]...)
+
+	// Baseline settings. lan-discovery=enable is intentional (lets
+	// the pod talk to its sibling slot-controller via cluster DNS);
+	// firewall off because we manage iptables ourselves; meshnet/
+	// notify off to skip the eager remote-config fetch.
+	for _, args := range [][]string{
+		{"set", "analytics", "disabled"},
+		{"set", "autoconnect", "disabled"},
+		{"set", "firewall", "disabled"},
+		{"set", "lan-discovery", "enable"},
+		{"set", "meshnet", "off"},
+		{"set", "notify", "off"},
+		{"set", "pq", "on"},
+		{"set", "technology", "NordLynx"},
+	} {
+		quiet(ctx, args...)
+	}
 }
 
 func (n NordVPN) Logout(ctx context.Context) error {
