@@ -68,8 +68,8 @@ jobs:
           namespace: lpellegr
           jwtGithubAudience: https://github.com/laurentpellegrino
           secrets: |
-            kv/data/vpn/protonvpn username | PROTON_ACCOUNT_USERNAME ;
-            kv/data/vpn/protonvpn password | PROTON_ACCOUNT_PASSWORD
+            kv/data/vpn/proton username | PROTON_ACCOUNT_USERNAME ;
+            kv/data/vpn/proton password | PROTON_ACCOUNT_PASSWORD
 
       - name: Run proton-updater
         run: |
