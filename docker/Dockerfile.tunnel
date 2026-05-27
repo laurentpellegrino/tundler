@@ -54,7 +54,7 @@ RUN if [ -z "${PROVIDER}" ]; then \
         echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
     fi && \
     case "${PROVIDER}" in \
-        expressvpn|ipvanish|mullvad|nordvpn|pia|protonvpn|surfshark) ;; \
+        expressvpn|ipvanish|mullvad|nordvpn|pia|protonvpn|surfshark|warp) ;; \
         *) echo "ERROR: PROVIDER=${PROVIDER} not in allow-list" >&2; exit 1 ;; \
     esac
 
@@ -122,6 +122,7 @@ RUN case "${PROVIDER}" in \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
         mullvad)    systemctl enable mullvad-daemon.service || true ;; \
         pia)        systemctl enable piavpn.service || true ;; \
+        warp)       systemctl enable warp-svc.service || true ;; \
         *)          : ;; \
     esac
 
