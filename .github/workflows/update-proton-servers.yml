@@ -15,12 +15,16 @@ name: Update ProtonVPN servers
 # The only external inputs are the two OpenBao secrets, which are
 # passed through env (not string interpolation).
 #
-# OpenBao path: vpn/protonvpn (properties: username, password) under
-# the ipregistry/production namespace. vault-action pulls them via
-# the same JWT/OIDC flow used by ipregistry-crawl's build-publish
-# workflow — if this is the FIRST run from this repo, the OpenBao
-# role's bound_subject list may need to include
-# `repo:laurentpellegrino/tundler:*` for the OIDC token to be accepted.
+# Auth: vault-action exchanges this workflow's GitHub OIDC token for
+# a short-lived OpenBao token via the `tundler` role configured in
+# the `lpellegr` namespace. Role + narrow-scope policy are managed
+# by elaunira-openbao/scripts/configure-github-jwt.sh — see
+# PERSONAL_ROLES["lpellegr|tundler"] there.
+#
+# Audience matches the repo owner (laurentpellegrino) because GH's
+# actions-run-service only issues ID tokens with audiences that match
+# the runner's GitHub owner — `https://github.com/ipregistry` is
+# rejected for repos outside that org.
 
 on:
   schedule:
@@ -60,9 +64,9 @@ jobs:
           url: https://bao.elaunira.com
           method: jwt
           path: github-actions
-          role: github-actions
-          namespace: ipregistry/production
-          jwtGithubAudience: https://github.com/ipregistry
+          role: tundler
+          namespace: lpellegr
+          jwtGithubAudience: https://github.com/laurentpellegrino
           secrets: |
             kv/data/vpn/protonvpn username | PROTON_ACCOUNT_USERNAME ;
             kv/data/vpn/protonvpn password | PROTON_ACCOUNT_PASSWORD
