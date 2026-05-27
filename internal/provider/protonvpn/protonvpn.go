@@ -2,7 +2,6 @@ package protonvpn
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -22,16 +21,20 @@ const (
 	name             = "protonvpn"
 	defaultProtocol  = "udp"
 	defaultConfigDir = "/etc/protonvpn/openvpn"
+	// defaultServersFile is where docker/providers/protonvpn/install.sh
+	// drops the server catalog at image-build time, downloaded from
+	// the protonvpn-servers GitHub release. Overridable via
+	// PROTON_SERVERS_FILE for local dev.
+	defaultServersFile = "/etc/protonvpn/servers.json"
 )
 
-// embeddedServers is the ProtonVPN server catalog, refreshed daily
-// by the proton-updater workflow (see cmd/proton-updater/ and
-// .github/workflows/update-proton-servers.yml) and baked into the
-// binary at build time so the tunnel pod never has to touch the
-// ProtonVPN account API at runtime. var (not const) so tests can
-// override it via useTestServers.
-//
-//go:embed servers.json
+// embeddedServers is the ProtonVPN server catalog, loaded lazily
+// from defaultServersFile on first fetchServers() call. Refreshed
+// daily by the update-proton-servers workflow which uploads it as
+// the `protonvpn-servers` GH release asset; install.sh in the
+// protonvpn image curl-downloads it at image-build time. Kept as a
+// package-level var (not a function-local read) so tests can
+// override it via useTestServers without touching disk.
 var embeddedServers []byte
 
 type ProtonVPN struct{}
@@ -124,6 +127,32 @@ func configDir() string {
 	return defaultConfigDir
 }
 
+// serversFilePath returns the path where install.sh drops the
+// downloaded servers.json. Overridable via PROTON_SERVERS_FILE for
+// out-of-cluster smoke tests.
+func serversFilePath() string {
+	if p := os.Getenv("PROTON_SERVERS_FILE"); p != "" {
+		return p
+	}
+	return defaultServersFile
+}
+
+// loadEmbeddedServersFromDisk reads the catalog file once and
+// caches it into the embeddedServers package var so subsequent
+// fetchServers() calls use the cached bytes. Tests bypass this by
+// pre-setting embeddedServers before fetchServers runs.
+func loadEmbeddedServersFromDisk() error {
+	if embeddedServers != nil {
+		return nil
+	}
+	data, err := os.ReadFile(serversFilePath())
+	if err != nil {
+		return fmt.Errorf("read ProtonVPN servers file %s: %w", serversFilePath(), err)
+	}
+	embeddedServers = data
+	return nil
+}
+
 // requiredFeatureMask reads PROTON_FEATURE_FILTER (CSV of feature
 // names: securecore, tor, p2p, stream) and ORs the corresponding
 // bits. A server is kept iff every bit in this mask is also set on
@@ -174,9 +203,14 @@ func fetchServers(_ context.Context) ([]protonServer, error) {
 	}
 	serverCacheOK = true
 
+	if err := loadEmbeddedServersFromDisk(); err != nil {
+		serverCacheErr = err
+		return nil, serverCacheErr
+	}
+
 	var parsed serversFile
 	if err := json.Unmarshal(embeddedServers, &parsed); err != nil {
-		serverCacheErr = fmt.Errorf("failed to parse embedded ProtonVPN server metadata: %w", err)
+		serverCacheErr = fmt.Errorf("failed to parse ProtonVPN server metadata: %w", err)
 		return nil, serverCacheErr
 	}
 
