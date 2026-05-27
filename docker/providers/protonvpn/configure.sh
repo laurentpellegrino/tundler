@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
+#
+# ProtonVPN server metadata is embedded in the tundler-tunnel binary
+# at build time (via go:embed of internal/provider/protonvpn/servers.json,
+# regenerated daily by the proton-updater GH Actions workflow).
+# Nothing to download at pod boot — just lay out the OpenVPN config
+# dir the runtime writes into.
+#
 set -e
 
 CONFIG_DIR="/etc/protonvpn/openvpn"
-SERVERS_FILE="${PROTON_SERVERS_FILE:-/etc/protonvpn/servers.json}"
-SERVERS_URL="${PROTON_SERVERS_URL:-https://raw.githubusercontent.com/qdm12/gluetun/master/internal/storage/servers.json}"
 
-mkdir -p "$CONFIG_DIR" "$(dirname "$SERVERS_FILE")"
+mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
-echo "Downloading ProtonVPN OpenVPN server metadata..."
-curl -fsSL "$SERVERS_URL" -o "$SERVERS_FILE"
-
-echo "ProtonVPN metadata configured successfully."
+echo "ProtonVPN config directory ready: $CONFIG_DIR"
