@@ -20,10 +20,8 @@ var errNoAllowedLocations = errors.New("no allowed locations after applying excl
 // dropped so an env var like "EXCLUDED_LOCATIONS=Bahrain,,Yemen, " still
 // excludes exactly Bahrain and Yemen.
 //
-// The exclusion set is documented in
-// architecture-tundler-fleet-controller.md ("Hourly rotation policy"):
-// operators add known-bad exits to vpn-providers.yaml; the rendered env
-// var arrives here as a CSV.
+// Operators add known-bad exits to vpn-providers.yaml on the
+// kubernetes side; the rendered env var arrives here as a CSV.
 func pickLocation(locations []string, excluded []string) (string, error) {
 	excludeSet := make(map[string]struct{}, len(excluded))
 	for _, e := range excluded {

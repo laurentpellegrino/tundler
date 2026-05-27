@@ -132,11 +132,11 @@ RUN apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
 # tundler-tunnel exposes:
-#   :4242 — HTTP API (/livez, /readyz, /status, /rotate) — consumed by
-#           k8s probes and by tundler-fleet-controller's rotation forwarder
-# Loopback-only ports NOT declared (they're not reachable from outside):
-#   :18000 — xDS gRPC (consumed by the sibling envoy container)
-EXPOSE 4242/tcp
+#   :4242 — HTTP API (/livez, /readyz, /status, /rotate) — consumed
+#           by k8s probes and by crawler slots POSTing /rotate
+#   :8485 — in-process CONNECT proxy — consumed by the crawler's
+#           pinned WebClient (slot-based routing)
+EXPOSE 4242/tcp 8485/tcp
 
 VOLUME ["/sys/fs/cgroup"]
 STOPSIGNAL SIGRTMIN+3
