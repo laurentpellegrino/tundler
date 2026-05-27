@@ -1,42 +1,40 @@
 name: Update ProtonVPN servers
 
-# Refreshes internal/provider/protonvpn/servers.json by authenticating
-# against ProtonVPN's account API (SRP v4) and fetching /vpn/v1/logicals.
-# Runs daily; commits the file into main if (and only if) the resulting
-# JSON differs from what's currently committed.
+# Refreshes the `protonvpn-servers` GH release asset (servers.json)
+# by authenticating against ProtonVPN's account API (SRP v4 via
+# OpenBao-supplied creds) over a Cloudflare WARP-routed egress and
+# fetching /vpn/v1/logicals. The tundler-protonvpn image build
+# downloads from that release at image-build time and drops it at
+# /etc/protonvpn/servers.json (read by the runtime provider).
 #
-# The runtime tunnel binary does NOT call the Proton account API — it
-# only reads the embedded servers.json. Keeping the SRP code out of
-# production minimises blast radius if Proton changes their auth flow:
-# this workflow fails loudly here, in CI, rather than silently
-# breaking tunnel pods at runtime.
+# Architecture rationale:
+#   - WARP routes the runner's egress so api.proton.me's anti-
+#     abuse scoring (which clamps the GitHub Actions runner IP
+#     range with frequent CAPTCHA challenges) gets a cleaner
+#     source IP.
+#   - Publishing to a GH release (vs committing servers.json to
+#     git) keeps the ~2 MB JSON out of repo history and out of
+#     every non-proton image.
+#   - SRP code stays out of production — auth happens here only,
+#     not on the tunnel pods.
 #
-# Security: no untrusted input is interpolated into any run: step.
-# The only external inputs are the two OpenBao secrets, which are
-# passed through env (not string interpolation).
-#
-# Auth: vault-action exchanges this workflow's GitHub OIDC token for
-# a short-lived OpenBao token via the `tundler` role configured in
-# the `lpellegr` namespace. Role + narrow-scope policy are managed
-# by elaunira-openbao/scripts/configure-github-jwt.sh — see
-# PERSONAL_ROLES["lpellegr|tundler"] there.
-#
-# Audience matches the repo owner (laurentpellegrino) because GH's
-# actions-run-service only issues ID tokens with audiences that match
-# the runner's GitHub owner — `https://github.com/ipregistry` is
-# rejected for repos outside that org.
+# Auth: vault-action exchanges this workflow's GitHub OIDC token
+# for a short-lived OpenBao token via the `tundler` role configured
+# in the `lpellegr` namespace. Role + narrow-scope policy are
+# managed by elaunira-openbao/scripts/configure-github-jwt.sh —
+# PERSONAL_ROLES["lpellegr|tundler"].
 
 on:
   schedule:
-    # 06:00 UTC daily — well after Proton's nightly catalog churn but
-    # early enough that any downstream image rebuild lands before
-    # business hours in EU/US.
+    # 06:00 UTC daily — well after Proton's nightly catalog churn
+    # but early enough that any downstream image rebuild lands
+    # before business hours in EU/US.
     - cron: '0 6 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write   # commit the regenerated servers.json
-  id-token: write   # required for vault-action JWT auth
+  contents: write   # upload to the GH release
+  id-token: write   # for vault-action JWT auth
 
 concurrency:
   group: update-proton-servers
@@ -46,11 +44,11 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      RELEASE_TAG: protonvpn-servers
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -58,12 +56,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Route outbound through Cloudflare WARP. Proton's anti-abuse
-      # heuristics on /core/v4/auth include source-IP scoring (the
-      # GitHub Actions runner pool is on a documented bot-flagged
-      # range), so a clean Cloudflare-network egress avoids the
-      # CAPTCHA challenge that otherwise blocks the SRP submit
-      # after a few attempts.
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
 
@@ -82,22 +74,45 @@ jobs:
 
       - name: Run proton-updater
         run: |
-          mkdir -p internal/provider/protonvpn
-          go run ./cmd/proton-updater \
-            > internal/provider/protonvpn/servers.json.new
-          python3 -c "import json; json.load(open('internal/provider/protonvpn/servers.json.new'))"
-          mv internal/provider/protonvpn/servers.json.new \
-             internal/provider/protonvpn/servers.json
+          set -euo pipefail
+          go run ./cmd/proton-updater > /tmp/fresh.json
+          # Validate it's actual JSON (catches HTML 4xx pages /
+          # Proton "please complete CAPTCHA" responses if the
+          # updater somehow returns 0 anyway).
+          python3 -c "import json; d=json.load(open('/tmp/fresh.json')); assert d.get('protonvpn', {}).get('servers'), 'no servers in response'; print(f'fetched {len(d[\"protonvpn\"][\"servers\"])} server entries')"
 
-      - name: Commit changes
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add internal/provider/protonvpn/servers.json
-          if git diff --staged --quiet; then
-            echo "ProtonVPN servers.json unchanged; skipping commit."
-            exit 0
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern servers.json --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/fresh.json | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/servers.json | awk '{print $1}')
+            if [[ "$FRESH_SUM" == "$CURR_SUM" ]]; then
+              echo "Servers unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Servers changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-          SUMMARY=$(python3 -c "import json; d=json.load(open('internal/provider/protonvpn/servers.json'))['protonvpn']['servers']; countries=sorted({s['country'] for s in d}); print(f'{len(d)} servers across {len(countries)} countries')")
-          git commit -m "protonvpn: refresh embedded servers.json ($SUMMARY)"
-          git push origin main
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "ProtonVPN server catalog (api.proton.me mirror)" \
+                --notes "Daily mirror of api.proton.me/vpn/v1/logicals. See update-proton-servers.yml."
+          mv /tmp/fresh.json /tmp/servers.json
+          gh release upload "$RELEASE_TAG" /tmp/servers.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} servers.json"

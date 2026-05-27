@@ -14,15 +14,28 @@
 
 # ----------------------------------------------------------------------
 # Build stage — compile tundler-tunnel
+#
+# The binary links ONLY the provider that matches the build arg:
+# each provider has a tagged register file
+# (internal/provider/register/register_<name>.go with
+# //go:build provider_<name>) and we pass `-tags provider_${PROVIDER}`
+# so only that provider's blank-import fires. This keeps the
+# provider's go:embed'd data (e.g. protonvpn's servers.json) out of
+# every OTHER provider's image.
 # ----------------------------------------------------------------------
 FROM golang:1.25 AS builder
 WORKDIR /build
+ARG PROVIDER
+RUN if [ -z "${PROVIDER}" ]; then \
+        echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
+    fi
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags "-s -w" \
+    -tags "provider_${PROVIDER}" \
     -o tundler-tunnel ./cmd/tundler-tunnel
 
 # ----------------------------------------------------------------------
@@ -69,21 +82,15 @@ RUN rm -f /usr/sbin/policy-rc.d
 # in pod boot logs.
 RUN mkdir -p /etc/selinux && echo 'SELINUX=disabled' > /etc/selinux/config
 
-# Provider install scripts are shared with the legacy image — we only
-# run the one for the requested PROVIDER and drop the rest.
-COPY docker/providers /opt/providers
-RUN chmod +x /opt/providers/*/install.sh
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN set -euo pipefail && \
-    for dir in /opt/providers/*; do \
-        p="$(basename "$dir")"; \
-        if [[ "$p" == "${PROVIDER}" ]]; then \
-            bash "$dir/install.sh"; \
-        else \
-            rm -rf "$dir"; \
-        fi; \
-    done
+# COPY only the active provider's directory so per-image layers
+# don't accumulate the other providers' install scripts + bundled
+# data (e.g. ipvanish's ~1 MB configs.zip would otherwise sit in
+# every image's intermediate layer even after a rm -rf in a later
+# step — Docker layer accounting includes additions even when
+# subsequent layers delete them).
+COPY docker/providers/${PROVIDER}/ /opt/providers/${PROVIDER}/
+RUN chmod +x /opt/providers/${PROVIDER}/install.sh && \
+    bash /opt/providers/${PROVIDER}/install.sh
 
 # Copy the tundler-tunnel binary + the per-pod systemd unit + shared
 # scripts.

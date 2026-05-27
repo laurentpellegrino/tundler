@@ -61,10 +61,11 @@ func resetTestState(t *testing.T) {
 	activeMu.Unlock()
 }
 
-// useTestServers swaps the embedded catalog for a deterministic test
-// fixture, restoring the real bytes on test cleanup. Combined with
-// resetTestState's cache reset, this gives each test a fresh, known
-// server set.
+// useTestServers stuffs the embedded-catalog package var with a
+// deterministic test fixture. Because fetchServers() only reads
+// from disk when embeddedServers is nil, this bypasses the disk
+// load entirely — tests don't need a /etc/protonvpn/servers.json
+// file to exist. Cleared on test cleanup.
 func useTestServers(t *testing.T) {
 	t.Helper()
 	original := embeddedServers
