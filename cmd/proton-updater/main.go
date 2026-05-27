@@ -30,8 +30,16 @@ import (
 	"strings"
 )
 
-// outputServer is the JSON shape the tunnel-side provider parses
-// (gluetun-compatible, kept identical to avoid touching the parser).
+// outputServer is the JSON shape the tunnel-side provider parses.
+// `features` is the Proton API's Features bitfield, propagated so
+// the runtime can filter the catalog to a subset (e.g. SecureCore
+// only, when ipinfo.io's blanket-block on Proton's commodity exit
+// IPs makes the default tier unusable). Bit layout per Proton:
+//
+//	1 = SecureCore
+//	2 = Tor
+//	4 = P2P
+//	8 = Stream
 type outputServer struct {
 	VPN        string   `json:"vpn"`
 	Country    string   `json:"country"`
@@ -42,6 +50,8 @@ type outputServer struct {
 	TCP        bool     `json:"tcp"`
 	UDP        bool     `json:"udp"`
 	IPs        []string `json:"ips"`
+	Features   int      `json:"features"`
+	Tier       int      `json:"tier"`
 }
 
 type outputFile struct {
@@ -131,6 +141,10 @@ func transform(data *logicalsResponse) []outputServer {
 		city := strings.TrimSpace(ls.City)
 		logicalName := strings.TrimSpace(ls.Name)
 
+		tier := 0
+		if ls.Tier != nil {
+			tier = *ls.Tier
+		}
 		for _, ps := range ls.Servers {
 			if ps.Status == 0 {
 				continue // disabled — skip
@@ -154,6 +168,8 @@ func transform(data *logicalsResponse) []outputServer {
 				TCP:        true,
 				UDP:        true,
 				IPs:        ips,
+				Features:   ls.Features,
+				Tier:       tier,
 			})
 		}
 	}

@@ -46,7 +46,20 @@ type protonServer struct {
 	TCP        bool     `json:"tcp"`
 	UDP        bool     `json:"udp"`
 	IPs        []string `json:"ips"`
+	// Features is the Proton API bitfield: 1=SecureCore, 2=Tor,
+	// 4=P2P, 8=Stream. Used by the PROTON_FEATURE_FILTER env to
+	// restrict the connect-time pool to a subset of tiers.
+	Features int `json:"features"`
+	Tier     int `json:"tier"`
 }
+
+// Feature-bit constants. Mirror the proton-updater main.go layout.
+const (
+	featureSecureCore = 1
+	featureTor        = 2
+	featureP2P        = 4
+	featureStream     = 8
+)
 
 type serversFile struct {
 	ProtonVPN struct {
@@ -111,6 +124,42 @@ func configDir() string {
 	return defaultConfigDir
 }
 
+// requiredFeatureMask reads PROTON_FEATURE_FILTER (CSV of feature
+// names: securecore, tor, p2p, stream) and ORs the corresponding
+// bits. A server is kept iff every bit in this mask is also set on
+// its Features field. Returns 0 (no filter) when the env var is
+// empty or unset.
+//
+// Used to restrict the connect-time pool to a subset of Proton's
+// tiers. The motivating case: ipinfo.io blanket-blocks Proton's
+// commodity OpenVPN exit IPs (which live in ~10 dense /16s); Proton
+// SecureCore exits route through Proton-owned datacenters in IS/SE/
+// CH and use a separate, smaller IP pool that may not be on the
+// same blocklist. Operators flip this via the StatefulSet env spec
+// without a code change.
+func requiredFeatureMask() int {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("PROTON_FEATURE_FILTER")))
+	if raw == "" {
+		return 0
+	}
+	mask := 0
+	for _, name := range strings.Split(raw, ",") {
+		switch strings.TrimSpace(name) {
+		case "securecore", "secure-core", "secure_core":
+			mask |= featureSecureCore
+		case "tor":
+			mask |= featureTor
+		case "p2p":
+			mask |= featureP2P
+		case "stream":
+			mask |= featureStream
+		default:
+			shared.Debugf("ProtonVPN: PROTON_FEATURE_FILTER token %q not recognized; ignoring", name)
+		}
+	}
+	return mask
+}
+
 // fetchServers returns the protocol-filtered ProtonVPN OpenVPN server
 // list from the embedded catalog. Result is cached for the process
 // lifetime — there's nothing dynamic to invalidate at runtime, the
@@ -132,9 +181,13 @@ func fetchServers(_ context.Context) ([]protonServer, error) {
 	}
 
 	proto := getProtocol()
+	requiredMask := requiredFeatureMask()
 	servers := make([]protonServer, 0, len(parsed.ProtonVPN.Servers))
 	for _, srv := range parsed.ProtonVPN.Servers {
 		if srv.VPN != "openvpn" || srv.Hostname == "" {
+			continue
+		}
+		if requiredMask != 0 && srv.Features&requiredMask != requiredMask {
 			continue
 		}
 		if proto == "udp" && !srv.UDP {
@@ -150,7 +203,11 @@ func fetchServers(_ context.Context) ([]protonServer, error) {
 		return nil, serverCacheErr
 	}
 	serverCache = servers
-	shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog", len(servers))
+	if requiredMask != 0 {
+		shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog (feature filter mask=%d)", len(servers), requiredMask)
+	} else {
+		shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog", len(servers))
+	}
 	return append([]protonServer(nil), serverCache...), nil
 }
 
