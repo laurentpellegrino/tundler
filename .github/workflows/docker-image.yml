@@ -4,6 +4,17 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+  schedule:
+    # Daily rebuild at 07:00 UTC. Two reasons:
+    # 1. Pick up upstream base-image security updates without needing
+    #    a code-change push.
+    # 2. Re-bake the protonvpn image with the freshest embedded
+    #    servers.json. The update-proton-servers workflow runs at
+    #    06:00 UTC and (when content changed) commits to main, which
+    #    already triggers this workflow via the push branch; the
+    #    schedule keeps the image current on days where the catalog
+    #    is unchanged.
+    - cron: '0 7 * * *'
 
 permissions:
   contents: read
