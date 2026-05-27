@@ -276,9 +276,10 @@ PersistentKeepalive = 25
 // isOpenVPNConnected checks if OpenVPN tunnel is routable inside VPN namespace.
 // Checking routes (not just link UP) ensures OpenVPN has finished setup —
 // the tun0 link comes up before routes are added, causing a race where
-// traffic fails if we start crawling too early.
+// traffic fails if we start crawling too early. Uses RunCmdSilent so the
+// connect-poll loop doesn't flood journald while waiting for tun0.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmd(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
 	if err != nil {
 		return false
 	}

@@ -80,6 +80,25 @@ func RunCmd(ctx context.Context, name string, args ...string) (string, error) {
 	return out, err
 }
 
+// RunCmdSilent is RunCmd but without the per-call Debugf logging.
+// Use this for inside-the-hot-path polling commands — e.g. the
+// `ip route show dev tun0` loop the OpenVPN providers run while
+// waiting for the tunnel to come up. Each poll otherwise logs
+// "Cannot find device tun0" + "exit status 1" via Debugf at ~2 Hz,
+// flooding journald and burying the real connect-failure messages.
+// Still applies the bounded-output sink + netns wrapping so the
+// runtime behavior matches RunCmd in every other respect.
+func RunCmdSilent(ctx context.Context, name string, args ...string) (string, error) {
+	name, args = withNetNS(name, args)
+	var buf bytes.Buffer
+	sink := newBoundedSink(&buf)
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = sink
+	cmd.Stderr = sink
+	err := cmd.Run()
+	return strings.TrimSpace(buf.String()), err
+}
+
 // RunCmdDirect runs a command without network namespace wrapping.
 // Use this for CLIs that need host network access (e.g., surfshark-vpn).
 func RunCmdDirect(ctx context.Context, name string, args ...string) (string, error) {
