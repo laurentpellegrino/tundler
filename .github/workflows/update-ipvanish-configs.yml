@@ -1,35 +1,31 @@
 name: Update IPVanish configs
 
-# Refreshes the `ipvanish-configs` release asset (configs.zip) by
-# pulling it daily from configs.ipvanish.com via Cloudflare WARP.
-# Each tundler-ipvanish image build (docker-image.yml) downloads
-# from that release at build time and bakes the .ovpn files into
-# the image, so a fresh release here means the next daily image
-# rebuild ships the current server list.
+# Refreshes docker/providers/ipvanish/configs.zip by pulling it
+# daily from configs.ipvanish.com via Cloudflare WARP. Commits the
+# updated file directly to main when content changed; the next
+# docker-image.yml rebuild (07:00 UTC daily, or on push) bakes
+# the new server list into the tundler-ipvanish image.
 #
-# Why WARP: configs.ipvanish.com sits behind Cloudflare and 403s
-# many cloud/datacenter egress IPs — in particular the GitHub
-# Actions runner pool. Routing the runner's egress through
-# Cloudflare WARP (free consumer tier) makes the outbound IP
-# appear as Cloudflare's own network, which Cloudflare's bot
-# heuristics naturally don't block. No account / Zero Trust
-# enrolment needed.
+# Why WARP: configs.ipvanish.com sits behind Cloudflare bot-
+# protection that 403s GitHub Actions runner IPs. The composite
+# action setup-cloudflare-warp routes the runner's outbound IP
+# through Cloudflare's own network so the request is whitelisted.
 #
-# Security: only external input is the configs.zip URL. The
-# downloaded archive is validated via `unzip -t` + a minimum
-# .ovpn entry count before being uploaded — guards against
-# accepting a Cloudflare interstitial HTML page or empty file
-# as if it were configs.zip.
+# Security: the only external input is the configs.zip URL. The
+# archive is validated (`unzip -t` + minimum-entry-count guard)
+# before being committed — protects against accepting a
+# Cloudflare interstitial or empty file as if it were configs.
 
 on:
   schedule:
-    # 05:00 UTC daily — earlier than the docker-image rebuild at
-    # 07:00 UTC so the image picks up any new release the same day.
+    # 05:00 UTC daily — earlier than the docker-image 07:00 UTC
+    # rebuild so a content change here triggers a same-day image
+    # build (via the auto-trigger on push to main).
     - cron: '0 5 * * *'
   workflow_dispatch:
 
 permissions:
-  contents: write   # required to upload the release asset
+  contents: write   # commit the regenerated configs.zip
 
 concurrency:
   group: update-ipvanish-configs
@@ -41,45 +37,26 @@ jobs:
     timeout-minutes: 12
     env:
       CONFIGS_URL: https://configs.ipvanish.com/configs/configs.zip
-      RELEASE_TAG: ipvanish-configs
+      REPO_PATH: docker/providers/ipvanish/configs.zip
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install + connect Cloudflare WARP
-        run: |
-          set -euo pipefail
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-            | sudo gpg --yes --dearmor \
-                --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" \
-            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
-          sudo apt-get -qq update
-          sudo apt-get -qq install -y cloudflare-warp
-          sudo warp-cli --accept-tos registration new
-          sudo warp-cli --accept-tos mode warp
-          sudo warp-cli --accept-tos connect
-          # Block until traffic is actually flowing through WARP.
-          for i in $(seq 1 30); do
-            if curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -q '^warp=on'; then
-              echo "WARP connected"
-              break
-            fi
-            sleep 2
-          done
-          curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp|h|colo)='
+      - name: Setup Cloudflare WARP
+        uses: ./.github/actions/setup-cloudflare-warp
 
-      - name: Download fresh configs.zip via WARP
+      - name: Download + validate fresh configs.zip
         run: |
           set -euo pipefail
           curl -fsSL --max-time 120 "$CONFIGS_URL" -o /tmp/fresh.zip
-          # Reject Cloudflare interstitials / HTML pages dressed up
-          # as configs.zip. `unzip -t` exits non-zero on anything
-          # that isn't a valid zip stream.
+          # Reject Cloudflare interstitials / HTML pages dressed
+          # up as configs.zip. `unzip -t` exits non-zero on
+          # anything that isn't a valid zip stream.
           unzip -tq /tmp/fresh.zip
-          # Sanity-check that the archive actually contains .ovpn
-          # files — protects against a future server-side change
-          # that returns a valid zip with the wrong contents.
+          # Sanity-check that the archive contains a credible
+          # number of .ovpn entries.
           COUNT=$(unzip -l /tmp/fresh.zip 'ipvanish-*.ovpn' 2>/dev/null \
                   | awk '/[0-9]+ files?$/ {print $1}')
           if [[ -z "$COUNT" ]] || [[ "$COUNT" -lt 100 ]]; then
@@ -88,37 +65,21 @@ jobs:
           fi
           echo "Fresh configs.zip: $COUNT server configs"
 
-      - name: Skip when checksum matches current release
-        id: skip
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit if content changed
         run: |
           set -euo pipefail
-          if gh release download "$RELEASE_TAG" --pattern configs.zip --dir /tmp/current 2>/dev/null; then
-            FRESH_SUM=$(sha256sum /tmp/fresh.zip | awk '{print $1}')
-            CURR_SUM=$(sha256sum /tmp/current/configs.zip | awk '{print $1}')
-            if [[ "$FRESH_SUM" == "$CURR_SUM" ]]; then
-              echo "Configs unchanged (sha256 match); nothing to publish."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "Configs changed: $CURR_SUM → $FRESH_SUM"
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "No existing release asset yet; publishing initial."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+          mkdir -p "$(dirname "$REPO_PATH")"
+          mv /tmp/fresh.zip "$REPO_PATH"
+          if git diff --quiet -- "$REPO_PATH"; then
+            echo "configs.zip unchanged; nothing to commit."
+            exit 0
           fi
-
-      - name: Upload to release
-        if: steps.skip.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          gh release upload "$RELEASE_TAG" /tmp/fresh.zip --clobber --repo "$GITHUB_REPOSITORY"
-          echo "::notice::Refreshed ${RELEASE_TAG} configs.zip"
-
-      - name: Disconnect WARP
-        if: always()
-        run: |
-          sudo warp-cli --accept-tos disconnect || true
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$REPO_PATH"
+          # Diff stat is unhelpful for binary archives; include the
+          # entry count instead so the log line stays informative.
+          ENTRIES=$(unzip -l "$REPO_PATH" 'ipvanish-*.ovpn' 2>/dev/null \
+                    | awk '/[0-9]+ files?$/ {print $1}')
+          git commit -m "ipvanish: refresh baked configs.zip (${ENTRIES} servers)"
+          git push origin main

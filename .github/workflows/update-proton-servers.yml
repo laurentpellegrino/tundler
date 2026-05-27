@@ -58,6 +58,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Route outbound through Cloudflare WARP. Proton's anti-abuse
+      # heuristics on /core/v4/auth include source-IP scoring (the
+      # GitHub Actions runner pool is on a documented bot-flagged
+      # range), so a clean Cloudflare-network egress avoids the
+      # CAPTCHA challenge that otherwise blocks the SRP submit
+      # after a few attempts.
+      - name: Setup Cloudflare WARP
+        uses: ./.github/actions/setup-cloudflare-warp
+
       - name: Fetch ProtonVPN account credentials from OpenBao
         uses: hashicorp/vault-action@v3
         with:
