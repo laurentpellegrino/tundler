@@ -231,27 +231,6 @@ import _ "github.com/laurentpellegrino/tundler/internal/provider/<your_provider>
 
 5. Document new environment variables in this README.
 
-## Injecting Sidecar Plugins
-
-Provider integrations remain the core extension point for tunnel control. If you
-need extra features that should not affect that core API, add a plugin instead:
-
-1. Create `internal/plugin/<your_plugin>`.
-2. Implement the `internal/plugin`.Plugin interface.
-3. Register it in `init()` by adding it to `plugin.Registry`.
-4. Add a blank import in `internal/plugin/register/register.go`.
-
-Plugins are isolated in two ways:
-
-- They only receive tunnel lifecycle events after Tundler has already connected or disconnected.
-- Their HTTP handlers live under `/plugins/<id>/...`, separate from the main API.
-
-Plugin metadata and events:
-
-- Every plugin must expose a stable `id` and a human-readable `name`.
-- Plugins receive `connected` and `disconnected` events.
-- Event payloads include `provider`, `location`, `region` when available, `ip`, and `timestamp`.
-
 ## Contributing
 
 Pull requests are welcome.

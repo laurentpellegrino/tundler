@@ -228,13 +228,11 @@ func main() {
 	wedgeThreshold := time.Duration(getEnvInt(envWedgeGuardSec, defaultWedgeGuardSec)) * time.Second
 	go runWedgeGuard(ctx, state, wedgeThreshold)
 
-	// Self-monitor (Trigger C, envoy-admin-driven) was removed when
-	// envoy was retired. The crawler's slot-level AIMD + per-tunnel
-	// 429 tracking now drives proactive rotation: when a slot sees
-	// sustained 429s it POSTs /rotate on the fleet-controller, which
-	// fans out to the affected tundler-tunnel's /rotate. Same
-	// triggerRotation flow as before, just sourced from the crawler
-	// side where the actual upstream-response visibility lives.
+	// Rotation is now exclusively driven by the crawler: each slot
+	// tracks AIMD + per-tunnel 429s and, on sustained throttling,
+	// POSTs /rotate directly to this pod via the headless-service
+	// DNS. The triggerRotation handler below is the same in-process
+	// flow that scheduled rotations use.
 	_ = triggerRotation // referenced by /rotate handler in startServer
 
 	rotationDesc := fmt.Sprintf("[%s..%s]", minRotation, maxRotation)

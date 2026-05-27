@@ -11,8 +11,7 @@ import (
 // Extracted as a pure function so the jitter distribution can be unit-tested
 // without sleeping: the test calls pickJitter(60) 100× and checks the
 // standard deviation is wide enough to spread a fleet of pods boot-logging
-// at the same provider auth API (see Decision Q9 + the "Boot-login jitter"
-// subsection of architecture-tundler-fleet-controller.md).
+// at the same provider auth API.
 func pickJitter(maxSeconds int) time.Duration {
 	if maxSeconds <= 0 {
 		return 0

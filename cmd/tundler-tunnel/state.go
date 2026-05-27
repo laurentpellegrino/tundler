@@ -190,9 +190,9 @@ func (s *StateTracker) Snapshot() Snapshot {
 	return snap
 }
 
-// Snapshot is the JSON shape returned by /status. Field tags + omitempty
-// rules match the schema documented in
-// architecture-tundler-fleet-controller.md.
+// Snapshot is the JSON shape returned by /status. Field tags +
+// omitempty rules: a slot consumer (crawler / leak detector) reads
+// these to introspect the tunnel's current state.
 type Snapshot struct {
 	State                        State           `json:"state"`
 	Provider                     string          `json:"provider"`
