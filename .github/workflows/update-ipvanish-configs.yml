@@ -52,11 +52,11 @@ jobs:
       - name: Download + validate fresh configs.zip
         run: |
           set -euo pipefail
-          curl -fsSL --max-time 120 "$CONFIGS_URL" -o /tmp/fresh.zip
+          curl -fsSL --max-time 120 "$CONFIGS_URL" -o /tmp/configs.zip
           # Reject Cloudflare interstitials / HTML pages dressed
           # up as configs.zip.
-          unzip -tq /tmp/fresh.zip
-          COUNT=$(unzip -l /tmp/fresh.zip 'ipvanish-*.ovpn' 2>/dev/null \
+          unzip -tq /tmp/configs.zip
+          COUNT=$(unzip -l /tmp/configs.zip 'ipvanish-*.ovpn' 2>/dev/null \
                   | awk '/[0-9]+ files?$/ {print $1}')
           if [[ -z "$COUNT" ]] || [[ "$COUNT" -lt 100 ]]; then
             echo "::error::Fresh configs.zip only contains ${COUNT:-0} ipvanish-*.ovpn entries; refusing to publish"
@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           if gh release download "$RELEASE_TAG" --pattern configs.zip --dir /tmp/current 2>/dev/null; then
-            FRESH_SUM=$(sha256sum /tmp/fresh.zip | awk '{print $1}')
+            FRESH_SUM=$(sha256sum /tmp/configs.zip | awk '{print $1}')
             CURR_SUM=$(sha256sum /tmp/current/configs.zip | awk '{print $1}')
             if [[ "$FRESH_SUM" == "$CURR_SUM" ]]; then
               echo "Configs unchanged (sha256 match); nothing to publish."
@@ -97,5 +97,5 @@ jobs:
                 --repo "$GITHUB_REPOSITORY" \
                 --title "IPVanish OpenVPN configs (mirror)" \
                 --notes "Daily mirror of configs.ipvanish.com/configs/configs.zip. See update-ipvanish-configs.yml."
-          gh release upload "$RELEASE_TAG" /tmp/fresh.zip --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" /tmp/configs.zip --clobber --repo "$GITHUB_REPOSITORY"
           echo "::notice::Refreshed ${RELEASE_TAG} configs.zip"
