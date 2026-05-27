@@ -205,8 +205,15 @@ func writeActiveConfig(server *ipvanishServer, credentialsFile string) (string, 
 	return dst, nil
 }
 
+// isOpenVPNConnected returns true once openvpn has finished tunnel
+// setup — checking the route table (not just link UP) because
+// OpenVPN brings the link up before pushing routes, and we want to
+// match the post-route point at which traffic can actually flow.
+// Uses RunCmdSilent so the connect-poll loop (60 iterations × 500ms)
+// doesn't swamp journald with "Cannot find device tun0" / exit-1
+// messages while the tunnel is still coming up.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmd(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
