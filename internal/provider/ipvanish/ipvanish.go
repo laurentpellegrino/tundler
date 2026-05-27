@@ -50,11 +50,31 @@ var (
 	// credentials file instead of prompting interactively.
 	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
 
-	// IPVanish configs still carry directives OpenVPN 2.6 either rejects
-	// outright (keysize) or warns about as insecure (comp-lzo enables
-	// receive-side compression, which underlies the VORACLE attack). Strip
-	// both so the daemon starts and compression stays off.
-	deprecatedDirectivesRe = regexp.MustCompile(`(?m)^(keysize|comp-lzo)\b.*$`)
+	// IPVanish configs still carry directives OpenVPN 2.6 / OpenSSL 3
+	// either reject outright or that silently break the handshake:
+	//
+	//   keysize        — removed from OpenVPN 2.6, the daemon refuses
+	//                    to start with it present.
+	//   comp-lzo       — enables receive-side compression (the VORACLE
+	//                    attack vector); OpenVPN 2.6 warns but starts.
+	//   cipher AES-…   — IPVanish ships `cipher AES-256-CBC`. OpenVPN
+	//                    2.6 ignores --cipher for the data channel
+	//                    (it negotiates via --data-ciphers NCP instead)
+	//                    and only emits a DEPRECATED-OPTION warning,
+	//                    so this is purely log noise. Stripped to
+	//                    quiet the boot logs.
+	//   tls-cipher …   — THE invisible-failure directive. IPVanish
+	//                    pins the TLS control-channel cipher to three
+	//                    TLS_*_CBC_SHA suites that OpenSSL 3 disables
+	//                    at SecLevel=2 (SHA-1 MAC, no PFS, etc.).
+	//                    Result: OpenSSL has no cipher to offer, no
+	//                    TLS Client Hello is ever sent, the server
+	//                    hears silence — looks identical to an IP
+	//                    block from our side. Stripping the directive
+	//                    lets OpenSSL use its modern default cipher
+	//                    list (TLS_AES_256_GCM_SHA384 et al.) and
+	//                    the handshake actually proceeds.
+	deprecatedDirectivesRe = regexp.MustCompile(`(?m)^(keysize|comp-lzo|cipher|tls-cipher)\b.*$`)
 )
 
 func init() { provider.Registry[name] = IPVanish{} }
