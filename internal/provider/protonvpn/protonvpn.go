@@ -273,11 +273,14 @@ func pickRandomServer(servers []protonServer) *protonServer {
 }
 
 // isOpenVPNConnected returns true once openvpn has finished tunnel
-// setup (link UP + routes pushed). Uses RunCmdSilent so the connect-
-// poll loop doesn't spam journald with "Cannot find device tun0"
-// while the tunnel is still coming up.
+// setup (link UP + routes pushed). Looks in MAIN namespace (not
+// vpnns) because openvpn is launched via RunCmdDirect — see the
+// comment at the openvpn spawn site in connectOpenVPN. Uses the
+// silent variant so the connect-poll loop doesn't spam journald
+// with "Cannot find device tun0" while the tunnel is still coming
+// up.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilentDirect(context.Background(), "ip", "route", "show", "dev", "tun0")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
@@ -340,7 +343,17 @@ func connectOpenVPN(ctx context.Context, server *protonServer) error {
 		return fmt.Errorf("failed to write ProtonVPN config: %w", err)
 	}
 
-	if _, err := shared.RunCmd(ctx, "openvpn", "--config", configFile, "--daemon"); err != nil {
+	// RunCmdDirect (not RunCmd) so openvpn — and the tun0 it
+	// creates — land in the pod's MAIN network namespace. The
+	// in-process CONNECT proxy in tundler-tunnel dials upstream
+	// with a plain net.DialTimeout (no fwmark), so the only way
+	// proxy traffic flows through the VPN is if tun0 is the
+	// main-ns default route. `shared.RunCmd` wraps under
+	// `ip netns exec vpnns` because the systemd unit sets
+	// TUNDLER_NETNS=vpnns — that would put tun0 in vpnns where
+	// the proxy can't reach it, and the proxy would then leak
+	// crawler traffic out the pod's node IP.
+	if _, err := shared.RunCmdDirect(ctx, "openvpn", "--config", configFile, "--daemon"); err != nil {
 		return fmt.Errorf("failed to start ProtonVPN OpenVPN: %w", err)
 	}
 
@@ -360,7 +373,9 @@ func (p ProtonVPN) Connected(ctx context.Context) bool {
 }
 
 func (p ProtonVPN) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
+	// Direct (no netns wrap) — matches the namespace openvpn was
+	// started in. Symmetry note same as ipvanish.go's Disconnect.
+	_, _ = shared.RunCmdDirect(ctx, "pkill", "-SIGTERM", "openvpn")
 	for i := 0; i < 20; i++ {
 		if !isOpenVPNConnected() {
 			break
