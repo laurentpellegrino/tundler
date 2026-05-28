@@ -292,13 +292,32 @@ func writeActiveConfig(dir string, server *cyberghostServer, caPath, certPath, k
 	return dst, nil
 }
 
-// isOpenVPNConnected returns true once openvpn has finished tunnel
-// setup. Looks in MAIN namespace — openvpn is launched there so the
-// in-process CONNECT proxy can reach tun0. Silent so the connect-
-// poll loop doesn't flood journald with "Cannot find device tun0".
+// isOpenVPNConnected returns true once the tunnel's redirect-gateway
+// push has actually taken effect — i.e. a route LOOKUP for an
+// arbitrary public address resolves via tun0, not via eth0. The
+// looser "any route on tun0 exists" variant we use elsewhere
+// returns true too early: openvpn installs the per-pod link-local
+// route (e.g. 10.2.4.0/24 dev tun0) BEFORE the redirect-gateway
+// default-eclipsing routes are pushed, so the exit-IP contract
+// probe in cmd/tundler-tunnel/egress.go would fire while the main-
+// ns default route is still via eth0 and flag a leak that doesn't
+// actually exist.
+//
+// `ip route get 8.8.8.8` returns the route the kernel would pick
+// for that dst RIGHT NOW; checking for " dev tun0 " in the output
+// confirms the tunnel is genuinely the path packets are taking.
+//
+// Same fix should be applied to ipvanish.go / protonvpn.go before
+// re-enabling those providers — they have the same race.
+//
+// 8.8.8.8 is a stable public-IPv4 destination; we don't actually
+// send a packet to it, this is purely a kernel route-table lookup.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
-	return err == nil && strings.TrimSpace(out) != ""
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, " dev tun0 ")
 }
 
 func (c CyberGhost) ActiveLocation(ctx context.Context) string {
