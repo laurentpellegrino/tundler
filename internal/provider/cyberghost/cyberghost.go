@@ -69,8 +69,22 @@ const (
 //go:embed ca.crt
 var embeddedCACert []byte
 
+// embeddedServers is the build-time-baked server list. Used ONLY as a
+// fallback when /etc/cyberghost/servers.json (the daily-refresh
+// overlay installed by docker/providers/cyberghost/install.sh) is
+// missing or unparseable. The on-disk file is the authoritative
+// source — it's refreshed daily by .github/workflows/update-
+// cyberghost-servers.yml and downloaded fresh at image build, so
+// a pod that boots on a 6-month-old image still gets a current
+// server list (its image-layer copy).
+//
 //go:embed servers.json
 var embeddedServers []byte
+
+// runtimeServersPath is where install.sh drops the daily-refreshed
+// list inside the image. Read at boot by loadServers(); takes
+// precedence over embeddedServers when present and parseable.
+const runtimeServersPath = "/etc/cyberghost/servers.json"
 
 type CyberGhost struct{}
 
@@ -174,15 +188,34 @@ func loadServers() ([]cyberghostServer, error) {
 		return append([]cyberghostServer(nil), serverCache...), nil
 	}
 
-	var servers []cyberghostServer
-	if err := json.Unmarshal(embeddedServers, &servers); err != nil {
-		return nil, fmt.Errorf("parse embedded servers.json: %w", err)
+	var (
+		servers []cyberghostServer
+		source  string
+	)
+	// Prefer the daily-refreshed overlay if it parses and has
+	// content. Any failure (missing file, malformed JSON, empty
+	// array) falls through to the embedded fallback rather than
+	// crash-looping the pod — a stale image is better than no
+	// servers at all.
+	if raw, err := os.ReadFile(runtimeServersPath); err == nil {
+		if jerr := json.Unmarshal(raw, &servers); jerr == nil && len(servers) > 0 {
+			source = runtimeServersPath
+		} else if jerr != nil {
+			shared.Debugf("CyberGhost: runtime %s unparseable (%v) — falling back to embedded", runtimeServersPath, jerr)
+			servers = nil
+		}
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("embedded servers.json is empty")
+		if err := json.Unmarshal(embeddedServers, &servers); err != nil {
+			return nil, fmt.Errorf("parse embedded servers.json: %w", err)
+		}
+		source = "embedded"
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("server list empty (both %s and embedded had no entries)", runtimeServersPath)
 	}
 	serverCache = servers
-	shared.Debugf("CyberGhost: loaded %d embedded servers", len(servers))
+	shared.Debugf("CyberGhost: loaded %d servers from %s", len(servers), source)
 	return append([]cyberghostServer(nil), servers...), nil
 }
 
