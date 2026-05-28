@@ -54,7 +54,7 @@ RUN if [ -z "${PROVIDER}" ]; then \
         echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
     fi && \
     case "${PROVIDER}" in \
-        expressvpn|ipvanish|mullvad|nordvpn|pia|protonvpn|surfshark|warp) ;; \
+        cyberghost|expressvpn|mullvad|nordvpn|pia|protonvpn|surfshark|warp) ;; \
         *) echo "ERROR: PROVIDER=${PROVIDER} not in allow-list" >&2; exit 1 ;; \
     esac
 
@@ -84,7 +84,7 @@ RUN mkdir -p /etc/selinux && echo 'SELINUX=disabled' > /etc/selinux/config
 
 # COPY only the active provider's directory so per-image layers
 # don't accumulate the other providers' install scripts + bundled
-# data (e.g. ipvanish's ~1 MB configs.zip would otherwise sit in
+# data (e.g. cyberghost's ~1 MB configs.zip would otherwise sit in
 # every image's intermediate layer even after a rm -rf in a later
 # step — Docker layer accounting includes additions even when
 # subsequent layers delete them).
@@ -114,9 +114,10 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
 # `expressvpnctl login`) which would otherwise sit timing out waiting
 # for a daemon that's not running.
 #
-# OpenVPN-based providers (ipvanish / protonvpn / surfshark) don't have
-# a separate daemon to enable — the Go binary spawns openvpn directly
-# at connect time. The `|| true` lines are no-ops for those images.
+# OpenVPN-based providers (cyberghost / protonvpn / surfshark) don't
+# have a separate daemon to enable — the Go binary spawns openvpn
+# directly at connect time. The `|| true` lines are no-ops for those
+# images.
 RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
