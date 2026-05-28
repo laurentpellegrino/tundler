@@ -262,8 +262,19 @@ PersistentKeepalive = 25
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 
-	// Start WireGuard inside VPN namespace
-	output, err := shared.RunCmd(ctx, "wg-quick", "up", configFile)
+	// Bring wg0 up in the MAIN network namespace (NOT vpnns).
+	// The in-process CONNECT proxy lives in main ns and dials
+	// upstream with a plain net.DialTimeout — no fwmark — so for
+	// proxy traffic to traverse the tunnel, wg0 has to be the
+	// main-ns default route. wg-quick's "suppress_prefixlength 0"
+	// + "not fwmark 51820 lookup 51820" rules make wg0 the de-facto
+	// main-ns default while keeping cluster CIDR (covered by the
+	// onlink 10.0.0.0/16 route installed at entrypoint) on eth0.
+	// This is the same model OpenVPN-daemon providers use
+	// (tun0 lives in main ns because the daemon does too).
+	// RunCmdDirect skips the `ip netns exec vpnns` wrap that
+	// systemd-Environment TUNDLER_NETNS=vpnns would otherwise add.
+	output, err := shared.RunCmdDirect(ctx, "wg-quick", "up", configFile)
 	if err != nil {
 		return fmt.Errorf("failed to start wireguard: %w: %s", err, output)
 	}
@@ -286,9 +297,13 @@ func isOpenVPNConnected() bool {
 	return len(out) > 0
 }
 
-// isWireGuardConnected checks if WireGuard tunnel is up inside VPN namespace
+// isWireGuardConnected checks if WireGuard tunnel is up in the main
+// network namespace. Connect() now brings wg0 up in main ns (see the
+// comment in connectWireGuard) so the check must look there too —
+// `wg show wg0` via RunCmd would `ip netns exec vpnns` into the wrong
+// namespace and report the tunnel as down.
 func isWireGuardConnected() bool {
-	out, err := shared.RunCmd(context.Background(), "wg", "show", "wg0")
+	out, err := shared.RunCmdDirect(context.Background(), "wg", "show", "wg0")
 	if err != nil {
 		return false
 	}
@@ -358,7 +373,11 @@ func (s Surfshark) Disconnect(ctx context.Context) error {
 	}
 
 	if proto == "wireguard" {
-		shared.RunCmd(ctx, "wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf")
+		// wg-quick down has to run in the same namespace where
+		// `up` ran (main ns — see connectWireGuard); otherwise it
+		// no-ops against an empty vpnns and leaks wg0 + the
+		// associated policy-routing rules across rotations.
+		shared.RunCmdDirect(ctx, "wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf")
 	} else {
 		shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
 		// Wait for process to terminate
