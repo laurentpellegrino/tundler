@@ -140,7 +140,7 @@ func (w WARP) Disconnect(ctx context.Context) error {
 // authoritative signal — `warp-cli status` says "Connected" before
 // traffic is actually flowing through the tunnel.
 func (w WARP) Connected(ctx context.Context) bool {
-	out, err := shared.RunCmdDirect(ctx, "curl", "-s", "--max-time", "3",
+	out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "3",
 		"https://www.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
 		return false
@@ -173,7 +173,7 @@ func (w WARP) ActiveLocation(ctx context.Context) string {
 
 // colo extracts the `colo=XXX` field from cloudflare's trace.
 func (w WARP) colo(ctx context.Context) string {
-	out, err := shared.RunCmdDirect(ctx, "curl", "-s", "--max-time", "3",
+	out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "3",
 		"https://www.cloudflare.com/cdn-cgi/trace")
 	if err != nil {
 		return ""
@@ -195,7 +195,7 @@ func (w WARP) Status(ctx context.Context) provider.Status {
 	if !w.Connected(ctx) {
 		return provider.Status{Connected: false, Provider: name}
 	}
-	ip, _ := shared.RunCmdDirect(ctx, "curl", "-s", "--max-time", "3",
+	ip, _ := shared.RunCmd(ctx, "curl", "-s", "--max-time", "3",
 		"https://checkip.amazonaws.com")
 	return provider.Status{
 		Connected: true,

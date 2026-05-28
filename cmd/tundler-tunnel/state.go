@@ -48,6 +48,20 @@ type StateTracker struct {
 	// wedge-guard goroutine owns the "stuck out of Ready" detection
 	// (see runWedgeGuard in main.go), not /livez.
 	lastReadyAt time.Time
+
+	// authFailuresTotal counts every Login() failure observed since
+	// process boot. Surfaced on /status so an aggregator (the crawler)
+	// can sum across the fleet and page when a single provider's
+	// counter spikes — that pattern is the canonical signature of
+	// either a credentials drift (OpenBao out of sync with the
+	// provider dashboard) or an account-level block (server-side
+	// rejection of valid creds, e.g. the IPVanish lockout we hit on
+	// 2026-05-28). Distinct from "Connect failures" because tunnel-
+	// build failures are noisy (transient network), whereas auth
+	// failures are nearly always operator-actionable.
+	authFailuresTotal     int
+	lastAuthFailureAt     time.Time
+	lastAuthFailureReason string
 }
 
 // RotationRecord is the JSON shape under `last_rotation` in /status.
@@ -180,6 +194,8 @@ func (s *StateTracker) Snapshot() Snapshot {
 		RotationCountTotal:           s.rotationCountTotal,
 		LastRotation:                 s.lastRotation,
 		BootLoginJitterActualSeconds: int(s.bootLoginJitterActual.Round(time.Second).Seconds()),
+		AuthFailuresTotal:            s.authFailuresTotal,
+		LastAuthFailureReason:        s.lastAuthFailureReason,
 	}
 	if !s.loggedInAt.IsZero() {
 		snap.LoggedInAt = s.loggedInAt.Format(time.RFC3339)
@@ -187,7 +203,27 @@ func (s *StateTracker) Snapshot() Snapshot {
 	if !s.tunnelConnectedAt.IsZero() {
 		snap.TunnelAgeSeconds = int(time.Since(s.tunnelConnectedAt).Round(time.Second).Seconds())
 	}
+	if !s.lastAuthFailureAt.IsZero() {
+		snap.LastAuthFailureAt = s.lastAuthFailureAt.Format(time.RFC3339)
+	}
 	return snap
+}
+
+// RecordAuthFailure bumps the auth-failure counter and stamps a
+// human-readable reason. Called from the Login-failure path; surfaces
+// on /status as auth_failures_total / last_auth_failure_at /
+// last_auth_failure_reason so an external aggregator can alert on
+// per-provider spikes. Reason is truncated to 256 bytes to keep
+// /status payloads bounded under pathological error strings.
+func (s *StateTracker) RecordAuthFailure(reason string) {
+	if len(reason) > 256 {
+		reason = reason[:256]
+	}
+	s.mu.Lock()
+	s.authFailuresTotal++
+	s.lastAuthFailureAt = time.Now().UTC()
+	s.lastAuthFailureReason = reason
+	s.mu.Unlock()
 }
 
 // Snapshot is the JSON shape returned by /status. Field tags +
@@ -204,4 +240,10 @@ type Snapshot struct {
 	LoggedInAt                   string          `json:"logged_in_at,omitempty"`
 	BootLoginJitterActualSeconds int             `json:"boot_login_jitter_actual_seconds"`
 	LastRotation                 *RotationRecord `json:"last_rotation,omitempty"`
+	// AuthFailuresTotal is the count of Login() rejections observed
+	// since this process started. Always present (zero-valued at
+	// boot) so an aggregator can poll without conditional branches.
+	AuthFailuresTotal     int    `json:"auth_failures_total"`
+	LastAuthFailureAt     string `json:"last_auth_failure_at,omitempty"`
+	LastAuthFailureReason string `json:"last_auth_failure_reason,omitempty"`
 }
