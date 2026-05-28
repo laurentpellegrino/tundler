@@ -272,9 +272,9 @@ PersistentKeepalive = 25
 	// onlink 10.0.0.0/16 route installed at entrypoint) on eth0.
 	// This is the same model OpenVPN-daemon providers use
 	// (tun0 lives in main ns because the daemon does too).
-	// RunCmdDirect skips the `ip netns exec vpnns` wrap that
+	// RunCmd (the new default after the 2026-05-28 inversion) skips the `ip netns exec vpnns` wrap that
 	// systemd-Environment TUNDLER_NETNS=vpnns would otherwise add.
-	output, err := shared.RunCmdDirect(ctx, "wg-quick", "up", configFile)
+	output, err := shared.RunCmd(ctx, "wg-quick", "up", configFile)
 	if err != nil {
 		return fmt.Errorf("failed to start wireguard: %w: %s", err, output)
 	}
@@ -303,7 +303,7 @@ func isOpenVPNConnected() bool {
 // `wg show wg0` via RunCmd would `ip netns exec vpnns` into the wrong
 // namespace and report the tunnel as down.
 func isWireGuardConnected() bool {
-	out, err := shared.RunCmdDirect(context.Background(), "wg", "show", "wg0")
+	out, err := shared.RunCmd(context.Background(), "wg", "show", "wg0")
 	if err != nil {
 		return false
 	}
@@ -377,7 +377,7 @@ func (s Surfshark) Disconnect(ctx context.Context) error {
 		// `up` ran (main ns — see connectWireGuard); otherwise it
 		// no-ops against an empty vpnns and leaks wg0 + the
 		// associated policy-routing rules across rotations.
-		shared.RunCmdDirect(ctx, "wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf")
+		shared.RunCmd(ctx, "wg-quick", "down", "/etc/surfshark/wireguard/wg0.conf")
 	} else {
 		shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
 		// Wait for process to terminate

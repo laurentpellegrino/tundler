@@ -137,6 +137,22 @@ func main() {
 		proxySrv.SetExitIP(exitIP)
 	})
 
+	// Capture the pod's pre-VPN egress IP so the post-Connect contract
+	// check (verifyExitIPDiffers) has a baseline to compare against.
+	// Runs BEFORE the rotation closure is constructed (so the closure
+	// can capture it) and BEFORE Login/Connect (once the VPN tunnel
+	// is up, "what's our egress IP" is what we're trying to verify,
+	// not the baseline). A failed baseline probe is non-fatal: the
+	// contract check degrades to a no-op with a logged warning, so a
+	// cluster with strict pre-VPN egress restrictions still boots.
+	baselineEgressIP, err := probeEgressIP(ctx)
+	if err != nil {
+		log.Printf("tundler-tunnel: pre-VPN baseline egress probe failed: %v — exit-ip contract test disabled", err)
+		baselineEgressIP = ""
+	} else {
+		log.Printf("tundler-tunnel: pre-VPN baseline egress=%s", baselineEgressIP)
+	}
+
 	// /rotate handler invokes this closure in a goroutine; rotateIfReady
 	// guards on state==Ready internally so this is safe to call even if
 	// the hourly rotator timer is racing with an HTTP-driven rotation.
@@ -145,7 +161,7 @@ func main() {
 	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
 	drain := newProxyDrainController(proxySrv)
 	triggerRotation := func() {
-		rotateIfReady(ctx, prov, state, providerName, excluded, drain)
+		rotateIfReady(ctx, prov, state, providerName, excluded, drain, baselineEgressIP)
 	}
 
 	go func() {
@@ -162,6 +178,13 @@ func main() {
 
 	state.Set(StateLoggingIn)
 	if err := prov.Login(ctx); err != nil {
+		// Bump the auth-failure counter BEFORE failAndExit. The
+		// counter is what /status exposes for fleet-wide
+		// alerting; surfacing it for at least the few seconds
+		// kubelet takes to observe the crash is what makes a
+		// "credentials drift" vs "transient network" distinction
+		// visible without per-pod log inspection.
+		state.RecordAuthFailure(err.Error())
 		// Initial-login failure handling: flip state to Failed (so /livez
 		// returns 503 within the next probe period — k8s sees the failure
 		// and CrashLoopBackOff kicks in), give probes a moment to pick up
@@ -174,7 +197,7 @@ func main() {
 	// EXCLUDED_LOCATIONS) and Connect. On success → Ready. On failure
 	// surrender to Failed. `excluded` is captured in triggerRotation
 	// above; reuse it here.
-	if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
+	if err := connectTunnel(ctx, prov, state, providerName, excluded, baselineEgressIP); err != nil {
 		log.Printf("tundler-tunnel: initial connect failed: %v", err)
 		failAndExit(state)
 	}
@@ -184,7 +207,7 @@ func main() {
 	// says drops should reconnect WITHOUT a re-login (login is one-shot;
 	// session token cached by the VPN client).
 	watchdogInterval := time.Duration(getEnvInt(envWatchdogIntervalSec, defaultWatchdogIntervSec)) * time.Second
-	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv)
+	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv, baselineEgressIP)
 
 	// Start the rotator: each interval is a fresh uniform random pick
 	// from [MIN_ROTATION_SECONDS, MAX_ROTATION_SECONDS] (defaults 2h-4h),
@@ -211,7 +234,7 @@ func main() {
 	}
 	rotationEnabled := minRotation > 0 || maxRotation > 0
 	if rotationEnabled {
-		go runRotator(ctx, prov, state, providerName, excluded, minRotation, maxRotation, drain)
+		go runRotator(ctx, prov, state, providerName, excluded, minRotation, maxRotation, drain, baselineEgressIP)
 	} else {
 		log.Printf("tundler-tunnel: periodic rotation disabled (MIN_ROTATION_SECONDS=MAX_ROTATION_SECONDS=0); /rotate still honored")
 	}
@@ -275,7 +298,7 @@ func main() {
 // threshold; systemd then respawns the binary fresh, and if the new
 // binary also can't initial-connect, failAndExit exits 2 and kubelet
 // container-restarts the pod.
-func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server) {
+func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server, baselineEgressIP string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	backoff := watchdogMinBackoff
@@ -298,7 +321,7 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 			h := proxySrv.RecentTunnelHealth()
 			log.Printf("tundler-tunnel: watchdog reconnect attempt (state=%s, consecutiveDialFails=%d, lastDialAt=%s)",
 				current, h.ConsecutiveFailures, h.LastDialAt.Format(time.RFC3339))
-			if err := connectTunnel(ctx, prov, state, providerName, excluded); err != nil {
+			if err := connectTunnel(ctx, prov, state, providerName, excluded, baselineEgressIP); err != nil {
 				log.Printf("tundler-tunnel: watchdog reconnect failed: %v (next retry in %s)",
 					err, backoff)
 				state.Set(StateFailed)
