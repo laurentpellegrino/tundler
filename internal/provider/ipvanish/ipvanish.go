@@ -229,11 +229,14 @@ func writeActiveConfig(server *ipvanishServer, credentialsFile string) (string, 
 // setup — checking the route table (not just link UP) because
 // OpenVPN brings the link up before pushing routes, and we want to
 // match the post-route point at which traffic can actually flow.
-// Uses RunCmdSilent so the connect-poll loop (60 iterations × 500ms)
+// Looks in MAIN namespace (not vpnns) because openvpn is launched
+// via RunCmdDirect — see the comment at the openvpn spawn site for
+// the full rationale on why tun0 has to live in main ns. Uses the
+// silent variant so the connect-poll loop (60 iterations × 500ms)
 // doesn't swamp journald with "Cannot find device tun0" / exit-1
 // messages while the tunnel is still coming up.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilentDirect(context.Background(), "ip", "route", "show", "dev", "tun0")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
@@ -285,7 +288,17 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	// default 1500-byte MTU produces oversized UDP packets that get
 	// dropped on the path, causing the TLS handshake to never
 	// complete and the connect to time out.
-	if _, err := shared.RunCmd(ctx, "openvpn",
+	//
+	// RunCmdDirect (not RunCmd) so openvpn — and the tun0 it creates
+	// — land in the pod's MAIN network namespace. The in-process
+	// CONNECT proxy in tundler-tunnel dials upstream with a plain
+	// net.DialTimeout (no fwmark), so the only way proxy traffic
+	// flows through the VPN is if tun0 is the main-ns default route.
+	// `shared.RunCmd` wraps under `ip netns exec vpnns` because the
+	// systemd unit sets TUNDLER_NETNS=vpnns — that would put tun0 in
+	// vpnns, where the proxy can't reach it, and the proxy would
+	// then leak crawler traffic out the pod's node IP.
+	if _, err := shared.RunCmdDirect(ctx, "openvpn",
 		"--cd", configDir(),
 		"--config", activeConfigName,
 		"--tun-mtu", "1320",
@@ -315,7 +328,11 @@ func (i IPVanish) Connected(ctx context.Context) bool {
 }
 
 func (i IPVanish) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
+	// Direct (no netns wrap) — matches the namespace openvpn was
+	// started in. pkill itself is netns-agnostic (it walks the
+	// host pidns), but keeping all openvpn-lifecycle commands on
+	// the Direct path makes the symmetry obvious.
+	_, _ = shared.RunCmdDirect(ctx, "pkill", "-SIGTERM", "openvpn")
 	for j := 0; j < 20; j++ {
 		if !isOpenVPNConnected() {
 			break

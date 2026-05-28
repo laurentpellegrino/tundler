@@ -116,6 +116,22 @@ func RunCmdDirect(ctx context.Context, name string, args ...string) (string, err
 	return out, err
 }
 
+// RunCmdSilentDirect is RunCmdDirect minus the per-call Debugf logging.
+// Pair with the connect-poll loops in the OpenVPN-direct providers
+// (ipvanish/protonvpn) — those poll `ip route show dev tun0` at 2 Hz
+// while waiting for openvpn to push routes, and the verbose variant
+// would flood journald with "Cannot find device tun0" + exit-status
+// chatter that buries real connect-failure messages.
+func RunCmdSilentDirect(ctx context.Context, name string, args ...string) (string, error) {
+	var buf bytes.Buffer
+	sink := newBoundedSink(&buf)
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout = sink
+	cmd.Stderr = sink
+	err := cmd.Run()
+	return strings.TrimSpace(buf.String()), err
+}
+
 // FirstIPv4 extracts the first IPv4 address found in the given string.
 func FirstIPv4(s string) string {
 	for _, tok := range strings.Fields(s) {
