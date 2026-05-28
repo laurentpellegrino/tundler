@@ -122,27 +122,41 @@ func podOrdinal() (int, error) {
 	return n, nil
 }
 
+// credsDir is where the StatefulSet projects the vpn-credentials-
+// cyberghost Secret as a directory (one file per key). Reading from
+// files (not env) sidesteps the entrypoint's printenv|grep filter
+// that truncates multi-line PEMs to their first line — see the
+// comment in render-vpn-manifests.py next to the cyberghost-creds
+// volume for the full history.
+const credsDir = "/etc/cyberghost/creds"
+
 // getCredentials returns the per-pod (cert, key, username, password)
-// quadruple from env. Each pod ordinal reads POD_<n>_CERTIFICATE,
-// POD_<n>_KEY, POD_<n>_USERNAME, POD_<n>_PASSWORD — the ExternalSecret
-// renders one k8s Secret holding all max_tunnels quadruples.
+// quadruple. Each pod ordinal reads POD_<n>_CERTIFICATE,
+// POD_<n>_KEY, POD_<n>_USERNAME, POD_<n>_PASSWORD as separate files
+// projected from the Secret at /etc/cyberghost/creds/. username
+// and password are trimmed of trailing whitespace; cert and key
+// are passed through untouched (PEM is whitespace-sensitive).
 func getCredentials() (cert, key, user, pass string, err error) {
 	ord, err := podOrdinal()
 	if err != nil {
 		return "", "", "", "", err
 	}
 	prefix := fmt.Sprintf("POD_%d_", ord)
-	cert = os.Getenv(prefix + "CERTIFICATE")
-	key = os.Getenv(prefix + "KEY")
-	user = os.Getenv(prefix + "USERNAME")
-	pass = os.Getenv(prefix + "PASSWORD")
-	if cert == "" || key == "" || user == "" || pass == "" {
-		return "", "", "", "", fmt.Errorf(
-			"missing CyberGhost credentials for pod ordinal %d "+
-				"(need %sCERTIFICATE, %sKEY, %sUSERNAME, %sPASSWORD)",
-			ord, prefix, prefix, prefix, prefix)
+	read := func(name string) (string, error) {
+		b, err := os.ReadFile(filepath.Join(credsDir, name))
+		return string(b), err
 	}
-	return cert, key, user, pass, nil
+	certB, errCert := read(prefix + "CERTIFICATE")
+	keyB, errKey := read(prefix + "KEY")
+	userB, errUser := read(prefix + "USERNAME")
+	passB, errPass := read(prefix + "PASSWORD")
+	if errCert != nil || errKey != nil || errUser != nil || errPass != nil {
+		return "", "", "", "", fmt.Errorf(
+			"missing CyberGhost credentials for pod ordinal %d in %s "+
+				"(need %sCERTIFICATE, %sKEY, %sUSERNAME, %sPASSWORD)",
+			ord, credsDir, prefix, prefix, prefix, prefix)
+	}
+	return certB, keyB, strings.TrimSpace(userB), strings.TrimSpace(passB), nil
 }
 
 func loadServers() ([]cyberghostServer, error) {
