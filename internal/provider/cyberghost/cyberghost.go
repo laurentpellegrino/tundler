@@ -195,6 +195,18 @@ func pickRandomServer(servers []cyberghostServer) *cyberghostServer {
 	return &s
 }
 
+// ensurePEMTerminator appends a trailing newline if the input doesn't
+// already end with one. OpenSSL's PEM parser rejects a block whose
+// END line isn't terminated ("bad end line" error) — and the
+// OpenBao web UI silently strips the trailing newline when a user
+// pastes a multi-line value into the form. Belt-and-braces fix here.
+func ensurePEMTerminator(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	return s + "\n"
+}
+
 // writeAuthArtifacts writes the per-pod cert / key / auth file (plus
 // the embedded CA) into the config directory at known names. The
 // generated .ovpn references them via `ca <file>`, `cert <file>`,
@@ -210,12 +222,12 @@ func writeAuthArtifacts(dir, cert, key, user, pass string) (caPath, certPath, ke
 		return
 	}
 	certPath = filepath.Join(dir, clientCertName)
-	if err = os.WriteFile(certPath, []byte(cert), 0600); err != nil {
+	if err = os.WriteFile(certPath, []byte(ensurePEMTerminator(cert)), 0600); err != nil {
 		err = fmt.Errorf("write client.crt: %w", err)
 		return
 	}
 	keyPath = filepath.Join(dir, clientKeyName)
-	if err = os.WriteFile(keyPath, []byte(key), 0600); err != nil {
+	if err = os.WriteFile(keyPath, []byte(ensurePEMTerminator(key)), 0600); err != nil {
 		err = fmt.Errorf("write client.key: %w", err)
 		return
 	}
