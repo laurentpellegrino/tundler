@@ -1,0 +1,98 @@
+name: Update CyberGhost servers
+
+# Refreshes the `cyberghost-servers` GH release asset (servers.json)
+# by bulk-DNS-resolving every {groupID}-{countryCode}.cg-dialup.net
+# candidate and keeping the ones that come back with an A record.
+# The tundler-cyberghost image build downloads from that release at
+# image-build time and drops it at /etc/cyberghost/servers.json
+# (read by the runtime provider, embedded fallback if absent).
+#
+# Why no auth / no scraping:
+# CyberGhost's OpenVPN edge follows a fixed naming pattern and
+# operates from a small enumerable set of (groupID × country code)
+# combinations. A pure DNS sweep tells us exactly which servers
+# currently exist — no cookies, no CAPTCHA, no dashboard scraping
+# (same approach gluetun's updater uses). The vpn/cyberghost
+# dashboard credentials in OpenBao are NOT used here; reserved for
+# future API needs (e.g. per-server load metrics) the DNS sweep
+# can't provide.
+#
+# Scope: European countries only (rest of the world filtered out at
+# the script level — see EUROPE_COUNTRY_CODES in
+# scripts/update-cyberghost-servers.py). Edit that map to widen
+# the geographic pool.
+
+on:
+  schedule:
+    # 05:30 UTC daily. CyberGhost rarely churns servers, but a
+    # daily cadence catches new countries / decommissions within
+    # a day. Runs before docker-image.yml (07:00 UTC) so a same-
+    # day image rebuild picks up any new entries.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+
+concurrency:
+  group: update-cyberghost-servers
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: cyberghost-servers
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run DNS sweep
+        run: |
+          set -euo pipefail
+          python3 scripts/update-cyberghost-servers.py --out /tmp/servers.json
+          # Sanity-floor: refuse to publish if the sweep returned
+          # absurdly few entries (something is broken — likely DNS
+          # blocked on the runner). Keep the previous release.
+          n=$(python3 -c "import json; print(len(json.load(open('/tmp/servers.json'))))")
+          if [ "$n" -lt 20 ]; then
+            echo "::error::DNS sweep returned only $n servers (<20 floor) — refusing to publish."
+            exit 1
+          fi
+          echo "DNS sweep returned $n servers."
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern servers.json --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/servers.json | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/servers.json | awk '{print $1}')
+            if [ "$FRESH_SUM" = "$CURR_SUM" ]; then
+              echo "Servers unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Servers changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "CyberGhost server catalog (DNS-sweep mirror)" \
+                --notes "Daily DNS sweep of {groupID}-{cc}.cg-dialup.net for European country codes. See update-cyberghost-servers.yml."
+          gh release upload "$RELEASE_TAG" /tmp/servers.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} servers.json"
