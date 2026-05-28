@@ -236,7 +236,7 @@ func writeActiveConfig(server *ipvanishServer, credentialsFile string) (string, 
 // doesn't swamp journald with "Cannot find device tun0" / exit-1
 // messages while the tunnel is still coming up.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilentDirect(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
 	return err == nil && strings.TrimSpace(out) != ""
 }
 
@@ -289,7 +289,7 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	// dropped on the path, causing the TLS handshake to never
 	// complete and the connect to time out.
 	//
-	// RunCmdDirect (not RunCmd) so openvpn — and the tun0 it creates
+	// RunCmd (the default — main ns, NOT a NetNS variant) so openvpn — and the tun0 it creates
 	// — land in the pod's MAIN network namespace. The in-process
 	// CONNECT proxy in tundler-tunnel dials upstream with a plain
 	// net.DialTimeout (no fwmark), so the only way proxy traffic
@@ -298,7 +298,7 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	// systemd unit sets TUNDLER_NETNS=vpnns — that would put tun0 in
 	// vpnns, where the proxy can't reach it, and the proxy would
 	// then leak crawler traffic out the pod's node IP.
-	if _, err := shared.RunCmdDirect(ctx, "openvpn",
+	if _, err := shared.RunCmd(ctx, "openvpn",
 		"--cd", configDir(),
 		"--config", activeConfigName,
 		"--tun-mtu", "1320",
@@ -332,7 +332,7 @@ func (i IPVanish) Disconnect(ctx context.Context) error {
 	// started in. pkill itself is netns-agnostic (it walks the
 	// host pidns), but keeping all openvpn-lifecycle commands on
 	// the Direct path makes the symmetry obvious.
-	_, _ = shared.RunCmdDirect(ctx, "pkill", "-SIGTERM", "openvpn")
+	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
 	for j := 0; j < 20; j++ {
 		if !isOpenVPNConnected() {
 			break
@@ -401,7 +401,7 @@ func (i IPVanish) Status(ctx context.Context) provider.Status {
 func publicIP(ctx context.Context) string {
 	const host = "icanhazip.com"
 	resolveIP := ""
-	if out, err := shared.RunCmdDirect(ctx, "getent", "ahostsv4", host); err == nil {
+	if out, err := shared.RunCmd(ctx, "getent", "ahostsv4", host); err == nil {
 		resolveIP = shared.FirstIPv4(out)
 	}
 	args := []string{"-s", "--max-time", "5"}

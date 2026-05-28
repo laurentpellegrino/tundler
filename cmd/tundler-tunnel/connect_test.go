@@ -96,7 +96,7 @@ func TestConnectTunnel_Success(t *testing.T) {
 		connectOK: true,
 	}
 	st := NewStateTracker("fake")
-	err := connectTunnel(context.Background(), fp, st, "fake", nil)
+	err := connectTunnel(context.Background(), fp, st, "fake", nil, "")
 	if err != nil {
 		t.Fatalf("connectTunnel: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestConnectTunnel_Success(t *testing.T) {
 func TestConnectTunnel_NoAllowedLocations(t *testing.T) {
 	fp := &fakeProvider{locations: []string{"Bahrain"}}
 	st := NewStateTracker("fake")
-	err := connectTunnel(context.Background(), fp, st, "fake", []string{"Bahrain"})
+	err := connectTunnel(context.Background(), fp, st, "fake", []string{"Bahrain"}, "")
 	if err == nil {
 		t.Fatal("expected error from connectTunnel, got nil")
 	}
@@ -135,7 +135,7 @@ func TestConnectTunnel_ConnectFails(t *testing.T) {
 		connectOK: false,
 	}
 	st := NewStateTracker("fake")
-	err := connectTunnel(context.Background(), fp, st, "fake", nil)
+	err := connectTunnel(context.Background(), fp, st, "fake", nil, "")
 	if err == nil {
 		t.Fatal("expected connect to fail, got nil")
 	}
@@ -168,7 +168,7 @@ func TestWatchdog_DetectsDropAndReconnects(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 	// Wait until the watchdog has triggered at least one reconnect.
@@ -214,7 +214,7 @@ func TestWatchdog_SkipsWhenNotReady(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 	<-done
@@ -245,7 +245,7 @@ func TestWatchdog_StaysOutOfWayWhenProxyHealthy(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 	<-done
@@ -275,7 +275,7 @@ func TestWatchdog_AbstainsWhenProxySilent(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 	<-done
@@ -315,7 +315,7 @@ func TestWatchdog_ReconnectFailureMarksFailedAndRetries(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 
@@ -369,7 +369,7 @@ func TestWatchdog_RecoversFromFailed(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv)
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
 		close(done)
 	}()
 

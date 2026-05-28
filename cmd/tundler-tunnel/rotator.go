@@ -30,7 +30,7 @@ const (
 //
 // Skipped if state != Ready/Failed (e.g., a previous rotation is in
 // flight, or the watchdog is reconnecting).
-func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval, maxInterval time.Duration, drain drainController) {
+func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, minInterval, maxInterval time.Duration, drain drainController, baselineEgressIP string) {
 	initialOffset := pickRotationInterval(minInterval, maxInterval)
 	log.Printf("tundler-tunnel: rotator armed; first rotation in %s (then every random %s..%s)",
 		initialOffset.Round(time.Second), minInterval, maxInterval)
@@ -43,7 +43,7 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			rotateIfReady(ctx, prov, state, providerName, excluded, drain)
+			rotateIfReady(ctx, prov, state, providerName, excluded, drain, baselineEgressIP)
 			next := pickRotationInterval(minInterval, maxInterval)
 			log.Printf("tundler-tunnel: next rotation in %s", next.Round(time.Second))
 			timer.Reset(next)
@@ -63,15 +63,15 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 //
 // Production passes a proxyDrainController; tests use nil (skip the
 // drain) or a fakeDrainController.
-func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, drain drainController) {
+func rotateIfReady(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, drain drainController, baselineEgressIP string) {
 	rotateIfReadyWithDeps(ctx, prov, state, providerName, excluded,
-		getEnvInt(envRotationRetryMax, defaultRotationRetryMax), time.Sleep, drain)
+		getEnvInt(envRotationRetryMax, defaultRotationRetryMax), time.Sleep, drain, baselineEgressIP)
 }
 
 // rotateIfReadyWithDeps is the testable form of rotateIfReady — exposes
 // maxAttempts + sleep so tests can drive deterministic behavior without
 // reading env vars or waiting for real backoffs.
-func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration), drain drainController) {
+func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, maxAttempts int, sleep func(time.Duration), drain drainController, baselineEgressIP string) {
 	// Accept Failed too: the watchdog usually drives recovery, but the
 	// scheduled rotator is a periodic backup path for the rare case
 	// where the watchdog is wedged (e.g., a CPU-pinned thread).
@@ -111,7 +111,7 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 		log.Printf("tundler-tunnel: rotation Disconnect failed (continuing to Connect): %v", err)
 	}
 
-	if err := connectWithRetry(ctx, prov, state, providerName, excluded, maxAttempts, sleep); err != nil {
+	if err := connectWithRetry(ctx, prov, state, providerName, excluded, maxAttempts, sleep, baselineEgressIP); err != nil {
 		log.Printf("tundler-tunnel: rotation failed after retries: %v", err)
 		state.RecordRotation(previousIP, "", "failed", time.Since(started))
 		state.Set(StateFailed)
