@@ -83,7 +83,16 @@ const (
 	// rule (32764) so the main table — with openvpn's pushed
 	// 0.0.0.0/1 via tun0 — is consulted first for general traffic.
 	mainBeatWarpPref = "32763"
-	warpDev          = "CloudflareWARP"
+	// remoteViaWarpPref is BELOW mainBeatWarpPref so the WLVPN remote
+	// rule wins over the main-beats-warp diversion: openvpn's outer
+	// packets to the WLVPN edge take WARP's NATIVE table (the same
+	// path standalone-WARP app traffic uses), which is the only way
+	// they pass WARP's kill-switch nftables (a hand-rolled
+	// /32-via-CloudflareWARP route in the main table gets
+	// EPERM-rejected — WARP only accepts traffic that flows through
+	// its own routing table).
+	remoteViaWarpPref = "100"
+	warpDev           = "CloudflareWARP"
 )
 
 var warpFlags = []string{"--accept-tos"}
@@ -245,46 +254,91 @@ func resolveRemotes(ctx context.Context, configPath string) ([]string, error) {
 	return ips, nil
 }
 
-// setupNestedRouting installs the three routing assertions that make
-// the WARP→OpenVPN→FastVPN nesting deliver a FastVPN exit. See the
-// package doc for the full rationale. Idempotent (uses `route
-// replace` and del-then-add for the rule).
+// warpTableNum reads the routing-table number WARP captures traffic
+// into, from its policy-routing rule (`not from all fwmark 0x...
+// lookup <N>`). Observed as 65743, but WARP picks it dynamically so
+// we never hard-code it.
+func warpTableNum(ctx context.Context) (string, error) {
+	out, err := shared.RunCmd(ctx, "ip", "rule", "show")
+	if err != nil {
+		return "", err
+	}
+	// Match the WARP rule line and grab the table after "lookup".
+	for _, ln := range strings.Split(out, "\n") {
+		if !strings.Contains(ln, "fwmark") || !strings.Contains(ln, "lookup") {
+			continue
+		}
+		fields := strings.Fields(ln)
+		for i, f := range fields {
+			if f == "lookup" && i+1 < len(fields) {
+				return fields[i+1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no WARP fwmark/lookup rule found in: %q", out)
+}
+
+// flushRemoteViaWarpRules deletes any leftover remote-via-WARP rules
+// at remoteViaWarpPref so a reconnect to a different city doesn't
+// accumulate stale rules. `ip rule del` removes one match per call;
+// loop until none remain (bounded).
+func flushRemoteViaWarpRules(ctx context.Context) {
+	for i := 0; i < 64; i++ {
+		if _, err := shared.RunCmd(ctx, "ip", "rule", "del", "pref", remoteViaWarpPref); err != nil {
+			return
+		}
+	}
+}
+
+// setupNestedRouting installs the routing assertions that make the
+// WARP→OpenVPN→FastVPN nesting deliver a FastVPN exit. See the
+// package doc for the full rationale. Idempotent.
 func setupNestedRouting(ctx context.Context, remoteIPs []string) error {
 	gw, err := origDefaultGateway(ctx)
 	if err != nil {
 		return fmt.Errorf("find original gateway: %w", err)
 	}
-	// (2) Pin WARP's anycast block via eth0 so WARP transport never
+	warpTable, err := warpTableNum(ctx)
+	if err != nil {
+		return fmt.Errorf("find WARP table: %w", err)
+	}
+	// (a) Pin WARP's anycast block via eth0 so WARP transport never
 	// loops into tun0. /16 is more specific than openvpn's eventual
 	// 0.0.0.0/1, so order vs openvpn doesn't matter.
 	if _, err := shared.RunCmd(ctx, "ip", "route", "replace", warpEdgeRange, "via", gw, "dev", "eth0"); err != nil {
 		return fmt.Errorf("pin warp edge %s: %w", warpEdgeRange, err)
 	}
-	// (1) Pin each WLVPN remote /32 through WARP so the outer
-	// tunnel's packets ride Cloudflare.
+	// (b) Route each WLVPN remote through WARP's NATIVE table at a
+	// priority below mainBeatWarpPref so it wins over the
+	// main-beats-warp diversion for the remote dest. Using WARP's
+	// own table (not a hand-rolled CloudflareWARP route) is what
+	// makes these packets pass WARP's kill-switch nft rules.
+	flushRemoteViaWarpRules(ctx)
 	for _, ip := range remoteIPs {
-		if _, err := shared.RunCmd(ctx, "ip", "route", "replace", ip+"/32", "dev", warpDev); err != nil {
-			return fmt.Errorf("pin remote %s via warp: %w", ip, err)
+		if _, err := shared.RunCmd(ctx, "ip", "rule", "add", "to", ip+"/32",
+			"lookup", warpTable, "pref", remoteViaWarpPref); err != nil {
+			return fmt.Errorf("route remote %s via WARP table %s: %w", ip, warpTable, err)
 		}
 	}
-	// (3) Make main beat WARP's catch-all (pref 32764) so openvpn's
+	// (c) Make main beat WARP's catch-all (pref 32764) so openvpn's
 	// pushed 0.0.0.0/1 via tun0 governs general traffic. Del-then-add
 	// keeps it idempotent across reconnects.
 	_, _ = shared.RunCmd(ctx, "ip", "rule", "del", "pref", mainBeatWarpPref)
 	if _, err := shared.RunCmd(ctx, "ip", "rule", "add", "from", "all", "lookup", "main", "pref", mainBeatWarpPref); err != nil {
 		return fmt.Errorf("add main-beats-warp rule: %w", err)
 	}
-	shared.Debugf("FastVPN: nested routing set (gw=%s, %d remote IPs pinned via WARP)", gw, len(remoteIPs))
+	shared.Debugf("FastVPN: nested routing set (gw=%s, warp-table=%s, %d remote IPs via WARP)",
+		gw, warpTable, len(remoteIPs))
 	return nil
 }
 
-// teardownNestedRouting removes the main-beats-warp rule so that
-// between rotations (openvpn down) stray traffic exits via WARP
-// rather than leaking out the node IP. The /32 + edge pins are
-// left in place — they're harmless and re-asserted on the next
-// Connect.
+// teardownNestedRouting removes the rules we added so that between
+// rotations (openvpn down) traffic falls back to WARP's catch-all
+// rather than leaking out the node IP. The /16 edge pin is left in
+// place — harmless and re-asserted on the next Connect.
 func teardownNestedRouting(ctx context.Context) {
 	_, _ = shared.RunCmd(ctx, "ip", "rule", "del", "pref", mainBeatWarpPref)
+	flushRemoteViaWarpRules(ctx)
 }
 
 func loadServers() ([]fastvpnServer, error) {
