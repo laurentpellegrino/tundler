@@ -33,10 +33,10 @@ mkdir -p "$(dirname "$ENV_FILE")"
 # split, a trailing '=' anchor on the union would have required
 # 'TUNDLER_' to be followed immediately by '=' — turning TUNDLER_
 # into a single literal var instead of a prefix.
-printenv | grep -E '^(POD_|EXPRESSVPN_|IPVANISH_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)|^(BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|MAX_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS)=' | sort > "$ENV_FILE"
+printenv | grep -E '^(POD_|EXPRESSVPN_|FASTVPN_|MULLVAD_|NORDVPN_|PRIVATEINTERNETACCESS_|PROTON_|SURFSHARK_|TUNDLER_)|^(BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|MAX_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS)=' | sort > "$ENV_FILE"
 
 # Run each installed provider's configure.sh once per pod boot. This
-# downloads OpenVPN configs (ipvanish/protonvpn/surfshark), seeds CLI
+# downloads OpenVPN configs (fastvpn/protonvpn/surfshark), seeds CLI
 # state, and otherwise prepares the provider for first-login. In the
 # new per-provider images only one subdirectory exists under
 # /opt/providers/ — the build-time install step deleted the others —
