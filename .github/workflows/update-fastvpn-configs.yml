@@ -1,0 +1,92 @@
+name: Update FastVPN configs
+
+# Mirrors Namecheap FastVPN's public OpenVPN config bundle from
+# https://vpn.ncapi.io/groupedServerList.zip (no auth needed) and
+# republishes just the UDP subset as a `fastvpn-configs` GH release
+# asset. The tundler-fastvpn image build downloads from that release
+# and drops the .ovpn files at /etc/fastvpn/configs/ (read by the
+# runtime provider).
+#
+# Why republish instead of pulling the upstream zip directly at
+# image build:
+#   - Strips TCP-only configs (we always use UDP) — halves the
+#     extracted footprint.
+#   - Deterministic byte order + frozen mtimes → the checksum-skip
+#     below only fires when CONTENT actually changes, not when
+#     Namecheap's CDN reshuffles the zip's directory entries.
+#   - Provides one stable artifact URL the dockerfile can pin
+#     without coupling to Namecheap's CDN path stability.
+
+on:
+  schedule:
+    # 05:45 UTC daily. FastVPN's bundle changes rarely (city pool
+    # is fairly static; edge IP rotation happens via the multiple
+    # `remote ...` lines INSIDE each .ovpn, which openvpn already
+    # load-balances client-side via `remote-random`).
+    - cron: '45 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+
+concurrency:
+  group: update-fastvpn-configs
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: fastvpn-configs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build UDP-only configs zip
+        run: |
+          set -euo pipefail
+          python3 scripts/update-fastvpn-configs.py --out /tmp/fastvpn-configs.zip
+          # Sanity-floor: refuse to publish if the bundle is
+          # suspiciously thin (something is broken upstream).
+          n=$(unzip -Z1 /tmp/fastvpn-configs.zip | wc -l)
+          if [ "$n" -lt 50 ]; then
+            echo "::error::Only $n UDP configs (<50 floor) — refusing to publish."
+            exit 1
+          fi
+          echo "Built $n-entry UDP configs zip."
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern fastvpn-configs.zip --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/fastvpn-configs.zip | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/fastvpn-configs.zip | awk '{print $1}')
+            if [ "$FRESH_SUM" = "$CURR_SUM" ]; then
+              echo "Configs unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Configs changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "FastVPN UDP OpenVPN configs (vpn.ncapi.io mirror)" \
+                --notes "Daily mirror of https://vpn.ncapi.io/groupedServerList.zip, UDP subset only. See update-fastvpn-configs.yml."
+          gh release upload "$RELEASE_TAG" /tmp/fastvpn-configs.zip --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} fastvpn-configs.zip"
