@@ -65,14 +65,20 @@ const (
 	credentialsName  = "auth.txt"
 
 	warpCli = "warp-cli"
-	// warpEdgeRanges are Cloudflare's anycast WARP/WireGuard endpoint
-	// ranges (engage.cloudflareclient.com resolves into these,
-	// port 2408). We pin them via the original eth0 gateway so
-	// WARP's own transport packets never get routed into FastVPN's
-	// tun0 — that would be a circular dependency (FastVPN needs
-	// WARP, WARP would need FastVPN).
-	warpEdgeRange1 = "162.159.192.0/24"
-	warpEdgeRange2 = "162.159.193.0/24"
+	// warpEdgeRange is Cloudflare's WARP anycast block. Modern WARP
+	// uses MASQUE (HTTP/3 over QUIC) — its endpoints are scattered
+	// across 162.159.x (observed: 162.159.198.2:8095 for the MASQUE
+	// tunnel, 162.159.36.1 / 162.159.46.1 for DoH) — NOT the legacy
+	// 162.159.192/193 WireGuard pair. We pin the whole /16 via the
+	// original eth0 gateway so WARP's OWN transport (control + data)
+	// always takes the direct path and never gets routed into
+	// FastVPN's tun0 — that circular dependency (FastVPN-needs-WARP,
+	// WARP-would-need-FastVPN) was what deadlocked WARP's MASQUE
+	// reconnect and tripped its always-on kill switch, EPERM-
+	// rejecting openvpn's packets. 162.159.0.0/16 is Cloudflare
+	// infra, never a crawl target, so pinning it costs no exit
+	// diversity.
+	warpEdgeRange = "162.159.0.0/16"
 	// mainBeatWarpPref is one priority ABOVE warp-svc's catch-all
 	// rule (32764) so the main table — with openvpn's pushed
 	// 0.0.0.0/1 via tun0 — is consulted first for general traffic.
@@ -248,13 +254,11 @@ func setupNestedRouting(ctx context.Context, remoteIPs []string) error {
 	if err != nil {
 		return fmt.Errorf("find original gateway: %w", err)
 	}
-	// (2) Pin WARP's edge ranges via eth0 so WARP transport never
-	// loops into tun0. More specific than openvpn's eventual
+	// (2) Pin WARP's anycast block via eth0 so WARP transport never
+	// loops into tun0. /16 is more specific than openvpn's eventual
 	// 0.0.0.0/1, so order vs openvpn doesn't matter.
-	for _, r := range []string{warpEdgeRange1, warpEdgeRange2} {
-		if _, err := shared.RunCmd(ctx, "ip", "route", "replace", r, "via", gw, "dev", "eth0"); err != nil {
-			return fmt.Errorf("pin warp edge %s: %w", r, err)
-		}
+	if _, err := shared.RunCmd(ctx, "ip", "route", "replace", warpEdgeRange, "via", gw, "dev", "eth0"); err != nil {
+		return fmt.Errorf("pin warp edge %s: %w", warpEdgeRange, err)
 	}
 	// (1) Pin each WLVPN remote /32 through WARP so the outer
 	// tunnel's packets ride Cloudflare.
