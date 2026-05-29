@@ -272,16 +272,27 @@ func pickRandomServer(servers []protonServer) *protonServer {
 	return &server
 }
 
-// isOpenVPNConnected returns true once openvpn has finished tunnel
-// setup (link UP + routes pushed). Looks in MAIN namespace (not
-// vpnns) because openvpn is launched via RunCmd (which now defaults to main ns) — see the
-// comment at the openvpn spawn site in connectOpenVPN. Uses the
-// silent variant so the connect-poll loop doesn't spam journald
-// with "Cannot find device tun0" while the tunnel is still coming
-// up.
+// isOpenVPNConnected returns true once the tunnel's redirect-gateway
+// push has actually taken effect — i.e. a route LOOKUP for an
+// arbitrary public address resolves via tun0, not via eth0. The
+// looser "any route on tun0 exists" check returns true too early:
+// openvpn installs the per-pod link-local route (e.g. 10.2.4.0/24
+// dev tun0) BEFORE the redirect-gateway default-eclipsing routes
+// are pushed, so the exit-IP contract probe in cmd/tundler-tunnel/
+// egress.go fires while the main-ns default route is still via
+// eth0 and flags a leak that doesn't actually exist. Validated
+// against cyberghost — same race, same fix.
+//
+// Looks in MAIN namespace because openvpn is launched via RunCmd
+// (which defaults to main ns post-bb88d29). 8.8.8.8 is a stable
+// public-IPv4 destination; we don't actually send a packet to it,
+// this is purely a kernel route-table lookup.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
-	return err == nil && strings.TrimSpace(out) != ""
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, " dev tun0 ")
 }
 
 // ActiveLocation returns whatever was passed to Connect — i.e. an
