@@ -1,29 +1,45 @@
 // Package fastvpn is an OpenVPN-direct provider for Namecheap's
-// FastVPN service. White-labels WLVPN's backbone (*.vpn.wlvpn.com).
+// FastVPN service, tunneled INSIDE a Cloudflare WARP transport.
+//
+// Why nested (WARP → OpenVPN → FastVPN):
+// FastVPN white-labels WLVPN's backbone (*.vpn.wlvpn.com). WLVPN's
+// edge blocks datacenter IP ranges at L3 (confirmed: TCP/443 and
+// UDP/1194 to every WLVPN edge time out from our Hetzner nodes,
+// while a generic Cloudflare host is reachable). To present an
+// acceptable source IP we route openvpn's OUTER packets through
+// Cloudflare WARP — WLVPN then sees a Cloudflare exit IP and
+// accepts the connection. Crawler traffic still exits via
+// FastVPN's tun0 (the innermost tunnel), so the upstream sees a
+// FastVPN IP, not Cloudflare's.
+//
+// The routing dance (see setupNestedRouting): WARP captures all
+// unmarked traffic via a policy-routing rule at priority 32764
+// (table 65743 → CloudflareWARP). Left alone, that shadows
+// openvpn's main-table split-default and every byte would exit via
+// WARP. We add three assertions around the openvpn launch:
+//   1. pin each WLVPN remote /32 → dev CloudflareWARP (outer
+//      tunnel rides WARP),
+//   2. pin Cloudflare WARP's edge ranges → via eth0 gateway (so
+//      WARP's own WireGuard transport doesn't loop into FastVPN's
+//      tun0 — the circular-routing deadlock),
+//   3. add `ip rule from all lookup main pref 32763` (one priority
+//      above WARP's catch-all) so main — carrying openvpn's
+//      0.0.0.0/1 via tun0 — governs general traffic.
+// All three are idempotent and survive warp-svc's route daemon
+// (we add a higher-priority rule rather than deleting WARP's).
 //
 // Auth model: 2-factor — username + password, generated separately
 // from the Namecheap dashboard login at FastVPN account panel →
-// "Network access information". Cred is shared across pods
-// (FastVPN allows unlimited concurrent OpenVPN sessions), so no
-// per-pod credential isolation is needed unlike cyberghost.
+// "Network access information". FastVPN allows unlimited concurrent
+// OpenVPN sessions, so one shared cred works across N pods.
 //
 // Server discovery: each pod ships a directory of UDP-only .ovpn
 // files (one per city) baked at image build time from the
 // fastvpn-configs GitHub release (mirror of the public
-// https://vpn.ncapi.io/groupedServerList.zip, refreshed daily —
-// see .github/workflows/update-fastvpn-configs.yml). Each .ovpn
-// contains MULTIPLE `remote ...` entries with `remote-random`, so
-// openvpn itself load-balances across the city's edge IPs — we
-// don't need to do anything clever runtime-side.
-//
-// Filename convention (parseable for Locations() metadata):
-//   NCVPN-<CC>-<City>[ - Virtual]-UDP.ovpn
-//
-// CA cert is INLINED in every .ovpn (`<ca>...</ca>` block), so no
-// embedded ca.crt either. We pass the .ovpn through openvpn
-// untouched except for overriding `auth-user-pass` to point at
-// our credentials file (the upstream config has a bare
-// `auth-user-pass` directive that would otherwise prompt on TTY).
+// https://vpn.ncapi.io/groupedServerList.zip, refreshed daily).
+// Each .ovpn carries multiple `remote ...` entries + `remote-random`;
+// the CA is inlined (`<ca>...</ca>`). We pass the .ovpn through
+// untouched except for rewriting the bare `auth-user-pass` directive.
 package fastvpn
 
 import (
@@ -47,7 +63,24 @@ const (
 	defaultConfigDir = "/etc/fastvpn/configs"
 	activeConfigName = "active.ovpn"
 	credentialsName  = "auth.txt"
+
+	warpCli = "warp-cli"
+	// warpEdgeRanges are Cloudflare's anycast WARP/WireGuard endpoint
+	// ranges (engage.cloudflareclient.com resolves into these,
+	// port 2408). We pin them via the original eth0 gateway so
+	// WARP's own transport packets never get routed into FastVPN's
+	// tun0 — that would be a circular dependency (FastVPN needs
+	// WARP, WARP would need FastVPN).
+	warpEdgeRange1 = "162.159.192.0/24"
+	warpEdgeRange2 = "162.159.193.0/24"
+	// mainBeatWarpPref is one priority ABOVE warp-svc's catch-all
+	// rule (32764) so the main table — with openvpn's pushed
+	// 0.0.0.0/1 via tun0 — is consulted first for general traffic.
+	mainBeatWarpPref = "32763"
+	warpDev          = "CloudflareWARP"
 )
+
+var warpFlags = []string{"--accept-tos"}
 
 type FastVPN struct{}
 
@@ -68,14 +101,16 @@ var (
 	loggedIn       bool
 
 	// Filename format: NCVPN-<CC>-<City>[ - Virtual]-UDP.ovpn
-	// City may contain spaces and hyphens, "Virtual" suffix is
-	// optional. Capture: 1=CC, 2=city-tail (with optional Virtual).
 	filenameRe = regexp.MustCompile(`^NCVPN-([A-Z]{2})-(.+)-UDP\.ovpn$`)
 
 	// Bare `auth-user-pass` directive (no file argument) — present
 	// in every upstream .ovpn. We rewrite it so openvpn reads our
 	// credentials file instead of prompting on TTY.
 	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
+
+	// `remote <host> <port>` lines — we resolve each host and pin
+	// the resulting IPs through WARP.
+	remoteRe = regexp.MustCompile(`(?m)^remote\s+(\S+)`)
 )
 
 func init() { provider.Registry[name] = FastVPN{} }
@@ -98,22 +133,154 @@ func getCredentials() (string, string, error) {
 	return user, pass, nil
 }
 
-// parseFilename extracts (CC, city, virtual) from an .ovpn filename
-// like `NCVPN-DE-Frankfurt-UDP.ovpn` or
-// `NCVPN-AM-Yerevan - Virtual-UDP.ovpn`. Returns false if the name
-// doesn't match the expected pattern.
-func parseFilename(fname string) (cc, city string, virtual bool, ok bool) {
-	m := filenameRe.FindStringSubmatch(fname)
-	if m == nil {
-		return "", "", false, false
+// ----------------------------------------------------------------------
+// WARP transport
+// ----------------------------------------------------------------------
+
+func warpRun(ctx context.Context, args ...string) (string, error) {
+	return shared.RunCmd(ctx, warpCli, append(append([]string(nil), warpFlags...), args...)...)
+}
+
+// warpOn probes Cloudflare's trace endpoint — the authoritative
+// "tunnel is actually routing" signal (warp-cli status flips to
+// Connected a moment before traffic flows).
+func warpOn(ctx context.Context) bool {
+	out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "3",
+		"https://www.cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		return false
 	}
-	cc = m[1]
-	city = m[2]
-	if strings.HasSuffix(city, " - Virtual") {
-		virtual = true
-		city = strings.TrimSuffix(city, " - Virtual")
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.TrimSpace(ln) == "warp=on" {
+			return true
+		}
 	}
-	return cc, city, virtual, true
+	return false
+}
+
+// warpUp ensures the WARP transport tunnel is connected. Idempotent:
+// re-registers only if no live registration, then connects and
+// polls until warp=on. Unlike the standalone warp provider, we do
+// NOT delete the registration on rotation — WARP is pure transport
+// here, not the rotating exit identity (FastVPN provides that).
+func warpUp(ctx context.Context) error {
+	if warpOn(ctx) {
+		return nil
+	}
+	reg, _ := warpRun(ctx, "registration", "show")
+	low := strings.ToLower(reg)
+	if !strings.Contains(low, "device id") && !strings.Contains(low, "account") {
+		if _, err := warpRun(ctx, "registration", "new"); err != nil {
+			return fmt.Errorf("warp registration new: %w", err)
+		}
+	}
+	_, _ = warpRun(ctx, "mode", "warp")
+	if _, err := warpRun(ctx, "connect"); err != nil {
+		return fmt.Errorf("warp connect: %w", err)
+	}
+	for i := 0; i < 60; i++ {
+		if warpOn(ctx) {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("warp did not reach warp=on within 30s")
+}
+
+// origDefaultGateway returns the eth0 next-hop from the main table's
+// default route. With WARP up this stays "via <gw> dev eth0" (WARP
+// routes via its own policy table 65743, leaving main's default
+// pointing at eth0).
+func origDefaultGateway(ctx context.Context) (string, error) {
+	out, err := shared.RunCmd(ctx, "ip", "route", "show", "default", "dev", "eth0")
+	if err != nil || strings.TrimSpace(out) == "" {
+		// Fall back to the unscoped default.
+		out, err = shared.RunCmd(ctx, "ip", "route", "show", "default")
+		if err != nil {
+			return "", err
+		}
+	}
+	// Parse "default via 10.0.x.2 dev eth0 ..."
+	fields := strings.Fields(out)
+	for i, f := range fields {
+		if f == "via" && i+1 < len(fields) {
+			return fields[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("no `via` gateway in default route: %q", out)
+}
+
+// resolveRemotes extracts every `remote <host>` from the active
+// config and resolves each to its IPv4 address(es).
+func resolveRemotes(ctx context.Context, configPath string) ([]string, error) {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	var ips []string
+	seen := map[string]bool{}
+	for _, m := range remoteRe.FindAllStringSubmatch(string(raw), -1) {
+		host := m[1]
+		out, err := shared.RunCmd(ctx, "getent", "ahostsv4", host)
+		if err != nil {
+			shared.Debugf("FastVPN: getent %s failed: %v", host, err)
+			continue
+		}
+		for _, ln := range strings.Split(out, "\n") {
+			if ip := shared.FirstIPv4(ln); ip != "" && !seen[ip] {
+				seen[ip] = true
+				ips = append(ips, ip)
+			}
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("resolved no remote IPs from %s", configPath)
+	}
+	return ips, nil
+}
+
+// setupNestedRouting installs the three routing assertions that make
+// the WARP→OpenVPN→FastVPN nesting deliver a FastVPN exit. See the
+// package doc for the full rationale. Idempotent (uses `route
+// replace` and del-then-add for the rule).
+func setupNestedRouting(ctx context.Context, remoteIPs []string) error {
+	gw, err := origDefaultGateway(ctx)
+	if err != nil {
+		return fmt.Errorf("find original gateway: %w", err)
+	}
+	// (2) Pin WARP's edge ranges via eth0 so WARP transport never
+	// loops into tun0. More specific than openvpn's eventual
+	// 0.0.0.0/1, so order vs openvpn doesn't matter.
+	for _, r := range []string{warpEdgeRange1, warpEdgeRange2} {
+		if _, err := shared.RunCmd(ctx, "ip", "route", "replace", r, "via", gw, "dev", "eth0"); err != nil {
+			return fmt.Errorf("pin warp edge %s: %w", r, err)
+		}
+	}
+	// (1) Pin each WLVPN remote /32 through WARP so the outer
+	// tunnel's packets ride Cloudflare.
+	for _, ip := range remoteIPs {
+		if _, err := shared.RunCmd(ctx, "ip", "route", "replace", ip+"/32", "dev", warpDev); err != nil {
+			return fmt.Errorf("pin remote %s via warp: %w", ip, err)
+		}
+	}
+	// (3) Make main beat WARP's catch-all (pref 32764) so openvpn's
+	// pushed 0.0.0.0/1 via tun0 governs general traffic. Del-then-add
+	// keeps it idempotent across reconnects.
+	_, _ = shared.RunCmd(ctx, "ip", "rule", "del", "pref", mainBeatWarpPref)
+	if _, err := shared.RunCmd(ctx, "ip", "rule", "add", "from", "all", "lookup", "main", "pref", mainBeatWarpPref); err != nil {
+		return fmt.Errorf("add main-beats-warp rule: %w", err)
+	}
+	shared.Debugf("FastVPN: nested routing set (gw=%s, %d remote IPs pinned via WARP)", gw, len(remoteIPs))
+	return nil
+}
+
+// teardownNestedRouting removes the main-beats-warp rule so that
+// between rotations (openvpn down) stray traffic exits via WARP
+// rather than leaking out the node IP. The /32 + edge pins are
+// left in place — they're harmless and re-asserted on the next
+// Connect.
+func teardownNestedRouting(ctx context.Context) {
+	_, _ = shared.RunCmd(ctx, "ip", "rule", "del", "pref", mainBeatWarpPref)
 }
 
 func loadServers() ([]fastvpnServer, error) {
@@ -173,6 +340,20 @@ func loadServers() ([]fastvpnServer, error) {
 	return append([]fastvpnServer(nil), servers...), nil
 }
 
+func parseFilename(fname string) (cc, city string, virtual bool, ok bool) {
+	m := filenameRe.FindStringSubmatch(fname)
+	if m == nil {
+		return "", "", false, false
+	}
+	cc = m[1]
+	city = m[2]
+	if strings.HasSuffix(city, " - Virtual") {
+		virtual = true
+		city = strings.TrimSuffix(city, " - Virtual")
+	}
+	return cc, city, virtual, true
+}
+
 func findServers(servers []fastvpnServer, location string) []fastvpnServer {
 	if location == "" {
 		return servers
@@ -209,11 +390,6 @@ func writeCredentials(user, pass string) (string, error) {
 	return path, nil
 }
 
-// writeActiveConfig copies the chosen city's .ovpn into a known
-// location with the bare `auth-user-pass` directive rewritten to
-// reference our credentials file. Everything else (the CA inlined
-// in <ca>...</ca>, the multiple `remote ...` lines, modern cipher
-// defaults) is passed through untouched.
 func writeActiveConfig(server *fastvpnServer, credentialsFile string) (string, error) {
 	src := filepath.Join(configDir(), server.Filename)
 	raw, err := os.ReadFile(src)
@@ -228,13 +404,13 @@ func writeActiveConfig(server *fastvpnServer, credentialsFile string) (string, e
 	return dst, nil
 }
 
-// isOpenVPNConnected returns true once the tunnel's redirect-gateway
-// push has actually taken effect — i.e. a route lookup for an
-// arbitrary public address resolves via tun0, not via eth0. Same
-// race-fix-style check as cyberghost / protonvpn / surfshark's
-// OpenVPN branch — gates against the per-pod link-local route on
-// tun0 fooling the contract probe into firing before the default-
-// eclipsing routes are installed.
+// isOpenVPNConnected returns true once openvpn's pushed
+// redirect-gateway has taken effect — a route lookup for an
+// arbitrary public address resolves via tun0. Because the
+// main-beats-warp rule (pref 32763) makes the main table win, this
+// flips to tun0 exactly when openvpn installs its 0.0.0.0/1 split
+// default (not the per-pod link-local route). Same default-route
+// gating as the other openvpn-direct providers.
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
@@ -259,6 +435,13 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 		return provider.Status{Connected: false, Provider: name}
 	}
 
+	// WARP transport must be up before openvpn — the outer tunnel
+	// rides it to dodge WLVPN's datacenter-IP block.
+	if err := warpUp(ctx); err != nil {
+		shared.Debugf("FastVPN: WARP transport not ready: %v", err)
+		return provider.Status{Connected: false, Provider: name}
+	}
+
 	servers, err := loadServers()
 	if err != nil {
 		shared.Debugf("FastVPN: failed to load servers: %v", err)
@@ -277,19 +460,33 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 		shared.Debugf("FastVPN: failed to write credentials: %v", err)
 		return provider.Status{Connected: false, Provider: name, Location: location}
 	}
-	if _, err := writeActiveConfig(server, credFile); err != nil {
+	activePath, err := writeActiveConfig(server, credFile)
+	if err != nil {
 		shared.Debugf("FastVPN: %v", err)
 		return provider.Status{Connected: false, Provider: name, Location: location}
 	}
 
-	// --tun-mtu / --mssfix clamp below the k8s pod MTU. RunCmd
-	// (post-bb88d29 default — main netns) so openvpn + tun0 land
-	// in the same namespace as the in-process CONNECT proxy.
+	// Resolve the chosen city's WLVPN edge IPs and pin them through
+	// WARP before openvpn opens its socket.
+	remoteIPs, err := resolveRemotes(ctx, activePath)
+	if err != nil {
+		shared.Debugf("FastVPN: %v", err)
+		return provider.Status{Connected: false, Provider: name, Location: location}
+	}
+	if err := setupNestedRouting(ctx, remoteIPs); err != nil {
+		shared.Debugf("FastVPN: nested routing failed: %v", err)
+		return provider.Status{Connected: false, Provider: name, Location: location}
+	}
+
+	// --tun-mtu 1200 / --mssfix 1160: WARP's WireGuard MTU is 1280;
+	// openvpn rides inside it, so the inner payload ceiling is well
+	// below the usual 1370 pod path. These leave headroom for both
+	// the WARP and OpenVPN headers.
 	if _, err := shared.RunCmd(ctx, "openvpn",
 		"--cd", configDir(),
 		"--config", activeConfigName,
-		"--tun-mtu", "1320",
-		"--mssfix", "1280",
+		"--tun-mtu", "1200",
+		"--mssfix", "1160",
 		"--daemon"); err != nil {
 		shared.Debugf("FastVPN: failed to start openvpn: %v", err)
 		return provider.Status{Connected: false, Provider: name, Location: location}
@@ -322,6 +519,10 @@ func (f FastVPN) Disconnect(ctx context.Context) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// Drop the main-beats-warp rule so the rotation window (openvpn
+	// down) exits via WARP rather than leaking the node IP. WARP
+	// itself stays up — it's transport, not the rotating identity.
+	teardownNestedRouting(ctx)
 	activeServer = nil
 	activeMu.Lock()
 	activeLocation = ""
@@ -355,6 +556,12 @@ func (f FastVPN) Login(ctx context.Context) error {
 	}
 	if _, err := loadServers(); err != nil {
 		return err
+	}
+	// Bring WARP transport up at login so the first Connect() has
+	// it ready. Non-fatal if it isn't up yet — Connect() re-checks
+	// and retries warpUp.
+	if err := warpUp(ctx); err != nil {
+		shared.Debugf("FastVPN: WARP not up at login (will retry on Connect): %v", err)
 	}
 	loggedIn = true
 	return nil

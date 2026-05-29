@@ -22,8 +22,24 @@ apt-get install -y --no-install-recommends \
     openvpn \
     ca-certificates \
     curl \
+    gpg \
+    iproute2 \
     unzip
 echo "FastVPN: openvpn installed ($(openvpn --version 2>&1 | head -1))"
+
+# FastVPN tunnels INSIDE a Cloudflare WARP transport (WLVPN's edge
+# blocks datacenter IPs; WARP presents a Cloudflare source IP so
+# the connection is accepted). Install the WARP client here so the
+# provider can bring the outer tunnel up at runtime — see the
+# package doc in internal/provider/fastvpn/fastvpn.go.
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+  | gpg --yes --dearmor \
+      --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" \
+  > /etc/apt/sources.list.d/cloudflare-client.list
+apt-get update
+apt-get install -y --no-install-recommends cloudflare-warp
+echo "FastVPN: WARP transport installed ($(warp-cli --version 2>&1 | head -1))"
 
 # Soft-fail download: if the release isn't reachable at build time
 # (fresh repo with no first release yet, network blip), keep going
