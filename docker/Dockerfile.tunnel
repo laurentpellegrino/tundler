@@ -118,12 +118,19 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
 # have a separate daemon to enable — the Go binary spawns openvpn
 # directly at connect time. The `|| true` lines are no-ops for those
 # images.
+#
+# fastvpn is the exception among the OpenVPN-direct providers: it
+# tunnels openvpn INSIDE a Cloudflare WARP transport (WLVPN's edge
+# blocks datacenter IPs), so it needs warp-svc running just like the
+# standalone warp provider. The fastvpn Go provider brings the WARP
+# tunnel up at Login/Connect via warp-cli, which needs the daemon.
 RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
         mullvad)    systemctl enable mullvad-daemon.service || true ;; \
         pia)        systemctl enable piavpn.service || true ;; \
         warp)       systemctl enable warp-svc.service || true ;; \
+        fastvpn)    systemctl enable warp-svc.service || true ;; \
         *)          : ;; \
     esac
 
