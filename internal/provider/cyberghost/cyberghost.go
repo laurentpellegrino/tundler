@@ -340,8 +340,9 @@ func writeActiveConfig(dir string, server *cyberghostServer, caPath, certPath, k
 // for that dst RIGHT NOW; checking for " dev tun0 " in the output
 // confirms the tunnel is genuinely the path packets are taking.
 //
-// Same fix should be applied to ipvanish.go / protonvpn.go before
-// re-enabling those providers — they have the same race.
+// The same fix is mirrored in protonvpn.go and surfshark.go's
+// OpenVPN branch (the WireGuard branch doesn't have this race —
+// wg-quick is synchronous, routes are installed before it returns).
 //
 // 8.8.8.8 is a stable public-IPv4 destination; we don't actually
 // send a packet to it, this is purely a kernel route-table lookup.

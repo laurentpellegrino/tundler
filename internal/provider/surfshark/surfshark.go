@@ -284,17 +284,27 @@ PersistentKeepalive = 25
 	return nil
 }
 
-// isOpenVPNConnected checks if OpenVPN tunnel is routable inside VPN namespace.
-// Checking routes (not just link UP) ensures OpenVPN has finished setup —
-// the tun0 link comes up before routes are added, causing a race where
-// traffic fails if we start crawling too early. Uses RunCmdSilent so the
-// connect-poll loop doesn't flood journald while waiting for tun0.
+// isOpenVPNConnected returns true once the tunnel's redirect-gateway
+// push has actually taken effect — i.e. the kernel's route lookup
+// for an arbitrary public address resolves via tun0, not via eth0.
+// The looser "any route on tun0 exists" check returns true too
+// early: openvpn installs the per-pod link-local route (e.g.
+// 10.x.0.0/24 dev tun0) BEFORE the redirect-gateway default-
+// eclipsing routes are pushed, so the exit-IP contract probe in
+// cmd/tundler-tunnel/egress.go fires while the main-ns default
+// route is still via eth0 and flags a false-positive leak.
+// Validated against cyberghost — same race, same fix.
+//
+// Production currently runs Surfshark in WireGuard mode (see
+// SURFSHARK_PROTOCOL env), so this OpenVPN branch isn't exercised
+// today; keeping the fix in place so a future protocol flip doesn't
+// regress on the contract test.
 func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "show", "dev", "tun0")
+	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return len(out) > 0
+	return strings.Contains(out, " dev tun0 ")
 }
 
 // isWireGuardConnected checks if WireGuard tunnel is up in the main
