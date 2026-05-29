@@ -93,6 +93,13 @@ const (
 	// its own routing table).
 	remoteViaWarpPref = "100"
 	warpDev           = "CloudflareWARP"
+	// FastVPN/WLVPN push these internal DNS resolvers in their
+	// PUSH_REPLY; they're reachable only through tun0. We point
+	// resolv.conf at them once the tunnel is up, replacing WARP's
+	// hijacked + flaky local stub (127.0.2.x). Resolving via FastVPN
+	// also keeps DNS geo-consistent with the exit.
+	fastvpnDNS = "nameserver 198.18.0.1\nnameserver 198.18.0.2\n"
+	resolvConf = "/etc/resolv.conf"
 )
 
 var warpFlags = []string{"--accept-tos"}
@@ -553,6 +560,13 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 	for j := 0; j < 60; j++ {
 		time.Sleep(500 * time.Millisecond)
 		if isOpenVPNConnected() {
+			// Repoint DNS away from WARP's hijacked stub to
+			// FastVPN's pushed resolvers (via tun0). Must happen
+			// before Status()/the contract probe, which both
+			// resolve hostnames.
+			if err := os.WriteFile(resolvConf, []byte(fastvpnDNS), 0644); err != nil {
+				shared.Debugf("FastVPN: could not repoint resolv.conf to FastVPN DNS: %v", err)
+			}
 			activeServer = server
 			activeMu.Lock()
 			activeLocation = location
