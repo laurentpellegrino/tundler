@@ -54,7 +54,7 @@ RUN if [ -z "${PROVIDER}" ]; then \
         echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
     fi && \
     case "${PROVIDER}" in \
-        cyberghost|expressvpn|mullvad|nordvpn|pia|protonvpn|surfshark|warp) ;; \
+        cyberghost|expressvpn|fastvpn|mullvad|nordvpn|pia|protonvpn|surfshark|warp) ;; \
         *) echo "ERROR: PROVIDER=${PROVIDER} not in allow-list" >&2; exit 1 ;; \
     esac
 
