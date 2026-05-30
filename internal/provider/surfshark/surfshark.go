@@ -274,6 +274,17 @@ PersistentKeepalive = 25
 	// (tun0 lives in main ns because the daemon does too).
 	// RunCmd (the new default after the 2026-05-28 inversion) skips the `ip netns exec vpnns` wrap that
 	// systemd-Environment TUNDLER_NETNS=vpnns would otherwise add.
+	//
+	// Idempotency guard: tundler-tunnel.service restarts inside the SAME
+	// pod (and thus the same network namespace) on failure, so a wg0
+	// brought up by a previous attempt survives the restart. Without a
+	// clean Disconnect in between (a crash, or a connect that failed the
+	// exit-IP contract after `up`), the next `wg-quick up` aborts with
+	// "`wg0' already exists" and the pod crashloops forever with no path
+	// to recovery. Tear down any leftover wg0 first — best-effort, errors
+	// ignored since on the happy path there's nothing to remove.
+	cleanupStaleWireGuard(ctx, configFile)
+
 	output, err := shared.RunCmd(ctx, "wg-quick", "up", configFile)
 	if err != nil {
 		return fmt.Errorf("failed to start wireguard: %w: %s", err, output)
@@ -282,6 +293,29 @@ PersistentKeepalive = 25
 	activeServer = server
 	activeProtocol = "wireguard"
 	return nil
+}
+
+// cleanupStaleWireGuard best-effort removes a leftover wg0 interface
+// before a fresh `wg-quick up`. See the call site in connectWireGuard
+// for why a stale wg0 can survive into a new connect attempt. No-op
+// when wg0 isn't present (the happy path); all errors are ignored.
+func cleanupStaleWireGuard(ctx context.Context, configFile string) {
+	if !wireGuardInterfacePresent(ctx) {
+		return
+	}
+	shared.Debugf("Surfshark: stale wg0 from a prior run — tearing down before up")
+	// wg-quick down unwinds the routes/rules/fwmark it installed; the
+	// bare `ip link del` is a fallback for when only the interface is
+	// left (e.g. wg-quick down can't find its saved state).
+	shared.RunCmdSilent(ctx, "wg-quick", "down", configFile)
+	shared.RunCmdSilent(ctx, "ip", "link", "del", "wg0")
+}
+
+// wireGuardInterfacePresent reports whether a wg0 link exists in the
+// current (main) network namespace.
+func wireGuardInterfacePresent(ctx context.Context) bool {
+	_, err := shared.RunCmdSilent(ctx, "ip", "link", "show", "wg0")
+	return err == nil
 }
 
 // isOpenVPNConnected returns true once the tunnel's redirect-gateway
