@@ -49,6 +49,13 @@ type StateTracker struct {
 	// (see runWedgeGuard in main.go), not /livez.
 	lastReadyAt time.Time
 
+	// nextRotationAt is the wall-clock time the rotator's timer is set to
+	// fire. The rotator goroutine owns this — it stamps it when arming
+	// the initial timer and after each Reset. Snapshot derives
+	// next_rotation_in_seconds from it (clamped at 0). Zero value means
+	// "rotation not yet scheduled", which /status reports as 0.
+	nextRotationAt time.Time
+
 	// authFailuresTotal counts every Login() failure observed since
 	// process boot. Surfaced on /status so an aggregator (the crawler)
 	// can sum across the fleet and page when a single provider's
@@ -179,10 +186,18 @@ func (s *StateTracker) RecordRotation(previousExitIP, newExitIP, outcome string,
 	s.mu.Unlock()
 }
 
+// RecordNextRotation stamps the wall-clock time the rotator's timer is
+// next set to fire. Called by the rotator goroutine when it arms the
+// initial timer and after each Reset, so /status can report
+// next_rotation_in_seconds.
+func (s *StateTracker) RecordNextRotation(at time.Time) {
+	s.mu.Lock()
+	s.nextRotationAt = at
+	s.mu.Unlock()
+}
+
 // Snapshot returns a copy of the tracker's state as the JSON-serializable
-// shape /status emits. next_rotation_in_seconds is not populated here —
-// the rotator goroutine owns that knowledge; later slices may pipe it
-// through if dashboards need it.
+// shape /status emits.
 func (s *StateTracker) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -205,6 +220,11 @@ func (s *StateTracker) Snapshot() Snapshot {
 	}
 	if !s.lastAuthFailureAt.IsZero() {
 		snap.LastAuthFailureAt = s.lastAuthFailureAt.Format(time.RFC3339)
+	}
+	if !s.nextRotationAt.IsZero() {
+		if remaining := time.Until(s.nextRotationAt); remaining > 0 {
+			snap.NextRotationInSeconds = int(remaining.Round(time.Second).Seconds())
+		}
 	}
 	return snap
 }

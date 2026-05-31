@@ -37,6 +37,7 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 
 	timer := time.NewTimer(initialOffset)
 	defer timer.Stop()
+	state.RecordNextRotation(time.Now().Add(initialOffset))
 
 	for {
 		select {
@@ -47,6 +48,7 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 			next := pickRotationInterval(minInterval, maxInterval)
 			log.Printf("tundler-tunnel: next rotation in %s", next.Round(time.Second))
 			timer.Reset(next)
+			state.RecordNextRotation(time.Now().Add(next))
 		}
 	}
 }

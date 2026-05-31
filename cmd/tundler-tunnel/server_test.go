@@ -146,6 +146,27 @@ func TestStatusHandler_TunnelUpFields(t *testing.T) {
 	}
 }
 
+func TestStatusHandler_NextRotationInSeconds(t *testing.T) {
+	st := NewStateTracker("ipvanish")
+
+	// Unset: rotator hasn't armed yet — field reports 0.
+	if got := st.Snapshot().NextRotationInSeconds; got != 0 {
+		t.Errorf("unset next_rotation_in_seconds=%d, want 0", got)
+	}
+
+	// Armed for the future: reports the remaining seconds (rounded).
+	st.RecordNextRotation(time.Now().Add(2 * time.Hour))
+	if got := st.Snapshot().NextRotationInSeconds; got < 7195 || got > 7200 {
+		t.Errorf("armed next_rotation_in_seconds=%d, want ~7200", got)
+	}
+
+	// A timer already in the past must clamp to 0, never go negative.
+	st.RecordNextRotation(time.Now().Add(-time.Minute))
+	if got := st.Snapshot().NextRotationInSeconds; got != 0 {
+		t.Errorf("past next_rotation_in_seconds=%d, want 0 (clamped)", got)
+	}
+}
+
 func TestStateTracker_TunnelUpListenerFiresWithExitIP(t *testing.T) {
 	st := NewStateTracker("expressvpn")
 	got := make(chan string, 3)
