@@ -1,0 +1,86 @@
+name: Update PureVPN servers
+
+# Refreshes the `purevpn-servers` GH release asset (servers.json) from
+# PureVPN's PUBLIC OpenVPN config bundle. The tundler-purevpn image build
+# downloads from that release at image-build time and drops it at
+# /etc/purevpn/servers.json (read by the runtime provider — there is no
+# embedded fallback, the build extracts from the bundle directly if the
+# release is missing). The list is NOT versioned in the repo.
+#
+# The bundle is a public, unauthenticated zip of per-server .ovpn files
+# named <slug>-auto-udp-qr.ovpn; we keep just the UDP slug list (the
+# provider builds each remote as <slug>-auto-udp-qr.ptoserver.com).
+
+on:
+  schedule:
+    # 05:55 UTC daily — before docker-image.yml (07:00 UTC) so a same-day
+    # image rebuild picks up server additions/removals within a day.
+    - cron: '55 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+
+concurrency:
+  group: update-purevpn-servers
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: purevpn-servers
+      BUNDLE_URL: https://d11a57lttb2ffq.cloudfront.net/heartbleed/router/Recommended-CA2.zip
+    steps:
+      - name: Extract slug list from PureVPN config bundle
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl -fsSL --max-time 90 "$BUNDLE_URL" -o "$tmp/pv.zip"
+          unzip -o -q "$tmp/pv.zip" -d "$tmp"
+          find "$tmp" -name '*-auto-udp-qr.ovpn' -printf '%f\n' \
+            | sed 's/-auto-udp-qr.ovpn//' \
+            | sort -u \
+            | jq -R . | jq -s . > /tmp/servers.json
+          n=$(jq 'length' /tmp/servers.json)
+          if [ "$n" -lt 20 ]; then
+            echo "::error::Server list returned only $n slugs (<20 floor) — refusing to publish."
+            exit 1
+          fi
+          echo "Extracted $n server slugs."
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern servers.json --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/servers.json | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/servers.json | awk '{print $1}')
+            if [ "$FRESH_SUM" = "$CURR_SUM" ]; then
+              echo "Servers unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Servers changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "PureVPN server slug list" \
+                --notes "Daily UDP slug list extracted from PureVPN's public OpenVPN config bundle. See update-purevpn-servers.yml."
+          gh release upload "$RELEASE_TAG" /tmp/servers.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} servers.json"
