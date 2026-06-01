@@ -1,0 +1,87 @@
+name: Update Mullvad relays
+
+# Refreshes the `mullvad-relays` GH release asset (relays.json) from
+# Mullvad's PUBLIC relay API. The tundler-mullvad image build downloads
+# from that release at image-build time and drops it at
+# /etc/mullvad/relays.json (read by the runtime provider — there is no
+# embedded fallback, the build fetches the live API if the release is
+# missing). The list is NOT versioned in the repo.
+#
+# Why no auth / no scraping:
+# https://api.mullvad.net/app/v1/relays is public and unauthenticated —
+# it's the same catalog the Mullvad app itself uses. We trim it to just
+# the WireGuard relays + the locations map (the only fields the provider
+# reads) to keep the baked asset small. No OpenBao creds, no WARP egress
+# (unlike protonvpn), no DNS sweep (unlike cyberghost).
+
+on:
+  schedule:
+    # 05:45 UTC daily — before docker-image.yml (07:00 UTC) so a same-day
+    # image rebuild picks up relay additions/decommissions within a day.
+    - cron: '45 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+
+concurrency:
+  group: update-mullvad-relays
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: mullvad-relays
+    steps:
+      - name: Fetch + trim relay list
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 https://api.mullvad.net/app/v1/relays \
+            | jq '{locations, wireguard: {relays: [.wireguard.relays[]
+                  | {hostname, active, location, ipv4_addr_in, public_key}]}}' \
+            > /tmp/relays.json
+          # Sanity-floor: refuse to publish a near-empty list (API blip /
+          # blocked on the runner). Keep the previous release.
+          n=$(jq '.wireguard.relays | length' /tmp/relays.json)
+          if [ "$n" -lt 50 ]; then
+            echo "::error::Relay list returned only $n WireGuard relays (<50 floor) — refusing to publish."
+            exit 1
+          fi
+          echo "Fetched $n WireGuard relays."
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern relays.json --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/relays.json | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/relays.json | awk '{print $1}')
+            if [ "$FRESH_SUM" = "$CURR_SUM" ]; then
+              echo "Relays unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Relays changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "Mullvad WireGuard relay catalog" \
+                --notes "Daily trim of https://api.mullvad.net/app/v1/relays (WireGuard relays + locations). See update-mullvad-relays.yml."
+          gh release upload "$RELEASE_TAG" /tmp/relays.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} relays.json"

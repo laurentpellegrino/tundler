@@ -127,7 +127,6 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
 RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
-        mullvad)    systemctl enable mullvad-daemon.service || true ;; \
         pia)        systemctl enable piavpn.service || true ;; \
         warp)       systemctl enable warp-svc.service || true ;; \
         fastvpn)    systemctl enable warp-svc.service || true ;; \
