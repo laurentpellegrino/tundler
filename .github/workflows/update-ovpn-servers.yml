@@ -1,0 +1,82 @@
+name: Update OVPN servers
+
+# Refreshes the `ovpn-servers` GH release asset (servers.json) from OVPN's
+# PUBLIC datacenter API. The tundler-ovpn image build downloads from that
+# release at image-build time and drops it at /etc/ovpn/servers.json (read
+# by the runtime provider — there is no embedded fallback, the build fetches
+# the live API if the release is missing). The list is NOT versioned in the
+# repo.
+#
+# https://www.ovpn.com/v1/api/client/datacenters is public and
+# unauthenticated — it returns {"<idx>":{"ip","slug","city","country"},...}.
+# We store it verbatim; the provider builds each remote as
+# pool-1.prd.<country-lower>.<slug>.ovpn.com.
+
+on:
+  schedule:
+    # 05:50 UTC daily — before docker-image.yml (07:00 UTC) so a same-day
+    # image rebuild picks up datacenter additions/removals within a day.
+    - cron: '50 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+
+concurrency:
+  group: update-ovpn-servers
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: ovpn-servers
+    steps:
+      - name: Fetch datacenter list
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 60 https://www.ovpn.com/v1/api/client/datacenters \
+            | jq '.' > /tmp/servers.json
+          # Sanity-floor: refuse to publish a near-empty list (API blip).
+          n=$(jq '[.[] | select(.slug)] | length' /tmp/servers.json)
+          if [ "$n" -lt 10 ]; then
+            echo "::error::Datacenter list returned only $n entries (<10 floor) — refusing to publish."
+            exit 1
+          fi
+          echo "Fetched $n datacenters."
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern servers.json --dir /tmp/current 2>/dev/null; then
+            FRESH_SUM=$(sha256sum /tmp/servers.json | awk '{print $1}')
+            CURR_SUM=$(sha256sum /tmp/current/servers.json | awk '{print $1}')
+            if [ "$FRESH_SUM" = "$CURR_SUM" ]; then
+              echo "Datacenters unchanged (sha256 match); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Datacenters changed: $CURR_SUM → $FRESH_SUM"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "OVPN.com datacenter list" \
+                --notes "Daily snapshot of https://www.ovpn.com/v1/api/client/datacenters. See update-ovpn-servers.yml."
+          gh release upload "$RELEASE_TAG" /tmp/servers.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} servers.json"
