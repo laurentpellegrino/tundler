@@ -137,6 +137,18 @@ func main() {
 		proxySrv.SetExitIP(exitIP)
 	})
 
+	// Proxy-chain providers (TunnelBear) don't bring up a kernel
+	// tunnel: they forward through an upstream HTTPS proxy by
+	// installing a dialer on the proxy. Hand them the proxy server so
+	// Connect/rotate can do so, and route the exit-IP contract probe
+	// through that same dialer (a direct probe would bypass the
+	// upstream proxy and read the node IP). Kernel-tunnel providers
+	// implement neither hook and are unaffected.
+	if pc, ok := prov.(interface{ AttachProxy(*proxy.Server) }); ok {
+		pc.AttachProxy(proxySrv)
+		contractProbeDialer = proxySrv.DialUpstream
+	}
+
 	// Capture the pod's pre-VPN egress IP so the post-Connect contract
 	// check (verifyExitIPDiffers) has a baseline to compare against.
 	// Runs BEFORE the rotation closure is constructed (so the closure

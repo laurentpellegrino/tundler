@@ -5,10 +5,23 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// contractProbeDialer, when non-nil, tunnels the post-connect exit-IP
+// contract probe through the in-process proxy's upstream dialer. It is
+// wired in main() to proxy.Server.DialUpstream. For kernel-tunnel
+// providers (OpenVPN/WireGuard/CLI) the proxy has no custom dialer, so
+// ok=false and the probe falls back to a direct dial — identical to the
+// historical behaviour. For proxy-chain providers (TunnelBear) a direct
+// probe would bypass the upstream proxy and read the node IP; routing it
+// through the same dialer crawler traffic uses makes the contract test
+// correct. The pre-VPN baseline probe never uses this (it must measure
+// the real node IP), so it keeps calling probeEgressIP directly.
+var contractProbeDialer func(ctx context.Context, target string) (net.Conn, bool, error)
 
 // egressCheckURL is the upstream we probe to learn what source IP
 // the world sees us from. Plain text body containing the IP and
@@ -65,6 +78,47 @@ func probeEgressIP(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
+// probeContractEgressIP is probeEgressIP for the post-connect contract
+// check. When a proxy-chain dialer is installed (contractProbeDialer
+// non-nil and the proxy has a custom dialer) the probe is tunneled
+// through it — the same path crawler traffic takes. Otherwise it dials
+// directly, matching probeEgressIP exactly.
+func probeContractEgressIP(ctx context.Context) (string, error) {
+	if contractProbeDialer == nil {
+		return probeEgressIP(ctx)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, egressProbeTimeout)
+	defer cancel()
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
+			if conn, ok, err := contractProbeDialer(c, addr); ok {
+				return conn, err
+			}
+			var d net.Dialer
+			return d.DialContext(c, network, addr)
+		},
+	}
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, egressCheckURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("egress probe: status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 // errExitIPLeak is the canonical signal that a Connect succeeded
 // at the link/route layer but post-connect traffic still exits via
 // the pre-VPN baseline IP (= no actual tunneling). Surfaced as an
@@ -89,7 +143,7 @@ func verifyExitIPDiffers(ctx context.Context, baseline string) error {
 		log.Printf("tundler-tunnel: exit-ip contract: SKIPPED (no pre-VPN baseline)")
 		return nil
 	}
-	observed, err := probeEgressIP(ctx)
+	observed, err := probeContractEgressIP(ctx)
 	if err != nil {
 		log.Printf("tundler-tunnel: exit-ip contract: probe error: %v — soft-pass (watchdog will catch a wedged tunnel)", err)
 		return nil
