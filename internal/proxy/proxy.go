@@ -74,6 +74,19 @@ type Server struct {
 	exitIP   atomic.Value // string; updated by SetExitIP
 	draining atomic.Bool  // when true, refuse new CONNECTs with 503
 
+	// dial is an optional override for how the proxy reaches the
+	// upstream target. Nil (the default for every kernel-tunnel
+	// provider — OpenVPN, WireGuard, vendor CLIs) means "direct dial":
+	// net.DialTimeout to the target, which the pod's default route
+	// sends through the VPN. A non-nil dialer is installed by
+	// proxy-chain providers (e.g. TunnelBear, whose "VPN" is an
+	// upstream HTTPS CONNECT proxy rather than a kernel route): the
+	// provider sets it on Connect and swaps it on rotate, so every
+	// subsequent CONNECT is tunneled through the chosen upstream proxy.
+	// Read once per request in handle(); stored as a pointer so the
+	// swap is atomic and lock-free, mirroring the exitIP pattern.
+	dial atomic.Pointer[DialFunc]
+
 	listener net.Listener
 
 	// concurrency limiter — buffered chan as semaphore. Acquired
@@ -115,6 +128,13 @@ type Server struct {
 	consecutiveDialFails atomic.Int64
 }
 
+// DialFunc reaches an upstream target (host:port) on the proxy's
+// behalf. Installed by proxy-chain providers via SetDialer; when none
+// is set the proxy dials the target directly (net.DialTimeout). The
+// returned conn is spliced bidirectionally to the client exactly like
+// a direct dial, so drain/health accounting is unaffected.
+type DialFunc func(ctx context.Context, target string) (net.Conn, error)
+
 // TunnelHealth is the proxy's view of recent upstream-dial outcomes,
 // consumed by the watchdog instead of the per-provider CLI Connected()
 // probe. See Server.RecentTunnelHealth.
@@ -144,6 +164,37 @@ func New(addr, podName, nodeIP string) *Server {
 // Empty string means "no exit IP known yet" — the header is then
 // omitted from responses entirely.
 func (s *Server) SetExitIP(ip string) { s.exitIP.Store(ip) }
+
+// SetDialer installs a custom upstream dialer (proxy-chain providers).
+// Passing nil restores the default direct dial. Safe to call from any
+// goroutine; takes effect on the next CONNECT. Providers set this on
+// Connect and swap it on rotate so traffic follows the chosen upstream
+// proxy. A dialer that returns an error for every target (see
+// tunnelbear's "disconnected" dialer) is the safe state between
+// teardown and the next Connect — it fails closed rather than leaking
+// to the pod's node IP.
+func (s *Server) SetDialer(d DialFunc) {
+	if d == nil {
+		s.dial.Store(nil)
+		return
+	}
+	s.dial.Store(&d)
+}
+
+// DialUpstream dials target through the installed custom dialer, if
+// any. ok=false means no custom dialer is set (kernel-tunnel
+// providers) — callers should fall back to a direct dial. Used by the
+// exit-IP contract probe so it traverses the SAME upstream path as
+// crawler traffic for proxy-chain providers (a direct probe would
+// bypass the upstream proxy and falsely read the pod's node IP).
+func (s *Server) DialUpstream(ctx context.Context, target string) (conn net.Conn, ok bool, err error) {
+	d := s.dial.Load()
+	if d == nil {
+		return nil, false, nil
+	}
+	c, e := (*d)(ctx, target)
+	return c, true, e
+}
 
 // SetDraining toggles drain mode. When draining, the proxy still
 // accepts connections but immediately returns 503 to CONNECT
@@ -297,9 +348,19 @@ func (s *Server) handle(client net.Conn) {
 		return
 	}
 
-	// Dial upstream. Go's default resolver caches via the host's
-	// nsswitch + glibc cache; sufficient for our load.
-	upstream, err := net.DialTimeout("tcp", target, upstreamDialTimeout)
+	// Dial upstream. Default path: direct net.DialTimeout to the
+	// target, which the pod's default route sends through the VPN
+	// tun0 (kernel-tunnel providers). Proxy-chain providers install a
+	// custom dialer via SetDialer that tunnels through an upstream
+	// HTTPS proxy instead — same returned conn, same accounting.
+	var upstream net.Conn
+	if d := s.dial.Load(); d != nil {
+		dctx, cancel := context.WithTimeout(context.Background(), upstreamDialTimeout)
+		upstream, err = (*d)(dctx, target)
+		cancel()
+	} else {
+		upstream, err = net.DialTimeout("tcp", target, upstreamDialTimeout)
+	}
 	s.recordDial(err == nil)
 	if err != nil {
 		s.totalError.Add(1)
