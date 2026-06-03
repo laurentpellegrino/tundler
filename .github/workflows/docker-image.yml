@@ -88,6 +88,13 @@ jobs:
             exit 1
           fi
           echo "Prefetched installer: $SZ bytes"
+      # Disconnect WARP before the build: the full WARP tunnel breaks the
+      # build's other downloads (go mod download can't reach the Go module
+      # proxy through WARP). The installer is already on disk, so the build
+      # uses it without touching ExpressVPN's CDN.
+      - name: Disconnect WARP before build
+        if: matrix.provider == 'expressvpn'
+        run: sudo warp-cli --accept-tos disconnect || true
       - name: Build and push tundler-${{ matrix.provider }}
         uses: docker/build-push-action@v7
         with:
