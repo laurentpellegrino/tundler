@@ -21,7 +21,36 @@ apt-get install -y procps psmisc libatomic1 libglib2.0-0 libbrotli1 libcap2-bin
 # Download & extract installer
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
-curl -L -o "$FILENAME" "$URL"
+# ExpressVPN's CDN (expressvpn.works) serves a small HTML block/challenge
+# page instead of the .run to some datacenter IPs (notably GitHub Actions
+# runners — the block is per source IP, not per user-agent). The old
+# `curl -L` didn't notice and the build then tried to EXECUTE that HTML
+# as a shell script (`<!DOCTYPE HTML ...: syntax error`). Harden it: send
+# a browser UA, retry with backoff (covers intermittent/per-runner
+# blocks), and validate the result is the real makeself archive (sizeable,
+# not starting with '<') — failing loudly with the block page's first
+# bytes instead of running garbage.
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+download_installer() {
+    local attempt sz first
+    for attempt in 1 2 3 4; do
+        if curl -fL --max-time 300 -A "$UA" -o "$FILENAME" "$URL"; then
+            sz=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
+            first=$(head -c1 "$FILENAME" 2>/dev/null)
+            if [ "$sz" -gt 1000000 ] && [ "$first" != "<" ]; then
+                echo "ExpressVPN: downloaded installer ($sz bytes)"
+                return 0
+            fi
+            echo "ExpressVPN: attempt $attempt got an invalid file (size=$sz, first='$first') — likely a CDN block page; retrying..."
+        fi
+        sleep $((attempt * 10))
+    done
+    echo "ERROR: could not download a valid ExpressVPN installer from $URL." >&2
+    echo "       The CDN is likely blocking this host's IP with an HTML page. First bytes:" >&2
+    head -c 300 "$FILENAME" >&2 || true
+    return 1
+}
+download_installer
 chmod +x "$FILENAME"
 "./$FILENAME" --noexec --nox11 --target "$WORKDIR/extracted"
 
