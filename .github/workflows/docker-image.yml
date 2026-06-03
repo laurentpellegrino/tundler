@@ -62,6 +62,32 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # ExpressVPN's CDN serves a Cloudflare block page to GitHub Actions
+      # runner IPs, so the in-build curl gets HTML instead of the .run. Same
+      # fix as the proton/ipvanish refresh workflows: route the runner's
+      # egress through Cloudflare WARP and prefetch the official installer
+      # on the runner, then hand it to the build (install.sh prefers the
+      # prefetched file). The version/URL lives only in install.sh.
+      - name: Setup Cloudflare WARP (expressvpn)
+        if: matrix.provider == 'expressvpn'
+        uses: ./.github/actions/setup-cloudflare-warp
+      - name: Prefetch ExpressVPN installer via WARP
+        if: matrix.provider == 'expressvpn'
+        run: |
+          set -euo pipefail
+          URL=$(grep -E '^URL=' docker/providers/expressvpn/install.sh | head -1 | cut -d'"' -f2)
+          OUT=docker/providers/expressvpn/expressvpn-prefetched.run
+          echo "Prefetching $URL through WARP..."
+          curl -fL --max-time 600 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" \
+            -o "$OUT" "$URL"
+          SZ=$(stat -c%s "$OUT"); FIRST=$(head -c1 "$OUT")
+          if [ "$SZ" -le 1000000 ] || [ "$FIRST" = "<" ]; then
+            echo "::error::Prefetched installer is invalid ($SZ bytes, first='$FIRST') — WARP egress still blocked?"
+            head -c 300 "$OUT" || true
+            exit 1
+          fi
+          echo "Prefetched installer: $SZ bytes"
       - name: Build and push tundler-${{ matrix.provider }}
         uses: docker/build-push-action@v7
         with:
