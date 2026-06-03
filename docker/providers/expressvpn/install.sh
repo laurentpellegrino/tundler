@@ -50,7 +50,21 @@ download_installer() {
     head -c 300 "$FILENAME" >&2 || true
     return 1
 }
-download_installer
+# In CI the installer is prefetched on the runner THROUGH Cloudflare WARP
+# (see .github/workflows/docker-image.yml + .github/actions/setup-cloudflare-warp)
+# and dropped next to this script, because ExpressVPN's CDN serves a block
+# page to GitHub Actions runner IPs. If that prefetched file is present and
+# valid, use it; otherwise download directly (works on un-blocked IPs, e.g.
+# local builds). Either way it's the official current .run from the CDN, not
+# a frozen re-host.
+PREFETCHED="$(dirname "$0")/expressvpn-prefetched.run"
+if [ -f "$PREFETCHED" ] && [ "$(head -c1 "$PREFETCHED" 2>/dev/null)" != "<" ] \
+   && [ "$(stat -c%s "$PREFETCHED" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+    echo "ExpressVPN: using WARP-prefetched installer ($(stat -c%s "$PREFETCHED") bytes)"
+    cp "$PREFETCHED" "$FILENAME"
+else
+    download_installer
+fi
 chmod +x "$FILENAME"
 "./$FILENAME" --noexec --nox11 --target "$WORKDIR/extracted"
 
