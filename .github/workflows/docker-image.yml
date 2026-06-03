@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: [cyberghost, expressvpn, fastvpn, ipvanish, mullvad, nordvpn, ovpn, pia, protonvpn, purevpn, surfshark, tunnelbear, veepn, warp, windscribe]
+        provider: [cyberghost, expressvpn, fastvpn, ipvanish, mullvad, nordvpn, ovpn, pia, protonvpn, psiphon, purevpn, surfshark, tunnelbear, veepn, warp, windscribe]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
