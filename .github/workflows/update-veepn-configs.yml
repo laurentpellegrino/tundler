@@ -1,0 +1,100 @@
+name: Update VeePN configs
+
+# VeePN's dashboard + API sit behind a Cloudflare JS challenge, so the
+# config archive can't be fetched with curl (it 403s). This workflow
+# drives a real Chrome (headed, under xvfb) to clear the challenge, log
+# in, and download "all configuration files", then republishes the
+# `veepn-configs` release that docker/providers/veepn/install.sh bakes.
+#
+# Prerequisites (repo Settings → Secrets and variables → Actions):
+#   VEEPN_EMAIL     — VeePN account login email
+#   VEEPN_PASSWORD  — VeePN account login password
+#                     (the ACCOUNT login, NOT the per-pod manual-config
+#                      credentials that live in OpenBao vpn/veepn/pod-<n>)
+#
+# Intentionally workflow_dispatch-ONLY for now: Cloudflare + SPA
+# automation is fragile and the login/download selectors in
+# scripts/update-veepn-configs.py are best-effort. Run it manually once;
+# once it succeeds reliably, uncomment the schedule below to go daily.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '40 5 * * *'   # 05:40 UTC, before docker-image.yml's 07:00 rebuild
+
+permissions:
+  contents: write   # create/upload the veepn-configs release
+
+concurrency:
+  cancel-in-progress: true
+  group: update-veepn-configs
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: veepn-configs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright + Chrome + xvfb
+        run: |
+          set -euo pipefail
+          pip install playwright
+          sudo apt-get update && sudo apt-get install -y xvfb
+          # channel="chrome" → install real Google Chrome (best odds vs
+          # Cloudflare's managed challenge; headless chromium is blocked).
+          python -m playwright install --with-deps chrome
+
+      - name: Download configs via headless browser
+        env:
+          VEEPN_EMAIL: ${{ secrets.VEEPN_EMAIL }}
+          VEEPN_PASSWORD: ${{ secrets.VEEPN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VEEPN_EMAIL:-}" ] || [ -z "${VEEPN_PASSWORD:-}" ]; then
+            echo "::error::VEEPN_EMAIL / VEEPN_PASSWORD repo secrets are not set."
+            exit 1
+          fi
+          xvfb-run -a python scripts/update-veepn-configs.py --out /tmp/veepn-configs.zip
+
+      - name: Skip when checksum matches current release
+        id: skip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release download "$RELEASE_TAG" --pattern veepn-configs.zip --dir /tmp/current 2>/dev/null; then
+            # zips aren't byte-stable; compare the sorted set of member names + sizes.
+            sig() { unzip -l "$1" | awk 'NF>=4 && $4 ~ /\.ovpn$/ {print $1, $4}' | sort | sha256sum; }
+            if [ "$(sig /tmp/veepn-configs.zip)" = "$(sig /tmp/current/veepn-configs.zip)" ]; then
+              echo "Configs unchanged (same file set); nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Configs changed."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No existing release asset yet; publishing initial."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "VeePN OpenVPN configs (account dashboard mirror)" \
+                --notes "All-locations OpenVPN config archive from VeePN's 'download all configs', fetched via headless browser (Cloudflare-gated). See update-veepn-configs.yml."
+          gh release upload "$RELEASE_TAG" /tmp/veepn-configs.zip --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Refreshed ${RELEASE_TAG} veepn-configs.zip"
