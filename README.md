@@ -1,235 +1,152 @@
 # Tundler
 
-Tundler ("tunnel bundler") packages a small REST API in a Docker image to manage multiple VPN providers.
-It can rotate tunnels on demand and exposes an HTTP proxy routed through the active VPN.
+Tundler ("tunnel bundler") turns a commercial VPN provider into a **single-purpose
+tunnel pod**: one Docker image per provider, each running the `tundler-tunnel`
+binary which brings up the VPN, keeps it healthy, rotates its exit IP on a
+schedule, and exposes the tunnel as an in-process HTTP **CONNECT proxy**.
 
-Unlike other solutions, it depends as much as possible on the VPN providers’ official client libraries
-to minimise breakage and remains stateless on its own.
+It was built to give a Kubernetes crawler fleet a large, diverse pool of
+rotating egress IPs: the crawler points each of its slots at a tunnel pod's
+proxy and the pod handles everything VPN-related behind it.
 
-## Features
+> **Architecture note.** Tundler used to be a single container that bundled
+> *all* providers behind one REST API + Envoy + network-namespace isolation.
+> That model is gone. Today each provider is its own image, the proxy is
+> in-process (no Envoy), and everything runs in the pod's main network
+> namespace. The detailed runtime design is in
+> [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md).
 
-- REST API on port `4242` for controlling VPN connections.
-- ExpressVPN, IPVanish, Mullvad, NordVPN, Private Internet Access (PIA), Proton VPN and Surfshark support out of the box.
-- Optional HTTP proxy on port `8484` with Envoy-based HTTP/HTTPS support.
-- YAML configuration file for location filtering and debug mode.
-- Easily extensible to add new providers.
-- Sidecar plugins can add non-core API features under `/plugins/...`.
+## What a tunnel pod does
 
-## Architecture
+Each pod is a single container running `systemd` → `tundler-tunnel`, which:
 
-Tundler uses Linux network namespaces to provide VPN proxy functionality while maintaining API accessibility.
-The system consists of two isolated network environments within a Docker container:
+1. **Logs in** to the provider (env-supplied credentials) and **connects** a
+   tunnel to a randomly chosen allowed location.
+2. Verifies the tunnel actually routes traffic out a different IP than the
+   node (the **exit-IP contract test**) before reporting ready.
+3. Serves an in-process **CONNECT proxy on `:8485`** — crawler traffic dialed
+   through it egresses via the VPN.
+4. Serves an **HTTP control API on `:4242`** (`/livez`, `/readyz`, `/status`,
+   `/rotate`) used by k8s probes and by clients triggering a rotation.
+5. **Rotates** to a fresh exit on a time window (or on demand), draining
+   in-flight connections first.
+6. Self-heals via an in-process **watchdog** (reconnects when upstream dials
+   start failing) and **wedge guard** (force-reconnect if stuck).
 
-### Network Architecture Diagram
+See the design doc for the pod state machine, probe semantics, failure layers,
+rotation/drain, and the full env-knob list.
 
-```
-                                 HOST SYSTEM
-        ┌────────────────────────────────────────────────────────────┐
-        │  curl --proxy localhost:8484 example.com                   │
-        └──────────────────────┬─────────────────────────────────────┘
-                               │ HTTP/HTTPS requests
-                               ▼
-    ┌────────────────────────────────────────────────────────────────────┐
-    │                           DOCKER CONTAINER                         │
-    │                                                                    │
-    │   ┌───────────────── DEFAULT NAMESPACE ────────────────────────┐   │
-    │   │                                                            │   │
-    │   │  ┌─────────────┐   ┌─────────────────┐  ┌──────────────┐  │   │
-    │   │  │ Tundler API │   │   Envoy Proxy   │  │  Docker DNS  │  │   │
-    │   │  │    :4242    │   │  :8484 (envoy)  │  │  (1.1.1.1)   │  │   │
-    │   │  └─────────────┘   └────────┬────────┘  └──────▲───────┘  │   │
-    │   │                             │                   │ DNS      │   │
-    │   │            UID-based mark ──┤  DNS queries ─────┘          │   │
-    │   │            (fwmark 200)     │  exempt from VPN routing     │   │
-    │   │                             ▼                              │   │
-    │   │        ┌─────────────────────────────────────┐             │   │
-    │   │        │             vpn-host                │             │   │
-    │   │        │          172.18.0.1/30              │             │   │
-    │   │        │        (veth interface)             │             │   │
-    │   │        └─────────────────┬───────────────────┘             │   │
-    │   └──────────────────────────┼─────────────────────────────────┘   │
-    │                              │ virtual ethernet pair               │
-    │                              ▼                                     │
-    │   ┌──────────────── VPN NAMESPACE (vpnns) ─────────────────────┐   │
-    │   │                                                            │   │
-    │   │        ┌─────────────────────────────────────┐             │   │
-    │   │        │         vpn-ns + MASQUERADE          │             │   │
-    │   │        │           172.18.0.2/30             │             │   │
-    │   │        │         (veth interface)            │             │   │
-    │   │        └─────────────────────────────────────┘             │   │
-    │   │                                                            │   │
-    │   │  ┌──────────────┐   ┌────────────┐   ┌──────────────┐      │   │
-    │   │  │  ExpressVPN  │   │    ...     │   │   NordVPN    │      │   │
-    │   │  │   Service    │   │            │   │   Service    │      │   │
-    │   │  │              │   │            │   │              │      │   │
-    │   │  │  ┌────────┐  │   │            │   │  ┌────────┐  │      │   │
-    │   │  │  │  tun0  │  │   │            │   │  │nordlynx│  │      │   │
-    │   │  │  │   IF   │  │   │            │   │  │   IF   │  │      │   │
-    │   │  │  └────────┘  │   │            │   │  └────────┘  │      │   │
-    │   │  └──────────────┘   └────────────┘   └──────────────┘      │   │
-    │   │                                │                           │   │
-    │   └────────────────────────────────┼───────────────────────────┘   │
-    │                                    │ VPN tunnel to internet        │
-    │                                    ▼                               │
-    └────────────────────────────────────────────────────────────────────┘
-                                         │
-                                         ▼
-                                ┌─────────────────┐
-                                │    INTERNET     │
-                                │   (VPN Server)  │
-                                └─────────────────┘
-```
+## Providers
 
-### How Traffic Flows
+One image per provider (`tundler-<provider>`), selected at build time. Four
+integration shapes:
 
-1. **Proxy requests**: Client connects to Envoy on port 8484. Envoy resolves the
-   upstream hostname, then opens a connection to the upstream server. All Envoy
-   traffic is routed through the veth pair into vpnns and forwarded through the
-   active VPN tunnel. By default, DNS queries are resolved outside the tunnel for
-   lower latency. Set `TUNDLER_VPN_DNS=true` to also route DNS through the tunnel
-   for full privacy (see [Environment variables](#environment-variables)).
+| Shape | Providers | How it connects |
+|-------|-----------|-----------------|
+| **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
+| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential |
+| **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
+| **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
 
-2. **API requests**: The Tundler REST API on port 4242 stays in the default
-   namespace and is always reachable regardless of VPN state.
+Credentials come from environment variables (in the fleet, injected from
+OpenBao via ExternalSecret). Most providers share one account credential
+across pods; a few are **per-pod** because each pod needs its own
+session/key/device:
 
-## Getting Started
+| Provider | Credential env |
+|----------|----------------|
+| expressvpn | `EXPRESSVPN_ACTIVATION_CODE` |
+| nordvpn | `NORDVPN_TOKEN` |
+| pia | `PRIVATEINTERNETACCESS_USERNAME` / `_PASSWORD` |
+| ipvanish | `IPVANISH_USERNAME` / `_PASSWORD` |
+| ovpn | `OVPN_USERNAME` / `_PASSWORD` |
+| purevpn | `PUREVPN_USERNAME` / `_PASSWORD` |
+| fastvpn | `FASTVPN_USERNAME` / `_PASSWORD` |
+| protonvpn | `PROTON_OPENVPN_USERNAME` / `_PASSWORD` |
+| surfshark | `SURFSHARK_OPENVPN_USERNAME` / `_PASSWORD` (or `SURFSHARK_WIREGUARD_PRIVATE_KEYS` + `SURFSHARK_PROTOCOL=wireguard`) |
+| windscribe | `WINDSCRIBE_USERNAME` / `_PASSWORD` (the OpenVPN credential, not the account login) |
+| tunnelbear | `TUNNELBEAR_USERNAME` / `_PASSWORD` |
+| mullvad *(per-pod)* | `POD_<n>_MULLVAD_PRIVATE_KEY` / `_ADDRESS` |
+| cyberghost *(per-pod)* | `POD_<n>_CERTIFICATE` / `_KEY` / `_USERNAME` / `_PASSWORD` |
+| veepn *(per-pod)* | `POD_<n>_VEEPN_USERNAME` / `_PASSWORD` (each device credential = one connection slot) |
+| warp | none (anonymous registration) |
+| psiphon | none (embedded network config) |
 
-### Build the image
+## Build & run
+
+Build one provider's image:
 
 ```bash
-docker/build.sh
+docker build -f docker/Dockerfile.tunnel \
+    --build-arg PROVIDER=windscribe \
+    -t laurentpellegrino/tundler-windscribe:latest .
 ```
 
-### Run the container
+The `PROVIDER` build-arg both selects the provider's `install.sh`
+(`docker/providers/<provider>/`) and compiles the binary with
+`-tags provider_<provider>` so only that provider's code + embedded data is
+linked.
 
-Credentials can be provided via environment variables or a `.env` file at the project root:
+Run it (needs `NET_ADMIN` and `/dev/net/tun` for the kernel-tunnel providers):
 
 ```bash
-# Option 1: Environment variables
-EXPRESSVPN_ACTIVATION_CODE=<code> \
-IPVANISH_USERNAME=<username> \
-IPVANISH_PASSWORD=<password> \
-MULLVAD_ACCOUNT_NUMBER=<account> \
-NORDVPN_TOKEN=<token> \
-PRIVATEINTERNETACCESS_USERNAME=<username> \
-PRIVATEINTERNETACCESS_PASSWORD=<password> \
-PROTON_OPENVPN_USERNAME=<username> \
-PROTON_OPENVPN_PASSWORD=<password> \
-SURFSHARK_OPENVPN_USERNAME=<username> \
-SURFSHARK_OPENVPN_PASSWORD=<password> \
-docker/run.sh
+docker run --rm \
+  --cap-add NET_ADMIN --device /dev/net/tun \
+  -e WINDSCRIBE_USERNAME=... -e WINDSCRIBE_PASSWORD=... \
+  -p 8485:8485 -p 4242:4242 \
+  laurentpellegrino/tundler-windscribe:latest
 
-# Option 2: .env file (automatically loaded by run.sh)
-cat > .env << 'EOF'
-NORDVPN_TOKEN=<token>
-MULLVAD_ACCOUNT_NUMBER=<account>
-EOF
-docker/run.sh
+# crawl through the tunnel:
+curl -x http://localhost:8485 https://ipinfo.io
+# check health / current exit:
+curl http://localhost:4242/status
 ```
 
-The API will be reachable on port `4242` and the HTTP proxy on `8484`.
+### Useful env knobs
 
-By default, VPN providers run inside their own network namespace.
-The `TUNDLER_NETNS` environment variable specifies the namespace name
-(defaults to `vpnns`). VPN daemons are launched in that namespace using
-systemd overrides, while the REST API and proxy stay in the main namespace so they 
-remain reachable even when the VPN changes routing.
+| Variable | Description |
+|----------|-------------|
+| `EXCLUDED_LOCATIONS` | comma-separated locations the random picker must never choose |
+| `MIN_ROTATION_SECONDS` / `MAX_ROTATION_SECONDS` | rotation interval window (each interval is a fresh uniform pick) |
+| `BOOT_LOGIN_JITTER_SECONDS` | spread simultaneous boot logins to avoid bursting the auth API |
+| `TUNDLER_PROXY_PORT` | CONNECT proxy port (default `8485`) |
+| `POD_NAME` / `POD_NAMESPACE` | downward-API identity; per-pod providers derive their ordinal from `POD_NAME` |
 
-#### Environment variables
+The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md#environment-knobs).
 
-##### Provider credentials
+## HTTP control API (`:4242`)
 
-| Provider                      | Variables                                                          |
-|-------------------------------|--------------------------------------------------------------------|
-| ExpressVPN                    | `EXPRESSVPN_ACTIVATION_CODE`                                       |
-| IPVanish                      | `IPVANISH_USERNAME`, `IPVANISH_PASSWORD`                           |
-| Mullvad                       | `MULLVAD_ACCOUNT_NUMBER`                                           |
-| NordVPN                       | `NORDVPN_TOKEN`                                                    |
-| Private Internet Access (PIA) | `PRIVATEINTERNETACCESS_USERNAME`, `PRIVATEINTERNETACCESS_PASSWORD` |
-| Proton VPN (OpenVPN)          | `PROTON_OPENVPN_USERNAME`, `PROTON_OPENVPN_PASSWORD`               |
-| Surfshark (OpenVPN)           | `SURFSHARK_OPENVPN_USERNAME`, `SURFSHARK_OPENVPN_PASSWORD`         |
-| Surfshark (WireGuard)         | `SURFSHARK_WIREGUARD_PRIVATE_KEYS`, `SURFSHARK_PROTOCOL=wireguard` |
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/livez` | GET | process is up |
+| `/readyz` | GET | `200` only when a tunnel is connected and the exit-IP contract passed; `503` while connecting/draining/failed |
+| `/status` | GET | JSON: state, current location, exit IP, tunnel age, next-rotation countdown, rotation/auth-failure counts |
+| `/rotate` | POST | drain in-flight connections, disconnect, reconnect to a fresh exit |
 
-Proton VPN uses the OpenVPN/IKEv2 credentials from your Proton account page,
-not your regular Proton account password. Tundler automatically downloads
-Proton server metadata during container configuration and generates the
-OpenVPN profile at connection time. Optional settings:
-`PROTON_OPENVPN_PROTOCOL=udp|tcp` (default `udp`) and `PROTON_OPENVPN_PORT`
-(defaults to `1194` for UDP and `443` for TCP). `PROTON_SERVERS_URL` may be
-set to override the server metadata source.
+## Extending: add a provider
 
-IPVanish has no Linux CLI; Tundler downloads IPVanish's official OpenVPN
-`configs.zip` during container configuration and connects with the username
-and password from your IPVanish account. `IPVANISH_CONFIGS_URL` may be set
-to override the configs source.
+1. `internal/provider/<name>/<name>.go` — implement the `provider.VPNProvider`
+   interface (`Login`/`Logout`/`LoggedIn`, `Connect`/`Disconnect`/`Connected`,
+   `Locations`, `ActiveLocation`, `Status`, `Version`). Rotation is just the
+   binary calling `Disconnect` then `Connect` again. Proxy-chain providers also
+   take the in-process proxy via an `AttachProxy(*proxy.Server)` method and
+   install a dialer with `SetDialer`.
+2. `internal/provider/register/register_<name>.go` — build-tagged blank import:
 
-##### Tundler options
+   ```go
+   //go:build provider_<name>
 
-| Variable          | Default | Description                                                        |
-|-------------------|---------|--------------------------------------------------------------------|
-| `TUNDLER_VPN_DNS` | `false` | Route proxy DNS queries through the VPN tunnel for full privacy    |
+   package register
 
-### Configuration
+   import _ "github.com/laurentpellegrino/tundler/internal/provider/<name>"
+   ```
 
-When present, `~/.config/tundler/tundler.yaml` is read at startup:
-
-```yaml
-debug: true
-telemetry: false
-plugins:
-  - vpnipobserver
-providers:
-  - nordvpn:
-      locations:
-        allow:
-          - France
-          - Germany
-        block:
-          - United_States
-```
-
-- `debug` enables verbose logging and may also be set with `-d/--debug`.
-- `telemetry` enables anonymous usage statistics (disabled by default). Collects provider, location, and VPN IP (the IP assigned by the VPN, not your real IP). May also be set with `--telemetry`.
-- `plugins` enables specific sidecar plugins. When omitted, every compiled-in plugin is enabled.
-- `providers.<name>.locations.allow` restricts the random locations used when `location` is omitted in API calls. When empty, the provider's full location list is used.
-- `providers.<name>.locations.block` removes locations from the candidate pool (the `allow` list above, or the provider's full list when `allow` is empty).
-- `login` automatically authenticates a comma-separated list of providers at startup (`all` for every provider).
-
-> The previous flat `locations: [France, Germany]` form is no longer accepted; migrate to `locations.allow:`.
-
-## REST API
-
-| Endpoint      | Method | Query params                          | Description                                         |
-|---------------|--------|---------------------------------------|-----------------------------------------------------|
-| `/`           | GET    | –                                     | List providers and login state                      |
-| `/connect`    | POST   | `locations.allow`, `locations.block`, `providers` *(optional)* | Connect to a random location/provider from the allow set, minus the block set |
-| `/disconnect` | POST   | –                                     | Tear down the current tunnel                        |
-| `/locations`  | GET    | –                                     | List available locations for logged in providers    |
-| `/login`      | POST   | `providers` *(optional)*              | Login comma-separated providers or all when omitted |
-| `/logout`     | POST   | `providers` *(optional)*              | Logout listed providers, or all if empty            |
-| `/plugins`    | GET    | –                                     | List enabled sidecar plugins with `id` and `name`   |
-| `/status`     | GET    | –                                     | Return tunnel state, IP and provider in use         |
-
-Compiled plugins are mounted below `/plugins/<id>/...`.
-
-The built-in `vpnipobserver` plugin exposes:
-
-| Endpoint                         | Method | Description                                                   |
-|----------------------------------|--------|---------------------------------------------------------------|
-| `/plugins/vpnipobserver/ips`     | GET    | List VPN IPs with last-seen timestamp plus provider/region data |
-
-## Extending Tundler
-
-1. Copy `docker/providers/nordvpn` to `docker/providers/<your_provider>`.
-2. Implement the `install.sh` and `configure.sh` scripts for your provider.
-3. Copy `internal/provider/nordvpn` to `internal/provider/<your_provider>` and implement the interface.
-4. Add a blank import in `internal/provider/register/register.go`:
-
-```go
-import _ "github.com/laurentpellegrino/tundler/internal/provider/<your_provider>"
-```
-
-5. Document new environment variables in this README.
+3. `docker/providers/<name>/install.sh` (+ `configure.sh`) — install the VPN
+   client / bake any config; keep it self-contained.
+4. Add `<name>` to the allow-list in `docker/Dockerfile.tunnel`, the matrix in
+   `.github/workflows/docker-image.yml`, and the env-passthrough regex in
+   `docker/services/tundler-entrypoint.sh`.
+5. Document the credential env vars in the tables above.
 
 ## Contributing
 
