@@ -30,6 +30,12 @@ const (
 	envMinRotationSec        = "MIN_ROTATION_SECONDS"
 	envMaxRotationSec        = "MAX_ROTATION_SECONDS"
 	envWedgeGuardSec         = "WEDGE_GUARD_THRESHOLD_SECONDS"
+	// Self-recycle: after RECYCLE_AFTER_SECONDS (jittered) OR
+	// RECYCLE_AFTER_ROTATIONS, the pod gracefully drains and exits its
+	// container so kubelet recreates it on the latest image + freshest env.
+	// 0 = disabled (the default; set via env in the fleet).
+	envRecycleAfterSec       = "RECYCLE_AFTER_SECONDS"
+	envRecycleAfterRot       = "RECYCLE_AFTER_ROTATIONS"
 	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
 	defaultBootJitterSec     = 60
@@ -262,6 +268,18 @@ func main() {
 	// recovery and keeps the kubelet-visible restart count quiet.
 	wedgeThreshold := time.Duration(getEnvInt(envWedgeGuardSec, defaultWedgeGuardSec)) * time.Second
 	go runWedgeGuard(ctx, state, wedgeThreshold)
+
+	// Self-recycle: after a jittered max lifetime and/or a max rotation
+	// count, gracefully drain and exit the CONTAINER so kubelet recreates
+	// it on the latest image (imagePullPolicy: Always) and freshest env —
+	// new builds/config roll out without hand-restarting pods. 0/0 = off.
+	// Rotation-count trigger: handled inside the rotator (recycle replaces
+	// the next rotation). Time trigger: the runRecycler backstop below.
+	recycleRotationLimit = getEnvInt(envRecycleAfterRot, 0)
+	recycleAfter := time.Duration(getEnvInt(envRecycleAfterSec, 0)) * time.Second
+	if recycleAfter > 0 {
+		go runRecycler(ctx, state, drain, recycleAfter)
+	}
 
 	// Rotation is now exclusively driven by the crawler: each slot
 	// tracks AIMD + per-tunnel 429s and, on sustained throttling,
