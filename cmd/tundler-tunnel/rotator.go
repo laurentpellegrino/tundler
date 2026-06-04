@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"time"
@@ -80,6 +81,16 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 	current := state.Get()
 	if current != StateReady && current != StateFailed {
 		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready/Failed)", current)
+		return
+	}
+
+	// Recycle instead of rotating once this pod has done its allotted
+	// rotations: a fresh container gives a new exit IP AND picks up the
+	// latest image + freshest env. So the (limit+1)th rotation becomes a
+	// graceful container recycle rather than another in-place reconnect.
+	if recycleRotationLimit > 0 && state.Snapshot().RotationCountTotal >= recycleRotationLimit {
+		recycleContainer(ctx, state, drain,
+			fmt.Sprintf("completed %d rotations", recycleRotationLimit))
 		return
 	}
 
