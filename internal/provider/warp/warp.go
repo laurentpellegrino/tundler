@@ -100,35 +100,61 @@ func (w WARP) LoggedIn(ctx context.Context) bool {
 	return strings.Contains(low, "device id") || strings.Contains(low, "account")
 }
 
-// Login registers the device. With a managed deployment (mdm.xml
-// service token) `registration new` enrolls into the Zero Trust org
-// using the token — the daemon may also auto-enroll asynchronously, so
-// we tolerate a transient command error and wait for enrollment to
-// settle. Without mdm.xml it falls back to a free anonymous
-// registration. Idempotent.
+// Login registers the device. Idempotent.
+//
+// Anonymous (no mdm.xml): `registration new` creates a free
+// registration directly.
+//
+// Managed (mdm.xml service token): the warp-svc daemon enrolls the
+// device into the Zero Trust org using the token from mdm.xml — NOT via
+// `registration new`, which is an interactive browser flow that's
+// useless headless. We nudge the daemon with `connect` and wait. If it
+// stalls (commonly because warp-svc booted and cached an enrollment
+// failure before the device-enrollment policy was reachable), we bounce
+// warp-svc once to force a fresh attempt.
 func (w WARP) Login(ctx context.Context) error {
 	if w.LoggedIn(ctx) {
 		return nil
 	}
-	managed := managedEnrollment()
-	if _, err := runCli(ctx, "registration", "new"); err != nil {
-		if !managed {
-			return err
-		}
-		shared.Debugf("WARP: `registration new` errored in managed mode (%v); waiting for daemon enrollment", err)
+	if !managedEnrollment() {
+		_, err := runCli(ctx, "registration", "new")
+		return err
 	}
-	if !managed {
+	// `connect` triggers token enrollment + connection via mdm.xml.
+	if _, err := runCli(ctx, "connect"); err != nil {
+		shared.Debugf("WARP: connect (enroll) errored: %v", err)
+	}
+	if w.waitEnrolled(ctx, 45*time.Second) {
 		return nil
 	}
-	// Authenticated enrollment involves a token exchange with the org;
-	// give the daemon time to complete it before declaring failure.
-	for i := 0; i < 90; i++ {
-		if w.LoggedIn(ctx) {
-			return nil
-		}
-		time.Sleep(time.Second)
+	shared.Debugf("WARP: enrollment stalled; restarting warp-svc to re-attempt")
+	if _, err := shared.RunCmd(ctx, "systemctl", "restart", "warp-svc"); err != nil {
+		shared.Debugf("WARP: warp-svc restart failed: %v", err)
 	}
-	return fmt.Errorf("warp: Zero Trust enrollment did not complete in 90s — verify the service token has device-enrollment (Service Auth) permission")
+	time.Sleep(3 * time.Second)
+	_, _ = runCli(ctx, "connect")
+	if w.waitEnrolled(ctx, 60*time.Second) {
+		return nil
+	}
+	return fmt.Errorf("warp: Zero Trust enrollment did not complete — verify the service token has a Service Auth rule in device-enrollment permissions")
+}
+
+// waitEnrolled polls until the device has a registration or the timeout
+// elapses (ctx-cancellable). Enrollment is a token exchange with the
+// org, so it can take a few seconds after `connect`.
+func (w WARP) waitEnrolled(ctx context.Context, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if w.LoggedIn(ctx) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Second):
+		}
+	}
+	return w.LoggedIn(ctx)
 }
 
 // Logout deletes the registration. Called from Disconnect() so the
