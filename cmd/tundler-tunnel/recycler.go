@@ -10,11 +10,13 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
 
-// recycleRotationLimit, when > 0, makes the rotator recycle the container
-// INSTEAD of performing a rotation once the pod has completed that many
-// rotations (see rotateIfReadyWithDeps). A recycle already yields a fresh
-// exit IP, so it cleanly replaces a rotation while also refreshing the
-// image + env. Set in main() from RECYCLE_AFTER_ROTATIONS; 0 in tests.
+// recycleRotationLimit, when > 0, makes runRotator recycle the container
+// INSTEAD of performing the next SCHEDULED relocation once the pod has done
+// that many (see runRotator). A recycle already yields a fresh exit IP, so
+// it cleanly replaces a relocation while also refreshing the image + env.
+// Only scheduled relocations count — crawler /rotate (throttle recovery)
+// must not trigger recycles. Set in main() from RECYCLE_AFTER_ROTATIONS;
+// 0 in tests and when periodic rotation is disabled.
 var recycleRotationLimit int
 
 // recycleContainer gracefully drains and then terminates the CONTAINER so
