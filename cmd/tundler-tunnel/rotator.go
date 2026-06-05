@@ -40,12 +40,30 @@ func runRotator(ctx context.Context, prov provider.VPNProvider, state *StateTrac
 	defer timer.Stop()
 	state.RecordNextRotation(time.Now().Add(initialOffset))
 
+	// Count only SCHEDULED relocations toward the recycle trigger. Crawler
+	// /rotate (AIMD throttle-recovery, which can fire every few minutes on a
+	// 429-stormed provider) flows through rotateIfReady too but must NOT
+	// count — otherwise a stormed pod would recycle its container every few
+	// minutes instead of after its ~6-8h relocations. This is why the check
+	// lives here and not in the shared rotateIfReadyWithDeps.
+	scheduledRotations := 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			// Recycle instead of performing the next scheduled relocation
+			// once this pod has done its allotment: a fresh container gives a
+			// new exit IP AND picks up the latest image + freshest env. So the
+			// (limit+1)th scheduled relocation becomes a graceful recycle.
+			if recycleRotationLimit > 0 && scheduledRotations >= recycleRotationLimit {
+				recycleContainer(ctx, state, drain,
+					fmt.Sprintf("completed %d scheduled relocations", recycleRotationLimit))
+				return
+			}
 			rotateIfReady(ctx, prov, state, providerName, excluded, drain, baselineEgressIP)
+			scheduledRotations++
 			next := pickRotationInterval(minInterval, maxInterval)
 			log.Printf("tundler-tunnel: next rotation in %s", next.Round(time.Second))
 			timer.Reset(next)
@@ -81,16 +99,6 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 	current := state.Get()
 	if current != StateReady && current != StateFailed {
 		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready/Failed)", current)
-		return
-	}
-
-	// Recycle instead of rotating once this pod has done its allotted
-	// rotations: a fresh container gives a new exit IP AND picks up the
-	// latest image + freshest env. So the (limit+1)th rotation becomes a
-	// graceful container recycle rather than another in-place reconnect.
-	if recycleRotationLimit > 0 && state.Snapshot().RotationCountTotal >= recycleRotationLimit {
-		recycleContainer(ctx, state, drain,
-			fmt.Sprintf("completed %d rotations", recycleRotationLimit))
 		return
 	}
 
