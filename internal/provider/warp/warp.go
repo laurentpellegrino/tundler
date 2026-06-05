@@ -10,10 +10,20 @@
 //
 // To fit into the existing tundler-tunnel slot+rotation
 // architecture, we expose WARP as a single-location provider
-// (Locations() returns just "auto") and rotate exit IPs by
-// deleting + re-registering on each Disconnect. A fresh
-// registration usually lands on a fresh edge IP, giving the
-// rotator the per-cycle IP-change semantics it expects.
+// (Locations() returns just "auto").
+//
+// Two enrollment modes:
+//
+//   - Anonymous (free): rotate exit IPs by deleting + re-registering
+//     on each Disconnect. Simple, but `registration new` is rate-
+//     limited per source IP and throttled on datacenter ranges
+//     (Hetzner), which crashlooped the pod.
+//
+//   - Managed Zero Trust: when /var/lib/cloudflare-warp/mdm.xml is
+//     present (service token from OpenBao, written by configure.sh),
+//     the daemon enrolls into the org authenticated — not subject to
+//     the anonymous throttle. We then KEEP the registration across
+//     rotations (see managedEnrollment / Disconnect).
 //
 // Why "auto" is the single location:
 //
@@ -30,6 +40,8 @@ package warp
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -40,7 +52,23 @@ import (
 const (
 	bin  = "warp-cli"
 	name = "warp"
+	// mdmPath is Cloudflare's managed-deployment config on Linux. When
+	// present (written by docker/providers/warp/configure.sh from the
+	// OpenBao-backed service token), the WARP daemon enrolls the device
+	// into a Zero Trust org instead of an anonymous registration —
+	// authenticated enrollment is NOT subject to the per-source-IP rate
+	// limit that throttles anonymous `registration new` on Hetzner.
+	mdmPath = "/var/lib/cloudflare-warp/mdm.xml"
 )
+
+// managedEnrollment reports whether a Zero Trust managed deployment is
+// configured (mdm.xml + service token). In that mode the device must
+// stay enrolled across rotations — deleting the registration would
+// re-trigger enrollment every cycle, the exact loop we're escaping.
+func managedEnrollment() bool {
+	_, err := os.Stat(mdmPath)
+	return err == nil
+}
 
 // flags shared by every warp-cli invocation. --accept-tos
 // suppresses the interactive TOS prompt that otherwise blocks
@@ -72,13 +100,35 @@ func (w WARP) LoggedIn(ctx context.Context) bool {
 	return strings.Contains(low, "device id") || strings.Contains(low, "account")
 }
 
-// Login creates an anonymous registration (free tier). Idempotent.
+// Login registers the device. With a managed deployment (mdm.xml
+// service token) `registration new` enrolls into the Zero Trust org
+// using the token — the daemon may also auto-enroll asynchronously, so
+// we tolerate a transient command error and wait for enrollment to
+// settle. Without mdm.xml it falls back to a free anonymous
+// registration. Idempotent.
 func (w WARP) Login(ctx context.Context) error {
 	if w.LoggedIn(ctx) {
 		return nil
 	}
-	_, err := runCli(ctx, "registration", "new")
-	return err
+	managed := managedEnrollment()
+	if _, err := runCli(ctx, "registration", "new"); err != nil {
+		if !managed {
+			return err
+		}
+		shared.Debugf("WARP: `registration new` errored in managed mode (%v); waiting for daemon enrollment", err)
+	}
+	if !managed {
+		return nil
+	}
+	// Authenticated enrollment involves a token exchange with the org;
+	// give the daemon time to complete it before declaring failure.
+	for i := 0; i < 90; i++ {
+		if w.LoggedIn(ctx) {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("warp: Zero Trust enrollment did not complete in 90s — verify the service token has device-enrollment (Service Auth) permission")
 }
 
 // Logout deletes the registration. Called from Disconnect() so the
@@ -121,17 +171,22 @@ func (w WARP) Connect(ctx context.Context, location string) provider.Status {
 	return provider.Status{Connected: false, Provider: name, Location: "auto"}
 }
 
-// Disconnect tears the tunnel down AND deletes the registration so
-// the next Connect() gets a fresh anonymous identity. Cloudflare
-// usually assigns a different edge IP to a fresh registration,
-// which is how WARP-as-a-provider gives the rotator IP rotation
-// semantics matching what OpenVPN providers provide via location
-// switching.
+// Disconnect tears the tunnel down. In ANONYMOUS mode it also deletes
+// the registration so the next Connect() gets a fresh edge IP (the only
+// rotation lever on the free tier). In managed (Zero Trust) mode it
+// keeps the registration — re-enrolling every rotation is what
+// rate-limited anonymous WARP on Hetzner.
 func (w WARP) Disconnect(ctx context.Context) error {
 	_, _ = runCli(ctx, "disconnect")
-	// Best-effort: deleting registration on disconnect realises
-	// rotation; if it fails (e.g. already gone), Connect will
-	// re-register from scratch on the way back up.
+	if managedEnrollment() {
+		// Zero Trust mode: KEEP the registration. Re-enrolling every
+		// rotation is what rate-limited anonymous WARP on Hetzner; the
+		// authenticated device stays enrolled and just disconnects.
+		return nil
+	}
+	// Anonymous mode: delete the registration so the next Connect lands a
+	// fresh edge IP — our only rotation lever on the free tier. If it
+	// fails (e.g. already gone), Connect re-registers on the way back up.
 	_, _ = runCli(ctx, "registration", "delete")
 	return nil
 }
