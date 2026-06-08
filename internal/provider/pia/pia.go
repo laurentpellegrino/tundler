@@ -119,7 +119,12 @@ func (p PIA) Disconnect(ctx context.Context) error {
 		return err
 	}
 
-	// Wait for disconnection to complete and VPN IP to be removed
+	// Wait for disconnection to complete and VPN IP to be removed. The
+	// `disconnect` command above has already been sent (the backend frees
+	// the session on that), so this loop is only confirmation — bail
+	// promptly if ctx is cancelled (e.g. a shutdown teardown bounded by
+	// gracefulDisconnect's 8s / systemd's 10s stop window) rather than
+	// blocking the full 30s and risking a SIGKILL mid-wait.
 	shared.Debugf("PIA: Disconnect() - waiting for VPN IP removal")
 	for i := 0; i < 30; i++ { // Wait up to 30 seconds
 		status := p.Status(ctx)
@@ -128,7 +133,12 @@ func (p PIA) Disconnect(ctx context.Context) error {
 			return nil
 		}
 		shared.Debugf("PIA: Disconnect() - attempt %d: connected=%v, ip=%s", i+1, status.Connected, status.IP)
-		time.Sleep(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			shared.Debugf("PIA: Disconnect() - ctx cancelled while awaiting IP removal (disconnect already sent): %v", ctx.Err())
+			return nil
+		case <-time.After(1 * time.Second):
+		}
 	}
 
 	shared.Debugf("PIA: Disconnect() - timeout waiting for VPN IP removal")
