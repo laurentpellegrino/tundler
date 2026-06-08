@@ -159,6 +159,15 @@ func main() {
 		contractProbeDialer = proxySrv.DialUpstream
 	}
 
+	// Wrap with a Locations() cache so the connect / rotate / watchdog paths
+	// don't re-fork the provider CLI (expressvpnctl / piactl / nordvpn) on
+	// every attempt — and, more importantly, keep serving the last-good
+	// region catalog when a wedged daemon momentarily returns nothing,
+	// instead of seeing "0 available" and spiralling. Done AFTER AttachProxy
+	// (handled on the concrete provider above); harmless for static-list
+	// providers. From here on, every prov.Locations() call is cached.
+	prov = newCachedLocationsProvider(prov, locationsCacheTTL())
+
 	// Capture the pod's pre-VPN egress IP so the post-Connect contract
 	// check (verifyExitIPDiffers) has a baseline to compare against.
 	// Runs BEFORE the rotation closure is constructed (so the closure
