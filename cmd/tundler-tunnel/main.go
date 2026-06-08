@@ -113,6 +113,10 @@ func main() {
 		log.Fatalf("tundler-tunnel: unknown provider %q (compiled-in providers: %v)",
 			providerName, registryKeys())
 	}
+	// Make the provider reachable from every exit path so we always
+	// disconnect the tunnel (release the account's device slot) before
+	// the process/container goes away — see registerShutdownDisconnect.
+	registerShutdownDisconnect(prov, providerName)
 
 	// Wire state + HTTP server up front so probes can see the pod's
 	// lifecycle from t=0 (Booting → LoggingIn → Ready / Failed).
@@ -299,6 +303,9 @@ func main() {
 	// (Trigger C) and Layer 1+2 envoy drain hooks.
 	<-ctx.Done()
 	log.Printf("tundler-tunnel: shutting down")
+	// Release the device slot client-side before exiting (fresh context —
+	// ctx is the now-cancelled signal context).
+	gracefulDisconnect()
 }
 
 // runWatchdog observes the CONNECT proxy's actual dial outcomes
@@ -435,6 +442,9 @@ func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Dura
 			if elapsed > threshold {
 				log.Printf("tundler-tunnel: wedge guard tripped — state=%s for %s (> %s); exiting for systemd respawn",
 					state.Get(), elapsed.Round(time.Second), threshold)
+				// Drop any half-up tunnel so the respawn doesn't briefly
+				// overlap a second session on the account.
+				gracefulDisconnect()
 				os.Exit(1)
 			}
 		}
@@ -466,6 +476,10 @@ const exitUnrecoverable = 2
 func failAndExit(state *StateTracker) {
 	state.Set(StateFailed)
 	time.Sleep(2 * time.Second) // let an in-flight /status probe see Failed
+	// If a tunnel (or just a login) was established before we gave up,
+	// disconnect so the provider frees the device slot rather than aging
+	// out a dangling session. No-op when nothing is connected.
+	gracefulDisconnect()
 	os.Exit(exitUnrecoverable)
 }
 
