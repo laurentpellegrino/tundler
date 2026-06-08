@@ -216,12 +216,20 @@ func main() {
 	}
 
 	// Tunnel hold: pick a random allowed location (provider-filtered minus
-	// EXCLUDED_LOCATIONS) and Connect. On success → Ready. On failure
-	// surrender to Failed. `excluded` is captured in triggerRotation
-	// above; reuse it here.
-	if err := connectTunnel(ctx, prov, state, providerName, excluded, baselineEgressIP); err != nil {
-		log.Printf("tundler-tunnel: initial connect failed: %v", err)
-		failAndExit(state)
+	// EXCLUDED_LOCATIONS) and Connect, retrying IN-PROCESS with backoff
+	// until it succeeds. Crucially we do NOT re-login and do NOT exit on a
+	// connect failure: the session token is established once by Login()
+	// above, and a container restart would force a fresh login — re-login
+	// storms are what trip a provider's shared-account / device-limit
+	// throttle. /readyz stays 503 while we retry, so no traffic is routed
+	// here until the tunnel is actually up. `excluded` is captured in
+	// triggerRotation above; reuse it here.
+	if err := connectInitialWithRetry(ctx, prov, state, providerName, excluded, baselineEgressIP, bootConnectBackoff); err != nil {
+		// Returns only on ctx cancellation — the pod is shutting down
+		// mid-connect. Release any half-up session and exit cleanly.
+		log.Printf("tundler-tunnel: shutting down during initial connect: %v", err)
+		gracefulDisconnect()
+		return
 	}
 
 	// Start the watchdog: detects unexpected tunnel drops and reconnects
