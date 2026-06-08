@@ -27,6 +27,9 @@ type fakeProvider struct {
 	onConnect func(location string)  // optional hook called from Connect
 
 	noLocations bool // when true, Locations() returns nil to force pick-fail
+
+	disconnectCalls   atomic.Int32 // number of Disconnect() invocations
+	disconnectCtxErrd atomic.Bool  // true if any Disconnect saw a cancelled ctx
 }
 
 func (f *fakeProvider) Locations(_ context.Context) []string {
@@ -57,7 +60,11 @@ func (f *fakeProvider) Connected(_ context.Context) bool { return f.connected.Lo
 func (f *fakeProvider) ActiveLocation(_ context.Context) string {
 	return ""
 }
-func (f *fakeProvider) Disconnect(_ context.Context) error {
+func (f *fakeProvider) Disconnect(ctx context.Context) error {
+	f.disconnectCalls.Add(1)
+	if ctx.Err() != nil {
+		f.disconnectCtxErrd.Store(true)
+	}
 	f.connected.Store(false)
 	return nil
 }

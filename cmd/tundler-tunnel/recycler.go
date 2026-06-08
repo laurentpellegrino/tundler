@@ -38,6 +38,11 @@ func recycleContainer(ctx context.Context, state *StateTracker, drain drainContr
 		_ = drain.TriggerGracefulDrain(ctx)
 		_ = drain.WaitForActiveConnectionsToDrain(ctx, 30*time.Second)
 	}
+	// Disconnect the tunnel so the provider frees the device slot before
+	// the container (and its VPN daemon) is torn down. The kernel removing
+	// the netns would drop the interface locally, but the backend keeps the
+	// session "connected" until WE disconnect — see gracefulDisconnect.
+	gracefulDisconnect()
 	// `systemctl exit 0` asks PID-1 systemd to terminate the whole container
 	// (allowed for the system manager only when running in a container —
 	// exactly our case), so kubelet repulls the image. os.Exit alone would
