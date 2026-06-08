@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
@@ -54,6 +55,72 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
 		providerName, location, status.IP)
 	return nil
+}
+
+// connectInitialWithRetry runs the BOOT connect: it retries connectTunnel
+// until it succeeds or ctx is cancelled. It NEVER re-logs-in and NEVER
+// exits the process.
+//
+// Rationale: the session token is established once by the preceding
+// Login(); a connect failure here is almost always transient (a throttled
+// or mid-catalog-load daemon, a flaky exit). The old behaviour —
+// failAndExit on the first failure — turned every such hiccup into a
+// container restart, and the restart's fresh daemon forces a re-login.
+// Re-login storms are exactly what trip a provider's shared-account /
+// device-limit throttle, so we stay in-process and retry instead.
+//
+// State stays Connecting between attempts (→ /readyz 503, no traffic
+// routed here) while /livez stays 200 (the process is alive and working).
+// The only outer bound is the kubelet startup probe; if a provider outage
+// outlasts it the resulting restart is graceful (gracefulDisconnect runs)
+// — still far fewer logins than exiting on the first failure.
+//
+// backoff is injected so tests can drive it without real sleeps;
+// production passes bootConnectBackoff.
+func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string, backoff func(attempt int) time.Duration) error {
+	for attempt := 1; ; attempt++ {
+		err := connectTunnel(ctx, prov, state, providerName, excluded, baselineEgressIP)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("tundler-tunnel: initial connect succeeded on attempt %d (stayed up, no re-login)", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		wait := backoff(attempt)
+		log.Printf("tundler-tunnel: initial connect attempt %d failed: %v; retrying in %s (staying up, no re-login)",
+			attempt, err, wait.Round(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// bootConnectBackoff returns the wait before initial-connect retry n+1:
+// exponential 1s, 2s, 4s, … capped at 60s, with ±25% jitter so a fleet
+// booting into a provider-wide outage doesn't re-hit the (possibly
+// throttled) backend in lockstep. Gentle by design — each attempt forks
+// the provider CLI (Locations/Connect), so we space attempts out rather
+// than hammer a daemon that's already struggling.
+func bootConnectBackoff(attempt int) time.Duration {
+	shift := attempt - 1
+	if shift > 6 {
+		shift = 6 // 1<<6 = 64s, clamped to the 60s cap below
+	}
+	base := time.Duration(1<<uint(shift)) * time.Second
+	if base > 60*time.Second {
+		base = 60 * time.Second
+	}
+	jitter := time.Duration(rand.Int64N(int64(base)/2+1)) - base/4
+	d := base + jitter
+	if d < time.Second {
+		d = time.Second
+	}
+	return d
 }
 
 // errRotationExhausted is returned by connectWithRetry when every attempt
