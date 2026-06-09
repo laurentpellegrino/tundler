@@ -101,8 +101,17 @@ jobs:
           context: .
           file: docker/Dockerfile.tunnel
           push: true
+          # expressvpn builds on Ubuntu 26.04; everything else on 24.04.
+          # 2026-06-09: the 24.04 glibc security update 2.39-0ubuntu8.7
+          # (CVE-2026-0861 "memalign: reinstate alignment") trips a latent
+          # heap bug in the ExpressVPN daemon (14.1.1.13156) →
+          # "free(): corrupted unsorted chunks" → daemon wedges → connect
+          # fails. 26.04's glibc 2.43 does NOT trigger it (verified: stable
+          # daemon, successful rotations). The other providers are unaffected,
+          # so keep them on 24.04 to avoid a fleet-wide LTS jump.
           build-args: |
             PROVIDER=${{ matrix.provider }}
+            BASE_IMAGE=${{ matrix.provider == 'expressvpn' && 'ubuntu:26.04' || 'ubuntu:24.04' }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:latest
             ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:${{ github.sha }}

@@ -12,6 +12,10 @@
 #
 # See cmd/tundler-tunnel/README.md for the full design.
 
+# Runtime base image — global ARG so it's usable in the runtime FROM below.
+# Override with --build-arg BASE_IMAGE=ubuntu:26.04 (or a pinned digest).
+ARG BASE_IMAGE=ubuntu:24.04
+
 # ----------------------------------------------------------------------
 # Build stage — compile tundler-tunnel
 #
@@ -40,8 +44,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 # ----------------------------------------------------------------------
 # Runtime stage — install ONE VPN client + tundler-tunnel
+#
+# BASE_IMAGE is parameterized (declared globally at the top of this file)
+# so the runtime base can be pinned/overridden without editing here (e.g.
+# to pin a glibc revision, or trial a newer Ubuntu LTS).
 # ----------------------------------------------------------------------
-FROM ubuntu:24.04
+FROM ${BASE_IMAGE}
 
 # PROVIDER MUST be set at build time. Validated below.
 ARG PROVIDER
