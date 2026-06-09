@@ -10,8 +10,12 @@
 #     the unit is enabled (via the symlink farm in
 #     /etc/systemd/system/multi-user.target.wants/).
 #   - The tundler-tunnel Go binary calls `expressvpnctl background
-#     enable` + `expressvpnctl set networklock false` in its Login()
-#     after the daemon is up — so we don't need to here.
+#     enable` + `expressvpnctl set killswitch off` in its Login()
+#     after the daemon is up — so we don't need to here. (killswitch
+#     off is load-bearing: at the default "auto" the daemon arms an
+#     iptables firewall during connect transitions, and its futex-
+#     deadlock bug can leave that firewall behind, blackholing the
+#     pod's entire egress+DNS.)
 #
 # All we still need to do at this point: make sure the systemd unit is
 # enabled so it auto-starts when systemd boots. `systemctl enable` is

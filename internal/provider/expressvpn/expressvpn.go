@@ -3,8 +3,11 @@ package expressvpn
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
@@ -14,11 +17,41 @@ import (
 const bin = "expressvpnctl"
 const name = "expressvpn"
 
+// daemonService is the systemd unit running expressvpn-daemon inside the
+// container (enabled by docker/providers/expressvpn/configure.sh).
+const daemonService = "expressvpn-service.service"
+
+// minDaemonRecoveryInterval throttles daemon restarts so a fundamentally
+// broken daemon can't be bounced on every single connect retry.
+const minDaemonRecoveryInterval = 60 * time.Second
+
+// lastDaemonRecovery is the unix-seconds timestamp of the last daemon
+// restart (one provider per process, so package state is fine).
+var lastDaemonRecovery atomic.Int64
+
+// cliMu serializes every expressvpnctl invocation. The official desktop
+// client holds ONE long-lived IPC connection to expressvpn-daemon; tundler
+// forks a fresh CLI per call, each opening a fresh connection to
+// daemon.sock — sometimes concurrently (boot retry, rotator, watchdog).
+// The daemon's IPC dispatcher deadlocks under exactly that pattern (futex
+// hang; same binary is stable under the official client on a desktop).
+// One-in-flight mimics the official client's access pattern and removes
+// the concurrent-connection trigger.
+var cliMu sync.Mutex
+
+// run executes `expressvpnctl args...` with the process-wide CLI lock held.
+// ALL expressvpnctl calls in this package must go through run/quiet/get.
+func run(ctx context.Context, args ...string) (string, error) {
+	cliMu.Lock()
+	defer cliMu.Unlock()
+	return shared.RunCmd(ctx, bin, args...)
+}
+
 type ExpressVPN struct{}
 
 func init() { provider.Registry[name] = ExpressVPN{} }
 
-func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
+func quiet(ctx context.Context, args ...string) { _, _ = run(ctx, args...) }
 
 // get returns the trimmed stdout of `expressvpnctl get <key>`. When the CLI
 // fails (non-zero exit, including its internal "Timed out after N sec"
@@ -28,7 +61,7 @@ func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin,
 // `expressvpnctl connect <token>`, wasting every connect attempt where the
 // daemon was momentarily slow.
 func get(ctx context.Context, key string) string {
-	out, err := shared.RunCmd(ctx, bin, "get", key)
+	out, err := run(ctx, "get", key)
 	if err != nil {
 		return ""
 	}
@@ -39,7 +72,62 @@ func (e ExpressVPN) ActiveLocation(ctx context.Context) string {
 	return strings.TrimSpace(get(ctx, "region"))
 }
 
+// daemonResponsive reports whether expressvpn-daemon currently answers CLI
+// requests. expressvpnctl has its own internal ~5s IPC timeout: on a wedged
+// daemon it prints "Timed out after N sec" and exits non-zero.
+func daemonResponsive(ctx context.Context) bool {
+	out, err := run(ctx, "status")
+	return err == nil && !strings.Contains(out, "Timed out")
+}
+
+// ensureDaemonResponsive detects the daemon's known futex deadlock (main
+// thread parked in futex_wait, zero CPU, every CLI call timing out —
+// observed repeatedly in production, 2026-06) and recovers it by restarting
+// the systemd unit. Crucially this recovery is LOGIN-FREE: the account/
+// session state lives on disk (/opt/expressvpn/etc/account.json) and
+// survives a daemon restart (validated 2026-06-09), so unlike a container
+// restart it costs none of the login-rate budget that ExpressVPN's
+// account-sharing heuristics watch. Restarts are throttled to one per
+// minute; after restarting we wait (up to ~30s) for the daemon to answer
+// again so the caller's connect attempt runs against a live daemon.
+func ensureDaemonResponsive(ctx context.Context) {
+	if daemonResponsive(ctx) {
+		return
+	}
+	now := time.Now().Unix()
+	last := lastDaemonRecovery.Load()
+	if now-last < int64(minDaemonRecoveryInterval/time.Second) {
+		return
+	}
+	if !lastDaemonRecovery.CompareAndSwap(last, now) {
+		return // another goroutine is already recovering
+	}
+	log.Printf("expressvpn: daemon unresponsive (CLI timeout) — restarting %s (login-free recovery)", daemonService)
+	if _, err := shared.RunCmd(ctx, "systemctl", "restart", daemonService); err != nil {
+		log.Printf("expressvpn: daemon restart failed: %v", err)
+		return
+	}
+	for i := 0; i < 15; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		if daemonResponsive(ctx) {
+			log.Printf("expressvpn: daemon responsive again after restart")
+			return
+		}
+	}
+	log.Printf("expressvpn: daemon still unresponsive %s after restart", "30s")
+}
+
 func (e ExpressVPN) Connect(ctx context.Context, location string) provider.Status {
+	// 0. self-heal: if the daemon is wedged (futex deadlock, CLI timing
+	// out), restart it BEFORE attempting to connect — login-free, so the
+	// boot/rotation retry loops recover instead of spinning against a dead
+	// daemon until the startup probe forces a container restart + re-login.
+	ensureDaemonResponsive(ctx)
+
 	// 1. kick off the connection
 	if location == "" {
 		quiet(ctx, "connect")
@@ -124,7 +212,7 @@ func (e ExpressVPN) Connected(ctx context.Context) bool {
 }
 
 func (e ExpressVPN) Disconnect(ctx context.Context) error {
-	_, err := shared.RunCmd(ctx, bin, "disconnect")
+	_, err := run(ctx, "disconnect")
 	return err
 }
 
@@ -151,7 +239,7 @@ func (e ExpressVPN) Locations(ctx context.Context) []string {
 		retryGap    = 5 * time.Second
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		out, err := shared.RunCmd(ctx, bin, "get", "regions")
+		out, err := run(ctx, "get", "regions")
 		if err == nil {
 			fields := strings.Fields(out)
 			if !isColdStartPlaceholder(fields) {
@@ -185,6 +273,20 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 		return fmt.Errorf("EXPRESSVPN_ACTIVATION_CODE environment variable not set")
 	}
 
+	// Disable Network Lock (settings.json "killswitch": auto → off) BEFORE
+	// anything else, on every boot — including the already-logged-in respawn
+	// path below. At "auto" the daemon arms an iptables firewall (evpn.*
+	// chains incl. blockDNS/blockAll hooked into OUTPUT) during every connect
+	// transition; when the daemon hits its internal futex deadlock
+	// mid-transition (observed 2026-06-09: every pod at once, DNS dead,
+	// "Could not resolve host") the armed killswitch stays behind and
+	// blackholes the pod's entire egress — turning a wedged daemon into an
+	// unrecoverable, undiagnosable pod. We don't need the daemon's leak
+	// protection: tundler gates traffic on /readyz and verifies the exit-IP
+	// contract after every connect. (A configure.sh comment used to claim
+	// Login() already did this — it never did.)
+	quiet(ctx, "set", "killswitch", "off")
+
 	if e.LoggedIn(ctx) {
 		return nil
 	}
@@ -194,7 +296,7 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 		return fmt.Errorf("cannot write activation code: %w", err)
 	}
 
-	if _, err := shared.RunCmd(ctx, bin, "login", "-t", "20", tmpFile); err != nil {
+	if _, err := run(ctx, "login", "-t", "20", tmpFile); err != nil {
 		return fmt.Errorf("expressvpnctl login failed: %w", err)
 	}
 
@@ -204,12 +306,12 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 }
 
 func (e ExpressVPN) LoggedIn(ctx context.Context) bool {
-	out, _ := shared.RunCmd(ctx, bin, "status")
+	out, _ := run(ctx, "status")
 	return !strings.Contains(out, "Not logged in.")
 }
 
 func (e ExpressVPN) Logout(ctx context.Context) error {
-	_, err := shared.RunCmd(ctx, bin, "logout")
+	_, err := run(ctx, "logout")
 	return err
 }
 
@@ -227,7 +329,7 @@ func (e ExpressVPN) Status(ctx context.Context) provider.Status {
 }
 
 func (e ExpressVPN) Version(ctx context.Context) (string, error) {
-	out, err := shared.RunCmd(ctx, bin, "-v")
+	out, err := run(ctx, "-v")
 	if err != nil {
 		return "", err
 	}
