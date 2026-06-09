@@ -283,9 +283,15 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 	// blackholes the pod's entire egress — turning a wedged daemon into an
 	// unrecoverable, undiagnosable pod. We don't need the daemon's leak
 	// protection: tundler gates traffic on /readyz and verifies the exit-IP
-	// contract after every connect. (A configure.sh comment used to claim
-	// Login() already did this — it never did.)
-	quiet(ctx, "set", "killswitch", "off")
+	// contract after every connect.
+	//
+	// The CLI key is "networklock" (NOT "killswitch", which the CLI rejects
+	// with "Unknown type"). This call rides the daemon's IPC, so it is lost
+	// if the daemon is wedged — the authoritative enforcement is the
+	// ExecStartPre prestart script (docker/providers/expressvpn/
+	// configure.sh) that patches settings.json before every daemon start;
+	// this CLI call is belt-and-braces for a responsive daemon.
+	quiet(ctx, "set", "networklock", "off")
 
 	if e.LoggedIn(ctx) {
 		return nil
