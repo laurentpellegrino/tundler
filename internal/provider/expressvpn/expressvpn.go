@@ -238,6 +238,14 @@ func (e ExpressVPN) Locations(ctx context.Context) []string {
 		maxAttempts = 12
 		retryGap    = 5 * time.Second
 	)
+	// Self-heal BEFORE the retry loop. connectTunnel calls Locations()
+	// before Connect(), so without this a wedged daemon never reaches
+	// Connect()'s recovery: Locations() spins its full 12×10s budget,
+	// returns nil, pickLocation fails, and the connect loop restarts —
+	// observed in production (tundler-tunnel-expressvpn-1, 2026-06-10:
+	// 40+ min of 10s-cadence CLI timeouts, zero daemon restarts, slot
+	// frozen at observed=0).
+	ensureDaemonResponsive(ctx)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		out, err := run(ctx, "get", "regions")
 		if err == nil {
@@ -291,6 +299,12 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 	// ExecStartPre prestart script (docker/providers/expressvpn/
 	// configure.sh) that patches settings.json before every daemon start;
 	// this CLI call is belt-and-braces for a responsive daemon.
+	//
+	// Self-heal first: a tundler respawn into a container whose daemon is
+	// already wedged would otherwise burn the whole boot path (LoggedIn
+	// reads a timeout as "logged in", Locations returns nil) against a
+	// dead daemon.
+	ensureDaemonResponsive(ctx)
 	quiet(ctx, "set", "networklock", "off")
 
 	if e.LoggedIn(ctx) {
