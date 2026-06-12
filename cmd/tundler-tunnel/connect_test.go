@@ -30,6 +30,9 @@ type fakeProvider struct {
 
 	disconnectCalls   atomic.Int32 // number of Disconnect() invocations
 	disconnectCtxErrd atomic.Bool  // true if any Disconnect saw a cancelled ctx
+
+	loggedOut  atomic.Bool  // when true, LoggedIn() reports false (session lost)
+	loginCalls atomic.Int32 // number of Login() invocations
 }
 
 func (f *fakeProvider) Locations(_ context.Context) []string {
@@ -68,8 +71,12 @@ func (f *fakeProvider) Disconnect(ctx context.Context) error {
 	f.connected.Store(false)
 	return nil
 }
-func (f *fakeProvider) LoggedIn(_ context.Context) bool          { return true }
-func (f *fakeProvider) Login(_ context.Context) error            { return nil }
+func (f *fakeProvider) LoggedIn(_ context.Context) bool { return !f.loggedOut.Load() }
+func (f *fakeProvider) Login(_ context.Context) error {
+	f.loginCalls.Add(1)
+	f.loggedOut.Store(false) // a successful login restores the session
+	return nil
+}
 func (f *fakeProvider) Logout(_ context.Context) error           { return nil }
 func (f *fakeProvider) Status(_ context.Context) provider.Status { return provider.Status{Connected: f.connected.Load()} }
 func (f *fakeProvider) Version(_ context.Context) (string, error) {

@@ -6,10 +6,47 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
 )
+
+// reloginThrottleSec bounds how often this process re-logs-in after finding
+// the daemon logged out mid-life, so a provider/account that keeps
+// invalidating the session can't drive a login storm (the exact churn that
+// trips shared-account detection).
+const reloginThrottleSec = 60
+
+// lastReloginUnix is the unix-seconds timestamp of the last re-login (one
+// provider per process, so package state is fine).
+var lastReloginUnix atomic.Int64
+
+// ensureLoggedIn re-authenticates if the provider daemon has lost its
+// session SINCE boot. The watchdog and rotation reconnect paths were built
+// on the assumption that login is one-shot (the VPN client caches the
+// session), so they reconnect WITHOUT re-logging-in. But a daemon can get
+// logged out mid-life — observed 2026-06-12: expressvpnctl reports "Not
+// logged in" hours after a successful boot login, and because nothing
+// re-runs Login() the watchdog reconnect-loops forever, leaving the slot
+// stuck at 0 rps until a manual pod restart. This closes that gap: only
+// re-logins when the daemon actually reports logged-out, and throttled so a
+// flapping session can't storm the account.
+func ensureLoggedIn(ctx context.Context, prov provider.VPNProvider, providerName string) error {
+	if prov.LoggedIn(ctx) {
+		return nil
+	}
+	now := time.Now().Unix()
+	last := lastReloginUnix.Load()
+	if now-last < reloginThrottleSec {
+		return fmt.Errorf("provider=%s daemon not logged in; re-login throttled (%ds)", providerName, reloginThrottleSec)
+	}
+	if !lastReloginUnix.CompareAndSwap(last, now) {
+		return fmt.Errorf("provider=%s re-login already in progress", providerName)
+	}
+	log.Printf("tundler-tunnel: provider=%s daemon lost its session mid-life — re-running Login()", providerName)
+	return prov.Login(ctx)
+}
 
 // connectTunnel picks a random allowed location (provider.Locations()
 // minus `excluded`) and connects through it. On success, verifies the
@@ -29,6 +66,9 @@ import (
 //	                                                          → (return error) (failure; caller sets Failed)
 func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string) error {
 	state.Set(StateConnecting)
+	if err := ensureLoggedIn(ctx, prov, providerName); err != nil {
+		return err
+	}
 	available := prov.Locations(ctx)
 	location, err := pickLocation(available, excluded)
 	if err != nil {
@@ -149,6 +189,13 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 	var recentlyFailed []string
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		state.Set(StateConnecting)
+		if err := ensureLoggedIn(ctx, prov, providerName); err != nil {
+			log.Printf("tundler-tunnel: rotation attempt %d/%d: %v", attempt, maxAttempts, err)
+			if attempt < maxAttempts {
+				sleep(retryBackoff(attempt))
+			}
+			continue
+		}
 		available := prov.Locations(ctx)
 		combined := append([]string(nil), excluded...)
 		combined = append(combined, recentlyFailed...)
