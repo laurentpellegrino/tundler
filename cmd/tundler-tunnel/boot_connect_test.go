@@ -76,15 +76,21 @@ func TestConnectInitialWithRetry_StopsOnContextCancel(t *testing.T) {
 }
 
 // TestBootConnectBackoff_CapsAndFloors checks the backoff stays within
-// [1s, 75s] (60s cap + 25% jitter) and never goes sub-second.
+// [1s, 375s] (5min cap + 25% jitter) and never goes sub-second.
 func TestBootConnectBackoff_CapsAndFloors(t *testing.T) {
 	for attempt := 1; attempt <= 20; attempt++ {
 		d := bootConnectBackoff(attempt)
 		if d < time.Second {
 			t.Fatalf("attempt %d: backoff %s < 1s floor", attempt, d)
 		}
-		if d > 75*time.Second {
-			t.Fatalf("attempt %d: backoff %s exceeds 60s cap + jitter", attempt, d)
+		if d > 375*time.Second {
+			t.Fatalf("attempt %d: backoff %s exceeds 5min cap + jitter", attempt, d)
 		}
+	}
+	// A high attempt must approach the 5-min cap (≥ 300s − 25% jitter),
+	// proving the account-saturation backoff actually spaces attempts out
+	// rather than staying at the old 60s.
+	if d := bootConnectBackoff(15); d < 225*time.Second {
+		t.Fatalf("attempt 15: backoff %s did not reach the 5min cap band", d)
 	}
 }

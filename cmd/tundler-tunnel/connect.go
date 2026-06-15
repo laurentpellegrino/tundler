@@ -141,19 +141,32 @@ func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, sta
 }
 
 // bootConnectBackoff returns the wait before initial-connect retry n+1:
-// exponential 1s, 2s, 4s, … capped at 60s, with ±25% jitter so a fleet
+// exponential 1s, 2s, 4s, … capped at 5 min, with ±25% jitter so a fleet
 // booting into a provider-wide outage doesn't re-hit the (possibly
 // throttled) backend in lockstep. Gentle by design — each attempt forks
 // the provider CLI (Locations/Connect), so we space attempts out rather
 // than hammer a daemon that's already struggling.
+//
+// The 5-min cap (was 60s) exists for the account-saturation case: when
+// more tunnels are provisioned than the provider account sustains
+// concurrent sessions for, the surplus pods can NEVER connect — every
+// Connect is a fresh session attempt the account rejects, and a tight
+// 60s retry turned that into a re-login storm the provider flags as
+// sharing (the chronic ExpressVPN churn-penalty spiral). Now the startup
+// probe is /livez (no 10-min force-restart), so a shut-out pod simply
+// stays NotReady and backs off to one attempt / 5 min — quiet enough to
+// not trip the penalty, while still reclaiming a freed session slot
+// within ~5 min. A healthy pod connects on attempt 1-2 and never reaches
+// the cap.
 func bootConnectBackoff(attempt int) time.Duration {
+	const maxWait = 5 * time.Minute
 	shift := attempt - 1
-	if shift > 6 {
-		shift = 6 // 1<<6 = 64s, clamped to the 60s cap below
+	if shift > 9 {
+		shift = 9 // 1<<9 = 512s, clamped to maxWait below
 	}
 	base := time.Duration(1<<uint(shift)) * time.Second
-	if base > 60*time.Second {
-		base = 60 * time.Second
+	if base > maxWait {
+		base = maxWait
 	}
 	jitter := time.Duration(rand.Int64N(int64(base)/2+1)) - base/4
 	d := base + jitter
