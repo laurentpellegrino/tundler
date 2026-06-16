@@ -27,6 +27,11 @@ import (
 // time chasing an IP that wasn't ready yet.
 const stateConnected = "Connected"
 
+// stateDisconnected is the documented idle state. Protocol changes are
+// only safe in this state — flipping the transport on any other state
+// (Connected/Connecting/Interrupted) wedges the piavpn daemon.
+const stateDisconnected = "Disconnected"
+
 // monitor wraps two long-lived `piactl monitor <type>` subprocesses
 // (one for connectionstate, one for vpnip) and exposes the latest
 // values via atomic reads. Replaces the ~3 piactl subprocess spawns
