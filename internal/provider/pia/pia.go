@@ -36,6 +36,42 @@ func init() { provider.Registry[name] = PIA{} }
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+// desiredProtocol is the VPN transport tundler forces for PIA. piactl's
+// Linux desktop default is OpenVPN (userspace, TLS-wrapped, single-
+// threaded crypto — slow to handshake and low throughput); the mobile
+// app defaults to WireGuard (kernel/near-instant, high throughput).
+// tundler never overrode the default, so every PIA tunnel was crawling
+// over the slow transport. PIA_PROTOCOL=openvpn reverts this without an
+// image rebuild if WireGuard can't come up in a given container/node.
+func desiredProtocol() string {
+	if p := strings.TrimSpace(os.Getenv("PIA_PROTOCOL")); p != "" {
+		return p
+	}
+	return "wireguard"
+}
+
+// ensureProtocol sets the transport to desiredProtocol(), but ONLY while
+// the daemon is DISCONNECTED. `piactl set protocol` returns exit 0 even on
+// a live tunnel, but immediately WEDGES the daemon (every subsequent
+// piactl call then times out), so it must run before any Connect(). It is
+// idempotent (skips when already set — so a reconnect mid-session never
+// re-flips it) and best-effort: a not-yet-ready daemon reports a non-
+// "Disconnected" state (or times out → empty), we skip, and the next
+// Login() in connectTunnel's retry loop tries again before Connect.
+func ensureProtocol(ctx context.Context) {
+	want := desiredProtocol()
+	if cur, _ := shared.RunCmd(ctx, bin, "get", "protocol"); strings.TrimSpace(cur) == want {
+		return
+	}
+	state, _ := shared.RunCmd(ctx, bin, "get", "connectionstate")
+	if strings.TrimSpace(state) != stateDisconnected {
+		shared.Debugf("PIA: ensureProtocol - skip set (state=%q, not Disconnected)", strings.TrimSpace(state))
+		return
+	}
+	shared.Debugf("PIA: ensureProtocol - setting protocol=%s while disconnected", want)
+	quiet(ctx, "set", "protocol", want)
+}
+
 func (p PIA) ActiveLocation(ctx context.Context) string {
 	out, _ := shared.RunCmd(ctx, bin, "get", "region")
 	return strings.TrimSpace(out)
@@ -197,6 +233,12 @@ func (p PIA) Login(ctx context.Context) error {
 
 	shared.Debugf("PIA: Login() - enabling background")
 	quiet(ctx, "background", "enable")
+
+	// Force WireGuard on the fresh, still-disconnected daemon BEFORE the
+	// first Connect — the desktop default is slow OpenVPN. Safe here
+	// because no tunnel is up yet (flipping protocol live wedges the
+	// daemon); idempotent on later calls. See ensureProtocol.
+	ensureProtocol(ctx)
 
 	shared.Debugf("PIA: Login() - checking if already logged in")
 	if p.LoggedIn(ctx) {
