@@ -3,9 +3,11 @@ package pia
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/provider"
@@ -14,6 +16,67 @@ import (
 
 const bin = "piactl"
 const name = "pia"
+
+// daemonService is the systemd unit running the PIA daemon (piavpn-daemon)
+// inside the container (enabled by docker/providers/pia/configure.sh).
+const daemonService = "piavpn.service"
+
+// minDaemonRecoveryInterval throttles daemon restarts so a fundamentally
+// broken daemon can't be bounced on every connect retry. 120s (vs
+// expressvpn's 60s) because PIA's auth path is more sensitive.
+const minDaemonRecoveryInterval = 120 * time.Second
+
+// lastDaemonRecovery is the unix-seconds timestamp of the last daemon restart.
+var lastDaemonRecovery atomic.Int64
+
+// daemonResponsive reports whether piavpn-daemon currently answers piactl
+// requests. piactl has its own internal ~5s IPC timeout: on a wedged daemon
+// it prints "Timed out after N sec" and exits non-zero. Mirrors the
+// expressvpn provider's check.
+func daemonResponsive(ctx context.Context) bool {
+	out, err := shared.RunCmd(ctx, bin, "get", "connectionstate")
+	return err == nil && !strings.Contains(out, "Timed out")
+}
+
+// ensureDaemonResponsive detects a wedged piavpn-daemon (every piactl call
+// timing out — the PIA analogue of the expressvpn futex deadlock, observed
+// leaving pods stuck in "Connecting" for hours with no recovery) and restarts
+// the systemd unit. LOGIN-FREE: the account/session token persists on disk
+// (/opt/piavpn/etc/account.json) and survives a daemon restart, so unlike a
+// container restart it costs none of the login-rate budget PIA's
+// account-sharing heuristics watch. Throttled to one restart per
+// minDaemonRecoveryInterval; after restarting we wait (up to ~30s) for the
+// daemon to answer again so the caller's connect runs against a live daemon.
+func ensureDaemonResponsive(ctx context.Context) {
+	if daemonResponsive(ctx) {
+		return
+	}
+	now := time.Now().Unix()
+	last := lastDaemonRecovery.Load()
+	if now-last < int64(minDaemonRecoveryInterval/time.Second) {
+		return
+	}
+	if !lastDaemonRecovery.CompareAndSwap(last, now) {
+		return // another goroutine is already recovering
+	}
+	log.Printf("PIA: daemon unresponsive (piactl timeout) — restarting %s (login-free recovery)", daemonService)
+	if _, err := shared.RunCmd(ctx, "systemctl", "restart", daemonService); err != nil {
+		log.Printf("PIA: daemon restart failed: %v", err)
+		return
+	}
+	for i := 0; i < 15; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		if daemonResponsive(ctx) {
+			log.Printf("PIA: daemon responsive again after restart")
+			return
+		}
+	}
+	log.Printf("PIA: daemon still unresponsive 30s after restart")
+}
 
 // rateLimitCooldown is how long Login refuses to call piactl after PIA's
 // auth API has returned ApiRateLimitedError. Chosen to outlast PIA's typical
@@ -79,6 +142,12 @@ func (p PIA) ActiveLocation(ctx context.Context) string {
 
 func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	shared.Debugf("PIA: Connect() called with location: %s", location)
+
+	// Self-heal: if the daemon is wedged (piactl timing out), restart it
+	// BEFORE attempting to connect — login-free, so the boot/rotation retry
+	// loops recover instead of spinning against a dead daemon and leaving the
+	// pod stuck "Connecting" for hours.
+	ensureDaemonResponsive(ctx)
 
 	if location != "" {
 		shared.Debugf("PIA: Connect() - setting region to %s", location)
@@ -233,6 +302,10 @@ func (p PIA) Login(ctx context.Context) error {
 
 	shared.Debugf("PIA: Login() - enabling background")
 	quiet(ctx, "background", "enable")
+
+	// A wedged daemon at boot makes the login CLI time out; restart it
+	// (login-free) so the login attempt runs against a live daemon.
+	ensureDaemonResponsive(ctx)
 
 	// Force WireGuard on the fresh, still-disconnected daemon BEFORE the
 	// first Connect — the desktop default is slow OpenVPN. Safe here
