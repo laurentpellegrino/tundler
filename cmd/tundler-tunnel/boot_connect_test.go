@@ -44,6 +44,54 @@ func TestConnectInitialWithRetry_RetriesUntilSuccess(t *testing.T) {
 	}
 }
 
+// TestLoginInitialWithRetry_RetriesUntilSuccess verifies boot login keeps
+// retrying IN-PROCESS (never exits) until a Login succeeds, and records an
+// auth failure for each failed attempt. This is the fix for the 700+ restart
+// crashloop: a throttled account's login timeout must NOT container-restart
+// the pod (each restart = a fresh login that deepens the throttle).
+func TestLoginInitialWithRetry_RetriesUntilSuccess(t *testing.T) {
+	fp := &fakeProvider{locations: []string{"USA"}}
+	fp.loginFails.Store(3) // first 3 Login() calls fail, 4th succeeds
+
+	st := NewStateTracker("fake")
+	if err := loginInitialWithRetry(context.Background(), fp, st, "fake", noBootBackoff); err != nil {
+		t.Fatalf("loginInitialWithRetry: %v", err)
+	}
+	if got := fp.loginCalls.Load(); got != 4 {
+		t.Errorf("Login called %d times, want 4", got)
+	}
+	if got := st.Snapshot().AuthFailuresTotal; got != 3 {
+		t.Errorf("AuthFailuresTotal=%d, want 3 (one per failed attempt)", got)
+	}
+}
+
+// TestLoginInitialWithRetry_StopsOnContextCancel verifies the loop returns
+// (rather than spinning forever) when the pod is shut down mid-login.
+func TestLoginInitialWithRetry_StopsOnContextCancel(t *testing.T) {
+	fp := &fakeProvider{locations: []string{"USA"}}
+	fp.loginFails.Store(1 << 30) // never succeeds
+	ctx, cancel := context.WithCancel(context.Background())
+
+	st := NewStateTracker("fake")
+	done := make(chan error, 1)
+	go func() {
+		done <- loginInitialWithRetry(ctx, fp, st, "fake",
+			func(int) time.Duration { return time.Millisecond })
+	}()
+	// Let a few attempts happen, then cancel.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a context-cancellation error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("loginInitialWithRetry did not return after ctx cancel")
+	}
+}
+
 // TestConnectInitialWithRetry_StopsOnContextCancel verifies the loop exits
 // (rather than spinning forever) when the pod is shutting down mid-connect.
 func TestConnectInitialWithRetry_StopsOnContextCancel(t *testing.T) {

@@ -207,21 +207,17 @@ func main() {
 		providerName, d, jitterMax)
 	time.Sleep(d)
 
-	state.Set(StateLoggingIn)
-	if err := prov.Login(ctx); err != nil {
-		// Bump the auth-failure counter BEFORE failAndExit. The
-		// counter is what /status exposes for fleet-wide
-		// alerting; surfacing it for at least the few seconds
-		// kubelet takes to observe the crash is what makes a
-		// "credentials drift" vs "transient network" distinction
-		// visible without per-pod log inspection.
-		state.RecordAuthFailure(err.Error())
-		// Initial-login failure handling: flip state to Failed (so /livez
-		// returns 503 within the next probe period — k8s sees the failure
-		// and CrashLoopBackOff kicks in), give probes a moment to pick up
-		// the new state, then exit non-zero.
-		log.Printf("tundler-tunnel: initial login failed for provider=%s: %v", providerName, err)
-		failAndExit(state)
+	// Boot login, retried IN-PROCESS with backoff (never exits / container-
+	// restarts). The old failAndExit-on-first-failure turned a transient
+	// account-login THROTTLE into a 700+ restart crashloop, each restart a
+	// fresh login that deepened the throttle. loginInitialWithRetry keeps the
+	// process (and /livez) up so a throttled or briefly-misconfigured account
+	// recovers without a re-login storm; auth failures still surface on
+	// /status. Returns only on ctx cancellation (pod shutting down).
+	if err := loginInitialWithRetry(ctx, prov, state, providerName, bootConnectBackoff); err != nil {
+		log.Printf("tundler-tunnel: shutting down during initial login: %v", err)
+		gracefulDisconnect()
+		return
 	}
 
 	// Tunnel hold: pick a random allowed location (provider-filtered minus
@@ -349,9 +345,8 @@ func main() {
 // then ticks back around. Truly unrecoverable wedges (the proxy can
 // dial nothing, the daemon's CLI keeps timing out on Connect) are
 // caught by runWedgeGuard, which exits the process after the wedge
-// threshold; systemd then respawns the binary fresh, and if the new
-// binary also can't initial-connect, failAndExit exits 2 and kubelet
-// container-restarts the pod.
+// threshold; systemd then respawns the binary fresh in-container
+// (login-free), and the boot login/connect retry loops take over.
 func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server, baselineEgressIP string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -468,37 +463,14 @@ func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Dura
 	}
 }
 
-// exitUnrecoverable is the exit code that tells systemd "don't restart
-// this binary — escalate to kubelet via /livez ECONNREFUSED." Paired
-// with `RestartPreventExitStatus=2` in tundler-tunnel.service. Used by
-// failAndExit, called from the initial-Login / initial-Connect path
-// when the provider daemon (expressvpnd / piad / openvpn) is wedged
-// in a way the in-binary watchdog can't recover from. Triggering a
-// container restart (instead of the systemd-respawn loop that ran
-// 437× on tundler-tunnel-expressvpn-1 over 9.5 h) gets us back to
-// Ready in ~30 s (one livenessProbe failureThreshold cycle).
-//
-// Distinct from the wedge guard's `os.Exit(1)`, which DOES want a
-// systemd respawn — the runtime "was Ready, lost it" case is often
-// just stale Go state and a fresh process inside the same container
-// can recover. If that respawn ALSO hits a daemon wedge, its
-// failAndExit will exit 2 and escalate from there.
-const exitUnrecoverable = 2
-
-// failAndExit is the unrecoverable-startup-error path: initial Login
-// or initial Connect could not establish a baseline tunnel. We exit
-// with exitUnrecoverable so systemd does NOT respawn (per
-// RestartPreventExitStatus=2); kubelet then container-restarts the
-// pod once livenessProbe sees /livez ECONNREFUSED.
-func failAndExit(state *StateTracker) {
-	state.Set(StateFailed)
-	time.Sleep(2 * time.Second) // let an in-flight /status probe see Failed
-	// If a tunnel (or just a login) was established before we gave up,
-	// disconnect so the provider frees the device slot rather than aging
-	// out a dangling session. No-op when nothing is connected.
-	gracefulDisconnect()
-	os.Exit(exitUnrecoverable)
-}
+// NOTE: the old failAndExit / exitUnrecoverable startup-error escalation was
+// removed. Both boot paths now retry IN-PROCESS forever (loginInitialWithRetry,
+// connectInitialWithRetry) keeping /livez up, because the container restart it
+// triggered re-ran boot → a fresh provider login that deepened the very
+// account-sharing throttle it was reacting to (700+ restart crashloops). The
+// daemon-wedge case it covered is handled in-process by the provider's
+// ensureDaemonResponsive (login-free daemon restart). The RestartPreventExitStatus=2
+// in tundler-tunnel.service is now inert (no path exits 2) but left as a guard.
 
 func registryKeys() []string {
 	keys := make([]string, 0, len(provider.Registry))
