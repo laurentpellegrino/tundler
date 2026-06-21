@@ -97,6 +97,53 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 	return nil
 }
 
+// loginInitialWithRetry runs the BOOT login: it retries prov.Login until it
+// succeeds or ctx is cancelled. Like connectInitialWithRetry, it NEVER exits
+// the process — it stays alive and retries in-place with backoff.
+//
+// Rationale: a boot-login failure used to call failAndExit (exit 2 → kubelet
+// container restart). But when login fails because the account is being
+// THROTTLED (expressvpnctl "login with token" → "Timed out after 20s", not a
+// credential error), a container restart just re-runs boot → another fresh
+// login against the already-throttled account → the throttle persists and
+// deepens. That self-reinforcing loop produced 700+ restart crashloops on the
+// expressvpn pods, each restart a fresh login = exactly the re-login storm a
+// shared-account heuristic punishes. The daemon-wedge case that originally
+// justified failAndExit is already handled IN-PROCESS: Login() calls
+// ensureDaemonResponsive (login-free daemon restart), so a container restart
+// adds nothing the retry loop can't do without the re-login cost.
+//
+// State stays LoggingIn between attempts (→ /readyz 503, no traffic) while
+// /livez stays 200 (process alive → kubelet never restarts the container).
+// A genuine credential drift no longer crashloops loudly; instead the pod
+// sits NotReady with the auth-failure counter on /status — observable, and
+// strictly better than a storm that harms the whole account. Auth failures
+// are recorded each attempt so that signal is preserved.
+func loginInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, backoff func(attempt int) time.Duration) error {
+	for attempt := 1; ; attempt++ {
+		state.Set(StateLoggingIn)
+		err := prov.Login(ctx)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("tundler-tunnel: initial login succeeded on attempt %d (stayed up, no container restart)", attempt)
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		state.RecordAuthFailure(err.Error())
+		wait := backoff(attempt)
+		log.Printf("tundler-tunnel: initial login attempt %d failed for provider=%s: %v; retrying in %s (staying up, /livez 200 — no container restart, no re-login storm)",
+			attempt, providerName, err, wait.Round(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 // connectInitialWithRetry runs the BOOT connect: it retries connectTunnel
 // until it succeeds or ctx is cancelled. It NEVER re-logs-in and NEVER
 // exits the process.
