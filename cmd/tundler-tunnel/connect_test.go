@@ -33,6 +33,7 @@ type fakeProvider struct {
 
 	loggedOut  atomic.Bool  // when true, LoggedIn() reports false (session lost)
 	loginCalls atomic.Int32 // number of Login() invocations
+	loginFails atomic.Int32 // >0: that many leading Login() calls return an error
 }
 
 func (f *fakeProvider) Locations(_ context.Context) []string {
@@ -74,6 +75,10 @@ func (f *fakeProvider) Disconnect(ctx context.Context) error {
 func (f *fakeProvider) LoggedIn(_ context.Context) bool { return !f.loggedOut.Load() }
 func (f *fakeProvider) Login(_ context.Context) error {
 	f.loginCalls.Add(1)
+	if f.loginFails.Load() > 0 {
+		f.loginFails.Add(-1)
+		return errors.New("login failed (test)")
+	}
 	f.loggedOut.Store(false) // a successful login restores the session
 	return nil
 }
