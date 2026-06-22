@@ -104,10 +104,11 @@ func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin,
 // threaded crypto — slow to handshake and low throughput); the mobile
 // app defaults to WireGuard (kernel/near-instant, high throughput).
 // tundler never overrode the default, so every PIA tunnel was crawling
-// over the slow transport. PIA_PROTOCOL=openvpn reverts this without an
-// image rebuild if WireGuard can't come up in a given container/node.
+// over the slow transport. PRIVATEINTERNETACCESS_PROTOCOL=openvpn overrides
+// this (same canonical prefix as the PRIVATEINTERNETACCESS_USERNAME/PASSWORD
+// creds — one prefix per provider).
 func desiredProtocol() string {
-	if p := strings.TrimSpace(os.Getenv("PIA_PROTOCOL")); p != "" {
+	if p := strings.TrimSpace(os.Getenv("PRIVATEINTERNETACCESS_PROTOCOL")); p != "" {
 		return p
 	}
 	return "wireguard"
