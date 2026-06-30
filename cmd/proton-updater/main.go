@@ -13,16 +13,31 @@
 // the tunnel only needs static server data plus the (separate)
 // PROTON_OPENVPN_* credentials to dial OpenVPN.
 //
-// Required env:
+// Two modes:
 //
-//	PROTON_ACCOUNT_USERNAME  ProtonMail/ProtonVPN account email
-//	PROTON_ACCOUNT_PASSWORD  account login password (NOT the
-//	                         per-OpenVPN credentials)
+//	(default) refresh mode — reuses a stored session and never triggers the
+//	  CAPTCHA. Reads:
+//	    PROTON_SESSION_UID            account UID from a prior login
+//	    PROTON_SESSION_REFRESH_TOKEN  refresh token from a prior login
+//	    PROTON_SESSION_OUT (optional) path to write the rotated session JSON
+//	                                  ({uid, refresh_token}) for write-back
+//	  and prints servers.json to stdout.
+//
+//	-login — one-time interactive seed. Performs the SRP password login and,
+//	  when Proton challenges it, prints the verify.proton.me URL to solve the
+//	  CAPTCHA in a browser; re-run with -hv-token <token>. On success it emits
+//	  the reusable session {uid, refresh_token} (to PROTON_SESSION_OUT, else
+//	  stdout) to store in OpenBao. Reads:
+//	    PROTON_ACCOUNT_USERNAME  ProtonMail/ProtonVPN account email
+//	    PROTON_ACCOUNT_PASSWORD  account login password (NOT the per-OpenVPN creds)
+//	    PROTON_HV_TOKEN (optional) solved human-verification token to replay
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -60,30 +75,112 @@ type outputFile struct {
 	} `json:"protonvpn"`
 }
 
+// session is the reusable login state persisted in OpenBao between runs.
+type session struct {
+	UID          string `json:"uid"`
+	RefreshToken string `json:"refresh_token"`
+}
+
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("proton-updater: ")
 
-	email := os.Getenv("PROTON_ACCOUNT_USERNAME")
-	password := os.Getenv("PROTON_ACCOUNT_PASSWORD")
-	if email == "" || password == "" {
-		log.Fatalf("PROTON_ACCOUNT_USERNAME and PROTON_ACCOUNT_PASSWORD must be set")
-	}
+	loginMode := flag.Bool("login", false,
+		"one-time interactive login: perform SRP (solving the CAPTCHA via the printed verify URL) and emit a reusable session for OpenBao")
+	hvToken := flag.String("hv-token", os.Getenv("PROTON_HV_TOKEN"),
+		"solved human-verification token to replay a CAPTCHA-challenged login")
+	hvType := flag.String("hv-type", "captcha", "human-verification token type")
+	flag.Parse()
 
 	ctx := context.Background()
 	client, err := newAPIClient(ctx)
 	if err != nil {
 		log.Fatalf("api client init: %v", err)
 	}
-	cookie, err := client.authenticate(ctx, email, password)
-	if err != nil {
-		log.Fatalf("auth: %v", err)
+
+	if *loginMode {
+		runLogin(ctx, client, *hvToken, *hvType)
+		return
 	}
+	runRefresh(ctx, client)
+}
+
+// runRefresh is the default (CI) path: reuse a stored session to fetch the
+// catalog without ever hitting the CAPTCHA-gated SRP login.
+func runRefresh(ctx context.Context, client *apiClient) {
+	uid := os.Getenv("PROTON_SESSION_UID")
+	refreshToken := os.Getenv("PROTON_SESSION_REFRESH_TOKEN")
+	if uid == "" || refreshToken == "" {
+		log.Fatalf("PROTON_SESSION_UID and PROTON_SESSION_REFRESH_TOKEN must be set " +
+			"(seed them once with `proton-updater -login`)")
+	}
+
+	cookie, rotated, err := client.refreshSession(ctx, uid, refreshToken)
+	if err != nil {
+		log.Fatalf("session refresh failed — re-seed with `proton-updater -login`: %v", err)
+	}
+
+	// Persist the (possibly rotated) refresh token so the next run can reuse
+	// it. Written before the fetch so a later failure can't lose a rotation.
+	if err := writeSession(session{UID: uid, RefreshToken: rotated}); err != nil {
+		log.Fatalf("persisting rotated session: %v", err)
+	}
+
 	logicals, err := client.fetchLogicals(ctx, cookie)
 	if err != nil {
 		log.Fatalf("fetch logicals: %v", err)
 	}
+	emitServers(logicals)
+}
 
+// runLogin is the one-time seed: SRP login (with optional CAPTCHA replay),
+// then emit the reusable session for the operator to store in OpenBao.
+func runLogin(ctx context.Context, client *apiClient, hvToken, hvType string) {
+	email := os.Getenv("PROTON_ACCOUNT_USERNAME")
+	password := os.Getenv("PROTON_ACCOUNT_PASSWORD")
+	if email == "" || password == "" {
+		log.Fatalf("PROTON_ACCOUNT_USERNAME and PROTON_ACCOUNT_PASSWORD must be set for -login")
+	}
+
+	cookie, refreshToken, err := client.authenticate(ctx, email, password, hvToken, hvType)
+	if err != nil {
+		var apiErr *protonAPIError
+		if errors.As(err, &apiErr) && apiErr.isHumanVerification() {
+			fmt.Fprintf(os.Stderr,
+				"\nProton requires a CAPTCHA. Solve it in a browser:\n  %s\n"+
+					"then re-run from the SAME machine:\n  proton-updater -login -hv-token <token-from-that-page>\n\n",
+				apiErr.verifyURL())
+		}
+		log.Fatalf("login: %v", err)
+	}
+	if refreshToken == "" {
+		log.Fatalf("login succeeded but no refresh token returned — cannot seed a reusable session")
+	}
+
+	if err := writeSession(session{UID: cookie.uid, RefreshToken: refreshToken}); err != nil {
+		log.Fatalf("writing session: %v", err)
+	}
+	fmt.Fprintf(os.Stderr,
+		"proton-updater: login OK — store the emitted {uid, refresh_token} in OpenBao "+
+			"at lpellegr/kv/vpn/proton-session\n")
+}
+
+// writeSession emits the session JSON to PROTON_SESSION_OUT (0600) when set,
+// otherwise to stdout (so an interactive -login can be piped/copied).
+func writeSession(s session) error {
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	if path := os.Getenv("PROTON_SESSION_OUT"); path != "" {
+		return os.WriteFile(path, b, 0o600)
+	}
+	_, err = os.Stdout.Write(append(b, '\n'))
+	return err
+}
+
+// emitServers transforms, sorts and prints the logicals catalog to stdout.
+func emitServers(logicals *logicalsResponse) {
 	servers := transform(logicals)
 	if len(servers) == 0 {
 		log.Fatalf("logicals returned 0 usable servers — refusing to overwrite")
