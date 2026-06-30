@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/notifier"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
 	"github.com/laurentpellegrino/tundler/internal/proxy"
@@ -23,13 +24,13 @@ import (
 )
 
 const (
-	envProvider              = "TUNDLER_TUNNEL_PROVIDER"
-	envBootLoginJitterSec    = "BOOT_LOGIN_JITTER_SECONDS"
-	envExcludedLocations     = "EXCLUDED_LOCATIONS"
-	envWatchdogIntervalSec   = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
-	envMinRotationSec        = "MIN_ROTATION_SECONDS"
-	envMaxRotationSec        = "MAX_ROTATION_SECONDS"
-	envWedgeGuardSec         = "WEDGE_GUARD_THRESHOLD_SECONDS"
+	envProvider            = "TUNDLER_TUNNEL_PROVIDER"
+	envBootLoginJitterSec  = "BOOT_LOGIN_JITTER_SECONDS"
+	envExcludedLocations   = "EXCLUDED_LOCATIONS"
+	envWatchdogIntervalSec = "TUNNEL_WATCHDOG_INTERVAL_SECONDS"
+	envMinRotationSec      = "MIN_ROTATION_SECONDS"
+	envMaxRotationSec      = "MAX_ROTATION_SECONDS"
+	envWedgeGuardSec       = "WEDGE_GUARD_THRESHOLD_SECONDS"
 	// Self-recycle: after RECYCLE_AFTER_SECONDS (jittered) OR
 	// RECYCLE_AFTER_ROTATIONS, the pod gracefully drains and exits its
 	// container so kubelet recreates it on the latest image + freshest env.
@@ -50,7 +51,7 @@ const (
 	// extra unpredictability).
 	defaultMinRotationSec = 7200  // 2h
 	defaultMaxRotationSec = 14400 // 4h
-	defaultWedgeGuardSec     = 900  // 15 min — tunable via WEDGE_GUARD_THRESHOLD_SECONDS
+	defaultWedgeGuardSec  = 900   // 15 min — tunable via WEDGE_GUARD_THRESHOLD_SECONDS
 
 	// Port the in-process Go CONNECT proxy listens on (replaces the
 	// sibling envoy container retired in phase 4). The Service
@@ -141,11 +142,35 @@ func main() {
 		}
 	}()
 
+	// Generic event hook (opt-in via TUNDLER_EVENT_SINKS). Provider-agnostic:
+	// it fans the pod's current exit-IP snapshot out to any configured webhook
+	// destination(s). Subscriber-specific concerns live in those subscribers,
+	// not here.
+	notif, notifEnabled := notifier.FromEnv(func() (map[string]any, bool) {
+		snap := state.Snapshot()
+		if snap.CurrentExitIP == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"provider_id": providerName,
+			"exit_ip":     snap.CurrentExitIP,
+			"node_ip":     nodeIP,
+			"pod":         podName,
+		}, true
+	})
+
 	state.SetTunnelUpListener(func(exitIP string) {
 		// In-process pointer swap — read by proxy.handle on every
 		// subsequent CONNECT, no IPC, no file IO.
 		proxySrv.SetExitIP(exitIP)
+		if notifEnabled {
+			// Fire a fresh-exit-IP event without blocking this listener.
+			notif.OnTunnelUp()
+		}
 	})
+	if notifEnabled {
+		go notif.Run(ctx)
+	}
 
 	// Proxy-chain providers (TunnelBear) don't bring up a kernel
 	// tunnel: they forward through an upstream HTTPS proxy by
@@ -396,12 +421,12 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 // predicate, based on what the in-process CONNECT proxy has actually
 // observed on its upstream dials. Returns true iff:
 //
-//	- no dial has happened recently (within dialSilenceWindow) — no
-//	  signal to act on; or
-//	- the very latest dial succeeded — proof the tunnel is currently
-//	  delivering packets; or
-//	- consecutive failures are below dialFailureThreshold — a few
-//	  failures could just be unreachable hosts, not a tunnel problem.
+//   - no dial has happened recently (within dialSilenceWindow) — no
+//     signal to act on; or
+//   - the very latest dial succeeded — proof the tunnel is currently
+//     delivering packets; or
+//   - consecutive failures are below dialFailureThreshold — a few
+//     failures could just be unreachable hosts, not a tunnel problem.
 //
 // Returns false (i.e. "go ahead, try to reconnect") only when there's
 // recent traffic AND a sustained failure pattern that the proxy
@@ -494,4 +519,3 @@ func getEnvInt(name string, def int) int {
 	}
 	return n
 }
-
