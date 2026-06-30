@@ -117,45 +117,49 @@ func (c *apiClient) setHeaders(req *http.Request, cookie cookieState) {
 //     which implements Proton's hash variants).
 //  6. POST /core/v4/auth → submit proof, get authenticated UID +
 //     access token + new cookie token.
-func (c *apiClient) authenticate(ctx context.Context, email, password string) (cookieState, error) {
+//
+// Returns the authenticated cookie plus the account refresh token (persist it
+// to reuse the session without logging in again). hvToken/hvType, when set,
+// replay a solved human-verification (CAPTCHA) challenge on the auth submit.
+func (c *apiClient) authenticate(ctx context.Context, email, password, hvToken, hvType string) (cookieState, string, error) {
 	sessionID, err := c.fetchSessionID(ctx)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("session id: %w", err)
+		return cookieState{}, "", fmt.Errorf("session id: %w", err)
 	}
 
 	tokenType, accessToken, refreshToken, uid, err := c.fetchUnauthSession(ctx, sessionID)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("unauth session: %w", err)
+		return cookieState{}, "", fmt.Errorf("unauth session: %w", err)
 	}
 
 	unauth := cookieState{sessionID: sessionID, uid: uid}
 
-	cookieToken, err := c.exchangeForCookieToken(ctx, unauth, tokenType, accessToken, refreshToken)
+	cookieToken, _, err := c.exchangeForCookieToken(ctx, unauth, tokenType, accessToken, refreshToken)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("cookie token: %w", err)
+		return cookieState{}, "", fmt.Errorf("cookie token: %w", err)
 	}
 	unauth.token = cookieToken
 
 	info, err := c.fetchAuthInfo(ctx, unauth, email)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("auth info: %w", err)
+		return cookieState{}, "", fmt.Errorf("auth info: %w", err)
 	}
 
 	srpAuth, err := srp.NewAuth(info.Version, email, []byte(password),
 		info.Salt, info.Modulus, info.ServerEphemeral)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("srp init: %w", err)
+		return cookieState{}, "", fmt.Errorf("srp init: %w", err)
 	}
 	proofs, err := srpAuth.GenerateProofs(2048)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("srp proofs: %w", err)
+		return cookieState{}, "", fmt.Errorf("srp proofs: %w", err)
 	}
 
-	authed, err := c.submitAuth(ctx, unauth, email, info.SRPSession, proofs)
+	authed, authRefresh, err := c.submitAuth(ctx, unauth, email, info.SRPSession, proofs, hvToken, hvType)
 	if err != nil {
-		return cookieState{}, fmt.Errorf("auth submit: %w", err)
+		return cookieState{}, "", fmt.Errorf("auth submit: %w", err)
 	}
-	return authed, nil
+	return authed, authRefresh, nil
 }
 
 // -----------------------------------------------------------------
@@ -232,10 +236,15 @@ type cookieTokenResponse struct {
 	UID  string `json:"UID"`
 }
 
-func (c *apiClient) exchangeForCookieToken(ctx context.Context, cookie cookieState, tokenType, accessToken, refreshToken string) (string, error) {
+// exchangeForCookieToken swaps a refresh token for an auth cookie via
+// /core/v4/auth/cookies. Returns the AUTH-<UID> cookie token plus any rotated
+// refresh token (REFRESH-<UID> cookie) Proton hands back — empty when none.
+// accessToken may be "" (the refresh-token grant carries identity in the body
+// + UID header), in which case no Authorization header is sent.
+func (c *apiClient) exchangeForCookieToken(ctx context.Context, cookie cookieState, tokenType, accessToken, refreshToken string) (cookieToken, newRefreshToken string, err error) {
 	body := cookieTokenRequest{
 		GrantType:    "refresh_token",
-		Persistent:   0,
+		Persistent:   1,
 		RedirectURI:  "https://protonmail.com",
 		RefreshToken: refreshToken,
 		ResponseType: "token",
@@ -244,44 +253,78 @@ func (c *apiClient) exchangeForCookieToken(ctx context.Context, cookie cookieSta
 	}
 	buf := bytes.NewBuffer(nil)
 	if err := json.NewEncoder(buf).Encode(body); err != nil {
-		return "", err
+		return "", "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/core/v4/auth/cookies", buf)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	c.setHeaders(req, cookie)
-	req.Header.Set("Authorization", tokenType+" "+accessToken)
+	if accessToken != "" {
+		req.Header.Set("Authorization", tokenType+" "+accessToken)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", apiError(resp.StatusCode, respBody)
+		return "", "", apiError(resp.StatusCode, respBody)
 	}
 
 	var parsed cookieTokenResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", fmt.Errorf("decode: %w (body=%q)", err, snippet(respBody))
+		return "", "", fmt.Errorf("decode: %w (body=%q)", err, snippet(respBody))
 	}
 	if parsed.Code != 1000 {
-		return "", fmt.Errorf("unexpected code %d (body=%q)", parsed.Code, snippet(respBody))
+		return "", "", fmt.Errorf("unexpected code %d (body=%q)", parsed.Code, snippet(respBody))
 	}
 
-	// The cookie token comes back as a Set-Cookie named AUTH-<UID>.
+	// The cookie token comes back as a Set-Cookie named AUTH-<UID>; a rotated
+	// refresh token, when present, as REFRESH-<UID>.
 	for _, ck := range resp.Cookies() {
-		if strings.HasPrefix(ck.Name, "AUTH-") {
-			return ck.Value, nil
+		switch {
+		case strings.HasPrefix(ck.Name, "AUTH-"):
+			cookieToken = ck.Value
+		case strings.HasPrefix(ck.Name, "REFRESH-"):
+			newRefreshToken = ck.Value
 		}
 	}
-	return "", errors.New("AUTH-<UID> cookie missing in /auth/cookies response")
+	if cookieToken == "" {
+		return "", "", errors.New("AUTH-<UID> cookie missing in /auth/cookies response")
+	}
+	return cookieToken, newRefreshToken, nil
+}
+
+// refreshSession rebuilds an authenticated cookie from a previously stored
+// session (UID + refresh token) instead of running the CAPTCHA-gated SRP
+// login. Returns the cookie ready for /vpn/v1/logicals plus the refresh token
+// to persist for next time (rotated when Proton returns a new one, otherwise
+// the same one back).
+func (c *apiClient) refreshSession(ctx context.Context, uid, refreshToken string) (cookieState, string, error) {
+	sessionID, err := c.fetchSessionID(ctx)
+	if err != nil {
+		return cookieState{}, "", fmt.Errorf("session id: %w", err)
+	}
+	cs := cookieState{sessionID: sessionID, uid: uid}
+
+	cookieToken, rotated, err := c.exchangeForCookieToken(ctx, cs, "", "", refreshToken)
+	if err != nil {
+		return cookieState{}, "", fmt.Errorf("refresh exchange: %w", err)
+	}
+	cs.token = cookieToken
+
+	next := rotated
+	if next == "" {
+		next = refreshToken
+	}
+	return cs, next, nil
 }
 
 // -----------------------------------------------------------------
@@ -341,7 +384,7 @@ type authResponse struct {
 	ServerProof  string `json:"ServerProof"`
 }
 
-func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, srpSession string, proofs *srp.Proofs) (cookieState, error) {
+func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, srpSession string, proofs *srp.Proofs, hvToken, hvType string) (cookieState, string, error) {
 	body, err := json.Marshal(authRequest{
 		Username:        email,
 		ClientEphemeral: base64Encode(proofs.ClientEphemeral),
@@ -349,34 +392,42 @@ func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, s
 		SRPSession:      srpSession,
 	})
 	if err != nil {
-		return cookieState{}, err
+		return cookieState{}, "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/core/v4/auth", bytes.NewReader(body))
 	if err != nil {
-		return cookieState{}, err
+		return cookieState{}, "", err
 	}
 	c.setHeaders(req, cookie)
 	req.Header.Set("Content-Type", "application/json")
+	// Replay a solved human-verification (CAPTCHA) challenge, if supplied.
+	if hvToken != "" {
+		if hvType == "" {
+			hvType = "captcha"
+		}
+		req.Header.Set("x-pm-human-verification-token", hvToken)
+		req.Header.Set("x-pm-human-verification-token-type", hvType)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return cookieState{}, err
+		return cookieState{}, "", err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return cookieState{}, err
+		return cookieState{}, "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return cookieState{}, apiError(resp.StatusCode, respBody)
+		return cookieState{}, "", apiError(resp.StatusCode, respBody)
 	}
 
 	var parsed authResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return cookieState{}, fmt.Errorf("decode auth: %w (body=%q)", err, snippet(respBody))
+		return cookieState{}, "", fmt.Errorf("decode auth: %w (body=%q)", err, snippet(respBody))
 	}
 	if parsed.Code != 1000 {
-		return cookieState{}, fmt.Errorf("auth code %d (body=%q)", parsed.Code, snippet(respBody))
+		return cookieState{}, "", fmt.Errorf("auth code %d (body=%q)", parsed.Code, snippet(respBody))
 	}
 
 	authed := cookieState{
@@ -395,7 +446,7 @@ func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, s
 		// directly in a synthetic AUTH cookie (Proton accepts it).
 		authed.token = parsed.AccessToken
 	}
-	return authed, nil
+	return authed, parsed.RefreshToken, nil
 }
 
 // -----------------------------------------------------------------
@@ -403,24 +454,24 @@ func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, s
 // -----------------------------------------------------------------
 
 type physicalServer struct {
-	ID        string `json:"ID"`
-	Domain    string `json:"Domain"`
-	EntryIP   string `json:"EntryIP"`
-	Status    int    `json:"Status"`
-	Generation int   `json:"Generation"`
+	ID         string `json:"ID"`
+	Domain     string `json:"Domain"`
+	EntryIP    string `json:"EntryIP"`
+	Status     int    `json:"Status"`
+	Generation int    `json:"Generation"`
 }
 
 type logicalServer struct {
-	Name        string           `json:"Name"`
-	EntryCountry string          `json:"EntryCountry"`
-	ExitCountry string           `json:"ExitCountry"`
-	Country     string           `json:"Country"`
-	Region      string           `json:"Region"`
-	City        string           `json:"City"`
-	Tier        *int             `json:"Tier"`
-	Features    int              `json:"Features"`
-	Servers     []physicalServer `json:"Servers"`
-	Status      int              `json:"Status"`
+	Name         string           `json:"Name"`
+	EntryCountry string           `json:"EntryCountry"`
+	ExitCountry  string           `json:"ExitCountry"`
+	Country      string           `json:"Country"`
+	Region       string           `json:"Region"`
+	City         string           `json:"City"`
+	Tier         *int             `json:"Tier"`
+	Features     int              `json:"Features"`
+	Servers      []physicalServer `json:"Servers"`
+	Status       int              `json:"Status"`
 }
 
 type logicalsResponse struct {
@@ -522,16 +573,59 @@ func (c *apiClient) doJSON(req *http.Request, out any) error {
 	return nil
 }
 
+// protonAPIError carries Proton's Code/Error pair and, for human-verification
+// challenges (code 9001), the details needed to solve and replay the request:
+// the HV session token and the offered methods. Its Error() string includes
+// the verify.proton.me URL so a one-time interactive login can solve the
+// CAPTCHA in a browser.
+type protonAPIError struct {
+	Status  int
+	Code    uint
+	Message string
+	HVToken string
+	Methods []string
+}
+
+func (e *protonAPIError) isHumanVerification() bool {
+	return e.Code == 9001 || e.HVToken != ""
+}
+
+func (e *protonAPIError) verifyURL() string {
+	methods := strings.Join(e.Methods, ",")
+	if methods == "" {
+		methods = "captcha"
+	}
+	return fmt.Sprintf("https://verify.proton.me/?methods=%s&token=%s", methods, e.HVToken)
+}
+
+func (e *protonAPIError) Error() string {
+	if e.isHumanVerification() && e.HVToken != "" {
+		return fmt.Sprintf("HTTP %d: code=%d %s — human verification required; solve at %s",
+			e.Status, e.Code, e.Message, e.verifyURL())
+	}
+	return fmt.Sprintf("HTTP %d: code=%d %s", e.Status, e.Code, e.Message)
+}
+
 func apiError(status int, body []byte) error {
-	// Surface Proton's Code/Error pair when present so the workflow
-	// log says exactly what went wrong (e.g. 8002 = wrong password,
-	// 12087 = human verification required).
+	// Surface Proton's Code/Error pair when present so the workflow log says
+	// exactly what went wrong (e.g. 8002 = wrong password, 9001 = human
+	// verification required), plus the HV Details for the CAPTCHA handshake.
 	var parsed struct {
-		Code  uint   `json:"Code"`
-		Error string `json:"Error"`
+		Code    uint   `json:"Code"`
+		Error   string `json:"Error"`
+		Details struct {
+			HumanVerificationToken   string   `json:"HumanVerificationToken"`
+			HumanVerificationMethods []string `json:"HumanVerificationMethods"`
+		} `json:"Details"`
 	}
 	if json.Unmarshal(body, &parsed) == nil && (parsed.Code != 0 || parsed.Error != "") {
-		return fmt.Errorf("HTTP %d: code=%d %s", status, parsed.Code, parsed.Error)
+		return &protonAPIError{
+			Status:  status,
+			Code:    parsed.Code,
+			Message: parsed.Error,
+			HVToken: parsed.Details.HumanVerificationToken,
+			Methods: parsed.Details.HumanVerificationMethods,
+		}
 	}
 	return fmt.Errorf("HTTP %d: %s", status, snippet(body))
 }

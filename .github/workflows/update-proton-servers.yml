@@ -59,7 +59,7 @@ jobs:
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
 
-      - name: Fetch ProtonVPN account credentials from OpenBao
+      - name: Fetch ProtonVPN session from OpenBao
         uses: hashicorp/vault-action@v3
         with:
           url: https://bao.elaunira.com
@@ -68,18 +68,48 @@ jobs:
           role: tundler
           namespace: lpellegr
           jwtGithubAudience: https://github.com/laurentpellegrino
+          # Export the short-lived Vault token so the write-back step can
+          # persist the rotated refresh token. Requires the `tundler` role's
+          # policy to allow create/update on kv/data/vpn/proton-session
+          # (read-only is no longer sufficient).
+          exportToken: true
           secrets: |
-            kv/data/vpn/proton username | PROTON_ACCOUNT_USERNAME ;
-            kv/data/vpn/proton password | PROTON_ACCOUNT_PASSWORD
+            kv/data/vpn/proton-session uid | PROTON_SESSION_UID ;
+            kv/data/vpn/proton-session refresh_token | PROTON_SESSION_REFRESH_TOKEN
 
       - name: Run proton-updater
+        env:
+          # Refresh mode: reuse the stored session (no SRP login → no CAPTCHA).
+          # The (possibly rotated) refresh token is written here for write-back.
+          PROTON_SESSION_OUT: /tmp/proton-session.json
         run: |
           set -euo pipefail
           go run ./cmd/proton-updater > /tmp/servers.json
-          # Validate it's actual JSON (catches HTML 4xx pages /
-          # Proton "please complete CAPTCHA" responses if the
-          # updater somehow returns 0 anyway).
+          # Validate it's actual JSON (catches HTML 4xx pages / unexpected
+          # non-JSON if the API path ever returns one despite exit 0).
           python3 -c "import json; d=json.load(open('/tmp/servers.json')); assert d.get('protonvpn', {}).get('servers'), 'no servers in response'; print(f'fetched {len(d[\"protonvpn\"][\"servers\"])} server entries')"
+
+      - name: Persist rotated session to OpenBao
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ ! -f /tmp/proton-session.json ]]; then
+            echo "no rotated session file (refresh did not run); skipping write-back"
+            exit 0
+          fi
+          NEW_UID=$(jq -r .uid /tmp/proton-session.json)
+          NEW_RT=$(jq -r .refresh_token /tmp/proton-session.json)
+          echo "::add-mask::$NEW_RT"
+          # Proton rotates the refresh token on use; persist it so the next
+          # run authenticates. KV v2 write — proton-session is a dedicated
+          # path holding only the session, so a full overwrite is safe.
+          jq -n --arg uid "$NEW_UID" --arg rt "$NEW_RT" '{data:{uid:$uid, refresh_token:$rt}}' \
+            | curl -sS --fail \
+                -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                -H "X-Vault-Namespace: lpellegr" \
+                -X POST https://bao.elaunira.com/v1/kv/data/vpn/proton-session \
+                --data @- >/dev/null
+          echo "Rotated session persisted to OpenBao."
 
       - name: Skip when checksum matches current release
         id: skip
