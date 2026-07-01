@@ -94,6 +94,16 @@ func ensureDaemonResponsive(ctx context.Context) {
 	if daemonResponsive(ctx) {
 		return
 	}
+	recoverDaemon(ctx)
+}
+
+// recoverDaemon restarts the daemon unit without probing it first — for
+// callers that already know the daemon is broken in a way daemonResponsive
+// cannot see. The daemon can wedge PARTIALLY: `status` still answers (so
+// ensureDaemonResponsive's probe passes) while the login RPC hangs until
+// expressvpnctl's own timeout. Same throttle and post-restart wait as
+// ensureDaemonResponsive; equally login-free (account.json survives).
+func recoverDaemon(ctx context.Context) {
 	now := time.Now().Unix()
 	last := lastDaemonRecovery.Load()
 	if now-last < int64(minDaemonRecoveryInterval/time.Second) {
@@ -294,18 +304,20 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 	// contract after every connect.
 	//
 	// The CLI key is "networklock" (NOT "killswitch", which the CLI rejects
-	// with "Unknown type"). This call rides the daemon's IPC, so it is lost
-	// if the daemon is wedged — the authoritative enforcement is the
-	// ExecStartPre prestart script (docker/providers/expressvpn/
-	// configure.sh) that patches settings.json before every daemon start;
-	// this CLI call is belt-and-braces for a responsive daemon.
+	// with "Unknown type") and the value must be "false" (the CLI rejects
+	// "off" with "Unexpected boolean value: off - expected true or false").
+	// This call rides the daemon's IPC, so it is lost if the daemon is
+	// wedged — the authoritative enforcement is the ExecStartPre prestart
+	// script (docker/providers/expressvpn/configure.sh) that patches
+	// settings.json before every daemon start; this CLI call is
+	// belt-and-braces for a responsive daemon.
 	//
 	// Self-heal first: a tundler respawn into a container whose daemon is
 	// already wedged would otherwise burn the whole boot path (LoggedIn
 	// reads a timeout as "logged in", Locations returns nil) against a
 	// dead daemon.
 	ensureDaemonResponsive(ctx)
-	quiet(ctx, "set", "networklock", "off")
+	quiet(ctx, "set", "networklock", "false")
 
 	if e.LoggedIn(ctx) {
 		return nil
@@ -316,7 +328,20 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 		return fmt.Errorf("cannot write activation code: %w", err)
 	}
 
-	if _, err := run(ctx, "login", "-t", "20", tmpFile); err != nil {
+	if out, err := run(ctx, "login", "-t", "20", tmpFile); err != nil {
+		// The daemon can wedge partially: `status` answers ("Not logged
+		// in.") so ensureDaemonResponsive's probe passes, but the login
+		// RPC hangs until expressvpnctl's own timeout ("Timed out after
+		// 20 sec", exit status 2). Observed 2026-07-01: pods stuck for
+		// 368 consecutive boot-login attempts (~31h) against such a
+		// daemon while a fresh daemon accepted the same token first try.
+		// Restart the daemon on login-RPC timeout so the next boot-login
+		// retry (~5 min later) runs against a fresh one instead of
+		// requiring a manual pod delete (container restart + re-login).
+		if strings.Contains(out, "Timed out") {
+			log.Printf("expressvpn: login RPC timed out while status RPC answers — restarting %s (login-free)", daemonService)
+			recoverDaemon(ctx)
+		}
 		return fmt.Errorf("expressvpnctl login failed: %w", err)
 	}
 
