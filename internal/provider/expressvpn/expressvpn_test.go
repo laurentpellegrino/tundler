@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -100,5 +101,65 @@ func TestActiveLocationReturnsValueOnSuccess(t *testing.T) {
 	got := ExpressVPN{}.ActiveLocation(context.Background())
 	if got != "uk-london" {
 		t.Errorf("ActiveLocation() = %q, want %q", got, "uk-london")
+	}
+}
+
+// The daemon can wedge PARTIALLY: `status` still answers ("Not logged in.")
+// so ensureDaemonResponsive's probe passes, but the login RPC hangs until
+// expressvpnctl's internal timeout ("Timed out after 20 sec", exit 2).
+// Observed in production 2026-07-01: pods retried boot-login 368 times over
+// ~31h against such a daemon while a fresh daemon accepted the same token
+// first try — only a manual pod delete recovered them. Login() must treat a
+// login-RPC timeout as a wedged daemon and restart the unit (login-free) so
+// the next boot-login retry runs against a fresh daemon.
+func TestLoginTimeoutRestartsDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH-stub trick assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+
+	// expressvpnctl: status answers normally, login times out — the exact
+	// partial-wedge signature from production.
+	ctl := filepath.Join(dir, "expressvpnctl")
+	if err := os.WriteFile(ctl, []byte(`#!/bin/sh
+case "$1" in
+  login)  echo "Timed out after 20 sec"; exit 2 ;;
+  status) echo "Not logged in."; exit 0 ;;
+  *)      exit 0 ;;
+esac
+`), 0o755); err != nil {
+		t.Fatalf("writing expressvpnctl stub: %v", err)
+	}
+
+	// systemctl: record every invocation so the test can assert the
+	// daemon restart actually happened.
+	marker := filepath.Join(dir, "systemctl-calls")
+	sysctl := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(sysctl, []byte("#!/bin/sh\necho \"$@\" >> "+marker+"\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing systemctl stub: %v", err)
+	}
+
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TUNDLER_NETNS", "")
+	t.Setenv("EXPRESSVPN_ACTIVATION_CODE", "test-activation-code")
+
+	// Clear the recovery throttle so this test doesn't depend on ordering
+	// with other tests that may have triggered a recovery.
+	lastDaemonRecovery.Store(0)
+
+	err := ExpressVPN{}.Login(context.Background())
+	if err == nil {
+		t.Fatal("Login() with a timing-out login RPC should return an error")
+	}
+
+	calls, readErr := os.ReadFile(marker)
+	if readErr != nil {
+		t.Fatalf("login-RPC timeout must trigger a daemon restart, but "+
+			"systemctl was never invoked (marker read: %v) — pre-fix the "+
+			"partial wedge spun the boot-login retry loop forever because "+
+			"ensureDaemonResponsive's status probe kept passing", readErr)
+	}
+	if got := string(calls); !strings.Contains(got, "restart "+daemonService) {
+		t.Errorf("systemctl invoked with %q, want a %q call", got, "restart "+daemonService)
 	}
 }
