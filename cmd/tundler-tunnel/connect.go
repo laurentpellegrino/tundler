@@ -81,7 +81,8 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 		return fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
-	if err := verifyExitIPDiffers(ctx, baselineEgressIP); err != nil {
+	observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
+	if err != nil {
 		// Tear the tunnel down so the pod doesn't sit in a half-up
 		// state where /status reports Connected but traffic leaks.
 		// Best-effort: ignore Disconnect's error — we're already in
@@ -90,11 +91,23 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 		_ = prov.Disconnect(ctx)
 		return fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
 	}
-	state.RecordTunnelUp(location, status.IP)
+	exitIP := exitIPOrProbe(status.IP, observed)
+	state.RecordTunnelUp(location, exitIP)
 	state.Set(StateReady)
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
-		providerName, location, status.IP)
+		providerName, location, exitIP)
 	return nil
+}
+
+// exitIPOrProbe prefers the provider CLI's self-reported IP, falling back to
+// the contract probe's observed egress IP when the CLI doesn't report one
+// (OpenVPN-based providers like veepn/windscribe). Without this the recorded
+// exit IP is empty and downstream consumers (e.g. the event hook) get nothing.
+func exitIPOrProbe(reported, observed string) string {
+	if reported != "" {
+		return reported
+	}
+	return observed
 }
 
 // loginInitialWithRetry runs the BOOT login: it retries prov.Login until it
@@ -268,7 +281,8 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 		log.Printf("tundler-tunnel: rotation attempt %d/%d to location=%s", attempt, maxAttempts, location)
 		status := prov.Connect(ctx, location)
 		if status.Connected {
-			if err := verifyExitIPDiffers(ctx, baselineEgressIP); err != nil {
+			observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
+			if err != nil {
 				// Leak detected: treat as a failed attempt so the
 				// rotator retries a different location (the failure
 				// might be location-specific routing) rather than
@@ -282,10 +296,11 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				}
 				continue
 			}
-			state.RecordTunnelUp(location, status.IP)
+			exitIP := exitIPOrProbe(status.IP, observed)
+			state.RecordTunnelUp(location, exitIP)
 			state.Set(StateReady)
 			log.Printf("tundler-tunnel: rotation attempt %d/%d succeeded location=%s exit_ip=%s",
-				attempt, maxAttempts, location, status.IP)
+				attempt, maxAttempts, location, exitIP)
 			return nil
 		}
 		recentlyFailed = append(recentlyFailed, location)
