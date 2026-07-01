@@ -109,6 +109,14 @@ func FromEnv(snapshot SnapshotFunc) (*Notifier, bool) {
 			log.Printf("notifier: skipping sink with empty url")
 			continue
 		}
+		// Pin the sink's hostname to an IP NOW, while the container still
+		// uses cluster DNS. FromEnv runs before Login/Connect, and several
+		// provider clients (expressvpn, veepn, windscribe) rewrite
+		// resolv.conf to an in-tunnel resolver that cannot resolve
+		// cluster-internal names — a dial-time lookup would then fail on
+		// every emit. Boot-time pinning is bounded by the pod's own
+		// recycle cadence, the same trade-off as the cluster-bypass route.
+		s.URL = pinHost(s.URL)
 		valid = append(valid, s)
 	}
 	if len(valid) == 0 {
@@ -211,6 +219,42 @@ func (n *Notifier) post(ctx context.Context, sink Sink, body []byte) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("notifier: %s rejected event: %s", sink.URL, resp.Status)
 	}
+}
+
+// pinHost resolves rawURL's hostname once and rewrites the URL with the
+// resolved IP (preferring IPv4). Returns the URL unchanged when the host is
+// already an IP literal or when resolution fails (best effort — the dial will
+// then surface the DNS error as before).
+func pinHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	host := u.Hostname()
+	if host == "" || net.ParseIP(host) != nil {
+		return rawURL
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		log.Printf("notifier: boot-time resolve of %s failed (%v) — keeping hostname", host, err)
+		return rawURL
+	}
+	picked := addrs[0]
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			picked = a
+			break
+		}
+	}
+	if port := u.Port(); port != "" {
+		u.Host = net.JoinHostPort(picked, port)
+	} else if ip := net.ParseIP(picked); ip != nil && ip.To4() == nil {
+		u.Host = "[" + picked + "]"
+	} else {
+		u.Host = picked
+	}
+	log.Printf("notifier: pinned sink host %s → %s", host, picked)
+	return u.String()
 }
 
 // tokenAllowed reports whether it is safe to attach a bearer token to a
