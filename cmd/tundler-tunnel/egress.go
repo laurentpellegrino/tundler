@@ -138,19 +138,22 @@ var errExitIPLeak = fmt.Errorf("exit-ip leak: post-VPN egress matches pre-VPN ba
 // `baseline == ""` means the pre-VPN baseline was unavailable
 // (cluster egress firewall, probe endpoint unreachable, etc.).
 // In that mode we can't compare, so we soft-pass with a warning.
-func verifyExitIPDiffers(ctx context.Context, baseline string) error {
+// Returns the observed post-VPN egress IP (empty when the contract was
+// skipped or the probe soft-passed on error) so callers can use it as the
+// exit IP for providers whose CLI doesn't self-report one.
+func verifyExitIPDiffers(ctx context.Context, baseline string) (string, error) {
 	if baseline == "" {
 		log.Printf("tundler-tunnel: exit-ip contract: SKIPPED (no pre-VPN baseline)")
-		return nil
+		return "", nil
 	}
 	observed, err := probeContractEgressIP(ctx)
 	if err != nil {
 		log.Printf("tundler-tunnel: exit-ip contract: probe error: %v — soft-pass (watchdog will catch a wedged tunnel)", err)
-		return nil
+		return "", nil
 	}
 	if observed == baseline {
-		return fmt.Errorf("%w (baseline=%s observed=%s)", errExitIPLeak, baseline, observed)
+		return "", fmt.Errorf("%w (baseline=%s observed=%s)", errExitIPLeak, baseline, observed)
 	}
 	log.Printf("tundler-tunnel: exit-ip contract: OK (baseline=%s, post-VPN=%s)", baseline, observed)
-	return nil
+	return observed, nil
 }
