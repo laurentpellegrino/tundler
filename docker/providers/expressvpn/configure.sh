@@ -33,8 +33,35 @@ else
     mkdir -p "$(dirname "$SETTINGS")"
     printf '{\n    "killswitch": "off"\n}\n' > "$SETTINGS"
 fi
-# Drop stale killswitch hooks from a previous daemon (idempotent).
-while iptables -D OUTPUT -j evpn.OUTPUT 2>/dev/null; do :; done
+# Clear ALL firewall damage a previous (deadlocked) daemon left behind.
+# Observed 2026-07-05: 4 pods stuck 24h+ with 260+ consecutive login
+# timeouts — the armed evpn.* chains blackholed every egress packet, so
+# the login RPC (the only call that needs the backend) timed out while
+# the status RPC (local IPC) kept answering. The old single
+# `-D OUTPUT -j evpn.OUTPUT` here missed other jump forms and left the
+# chains in place. This damage lives in the POD netns: it survives
+# daemon AND container restarts; only pod deletion or this cleanup
+# clears it. Safe here: the daemon is guaranteed not running during
+# ExecStartPre, and it rebuilds the firewall on the next connect if it
+# actually needs it.
+for hook in INPUT OUTPUT FORWARD; do
+    iptables -S "$hook" 2>/dev/null | grep evpn | sed 's/^-A/-D/' | while read -r rule; do
+        # shellcheck disable=SC2086
+        iptables $rule 2>/dev/null
+    done
+done
+for c in $(iptables -S 2>/dev/null | awk '/^-N evpn/{print $2}'); do iptables -F "$c" 2>/dev/null; done
+for c in $(iptables -S 2>/dev/null | awk '/^-N evpn/{print $2}'); do iptables -X "$c" 2>/dev/null; done
+# Same class of damage, DNS layer: on connect the daemon rewrites
+# /etc/resolv.conf to its in-tunnel resolver (100.64.100.1, reachable
+# ONLY through the tunnel) and never restores it when the session dies.
+# The file is bind-mounted from the pod sandbox, so it too survives
+# container restarts. If names don't resolve with the tunnel down, fall
+# back to public resolvers over eth0 so the daemon can reach its backend
+# to log in; the daemon rewrites resolv.conf again on the next connect.
+if ! timeout 4 getent hosts www.expressvpn.com >/dev/null 2>&1; then
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+fi
 exit 0
 EOF
 chmod +x /usr/local/bin/expressvpn-prestart.sh
