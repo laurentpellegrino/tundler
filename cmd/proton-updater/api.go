@@ -434,10 +434,16 @@ func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, s
 		sessionID: cookie.sessionID,
 		uid:       parsed.UID,
 	}
+	// In cookie mode (session riding the account.proton.me cookies, as
+	// here) the tokens come back as Set-Cookie headers — AUTH-<UID> and
+	// REFRESH-<UID> — and the JSON body's token fields are empty.
+	refreshToken := parsed.RefreshToken
 	for _, ck := range resp.Cookies() {
-		if strings.HasPrefix(ck.Name, "AUTH-") {
+		switch {
+		case strings.HasPrefix(ck.Name, "AUTH-"):
 			authed.token = ck.Value
-			break
+		case strings.HasPrefix(ck.Name, "REFRESH-") && refreshToken == "":
+			refreshToken = ck.Value
 		}
 	}
 	if authed.token == "" {
@@ -446,7 +452,7 @@ func (c *apiClient) submitAuth(ctx context.Context, cookie cookieState, email, s
 		// directly in a synthetic AUTH cookie (Proton accepts it).
 		authed.token = parsed.AccessToken
 	}
-	return authed, parsed.RefreshToken, nil
+	return authed, refreshToken, nil
 }
 
 // -----------------------------------------------------------------
