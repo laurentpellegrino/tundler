@@ -27,7 +27,7 @@
 //	  when Proton challenges it, prints the verify.proton.me URL to solve the
 //	  CAPTCHA in a browser; re-run with -hv-token <token>. On success it emits
 //	  the reusable session {uid, refresh_token} (to PROTON_SESSION_OUT, else
-//	  stdout) to store in OpenBao. Reads:
+//	  stdout) to store as GitHub Actions secrets. Reads:
 //	    PROTON_ACCOUNT_USERNAME  ProtonMail/ProtonVPN account email
 //	    PROTON_ACCOUNT_PASSWORD  account login password (NOT the per-OpenVPN creds)
 //	    PROTON_HV_TOKEN (optional) solved human-verification token to replay
@@ -75,7 +75,8 @@ type outputFile struct {
 	} `json:"protonvpn"`
 }
 
-// session is the reusable login state persisted in OpenBao between runs.
+// session is the reusable login state persisted (as GitHub Actions
+// secrets) between runs.
 type session struct {
 	UID          string `json:"uid"`
 	RefreshToken string `json:"refresh_token"`
@@ -86,7 +87,7 @@ func main() {
 	log.SetPrefix("proton-updater: ")
 
 	loginMode := flag.Bool("login", false,
-		"one-time interactive login: perform SRP (solving the CAPTCHA via the printed verify URL) and emit a reusable session for OpenBao")
+		"one-time interactive login: perform SRP (solving the CAPTCHA via the printed verify URL) and emit a reusable session to store as GitHub Actions secrets")
 	hvToken := flag.String("hv-token", os.Getenv("PROTON_HV_TOKEN"),
 		"solved human-verification token to replay a CAPTCHA-challenged login")
 	hvType := flag.String("hv-type", "captcha", "human-verification token type")
@@ -134,7 +135,8 @@ func runRefresh(ctx context.Context, client *apiClient) {
 }
 
 // runLogin is the one-time seed: SRP login (with optional CAPTCHA replay),
-// then emit the reusable session for the operator to store in OpenBao.
+// then emit the reusable session for the operator to store as GitHub
+// Actions secrets.
 func runLogin(ctx context.Context, client *apiClient, hvToken, hvType string) {
 	email := os.Getenv("PROTON_ACCOUNT_USERNAME")
 	password := os.Getenv("PROTON_ACCOUNT_PASSWORD")
@@ -161,8 +163,8 @@ func runLogin(ctx context.Context, client *apiClient, hvToken, hvType string) {
 		log.Fatalf("writing session: %v", err)
 	}
 	fmt.Fprintf(os.Stderr,
-		"proton-updater: login OK — store the emitted {uid, refresh_token} in OpenBao "+
-			"at lpellegr/kv/vpn/proton-session\n")
+		"proton-updater: login OK — store the emitted {uid, refresh_token} in the "+
+			"PROTON_SESSION_UID / PROTON_SESSION_REFRESH_TOKEN GitHub Actions secrets\n")
 }
 
 // writeSession emits the session JSON to PROTON_SESSION_OUT (0600) when set,
