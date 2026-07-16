@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -58,6 +59,13 @@ const (
 	// publishes the same port; the crawler's TunnelSlot.proxyUrl
 	// points here.
 	proxyListenPort = 8485
+
+	// Port the browser-impersonating forward proxy listens on. Unlike the
+	// CONNECT proxy (which byte-pipes the client's own TLS), this one
+	// originates the upstream TLS itself with a real browser ClientHello
+	// (uTLS + h2) so an edge sees a genuine browser JA3/JA4. Runs alongside
+	// :8485 during migration; clients switch over in a later phase.
+	impersonateListenPort = 8486
 )
 
 // Watchdog reconnect backoff. The watchdog keeps retrying forever
@@ -183,6 +191,22 @@ func main() {
 		pc.AttachProxy(proxySrv)
 		contractProbeDialer = proxySrv.DialUpstream
 	}
+
+	// Browser-impersonating forward proxy on :8486, sharing the CONNECT
+	// proxy's upstream dialer (so it routes through the VPN / proxy-chain
+	// identically — DialUpstream honours SetDialer installed by AttachProxy
+	// above). Started here, after AttachProxy, for exactly that reason.
+	impSrv := proxy.NewImpersonateServer(
+		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), podName,
+		func(dctx context.Context, target string) (net.Conn, error) {
+			conn, _, derr := proxySrv.DialUpstream(dctx, target)
+			return conn, derr
+		})
+	go func() {
+		if err := impSrv.Serve(ctx); err != nil {
+			log.Printf("tundler-tunnel: impersonate proxy: %v", err)
+		}
+	}()
 
 	// Wrap with a Locations() cache so the connect / rotate / watchdog paths
 	// don't re-fork the provider CLI (expressvpnctl / piactl / nordvpn) on
