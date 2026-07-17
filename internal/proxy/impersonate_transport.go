@@ -82,6 +82,12 @@ func (t *ImpersonatingTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if err != nil {
 		return nil, fmt.Errorf("impersonate: dial %s: %w", addr, err)
 	}
+	// A dialer that reports neither conn nor error is a caller bug (e.g.
+	// forwarding proxy.Server.DialUpstream's ok=false nil conn). Handing nil
+	// to the TLS layer panics the whole handler, so fail the request instead.
+	if raw == nil {
+		return nil, fmt.Errorf("impersonate: dialer returned no conn and no error for %s", addr)
+	}
 	uconn, err := HandshakeAs(req.Context(), raw,
 		&utls.Config{ServerName: host, InsecureSkipVerify: t.insecure}, t.hello)
 	if err != nil {

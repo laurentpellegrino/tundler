@@ -108,3 +108,18 @@ func TestImpersonateServer_ForwardProxyUpgradesToTLS(t *testing.T) {
 		t.Fatalf("got status=%d body=%q", resp.StatusCode, body)
 	}
 }
+
+// A dialer returning (nil, nil) — the shape proxy.Server.DialUpstream uses to
+// say "no custom dialer, fall back to a direct dial" — must surface as an
+// error, never a panic. Regression: forwarding that nil conn straight to the
+// TLS layer crashed every request through the handler in production.
+func TestImpersonatingTransport_NilConnDoesNotPanic(t *testing.T) {
+	tr := NewImpersonatingTransport(func(ctx context.Context, addr string) (net.Conn, error) {
+		return nil, nil // no conn, no error
+	}, utls.HelloChrome_120)
+	req, _ := http.NewRequest(http.MethodGet, "https://example.invalid/x", nil)
+	resp, err := tr.RoundTrip(req)
+	if err == nil {
+		t.Fatalf("want an error for a nil conn, got resp=%v", resp)
+	}
+}

@@ -199,8 +199,16 @@ func main() {
 	impSrv := proxy.NewImpersonateServer(
 		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), podName,
 		func(dctx context.Context, target string) (net.Conn, error) {
-			conn, _, derr := proxySrv.DialUpstream(dctx, target)
-			return conn, derr
+			// DialUpstream's ok=false means "no custom dialer installed"
+			// (kernel-tunnel providers) and returns a nil conn — the caller
+			// must fall back to a direct dial, which the pod's default route
+			// sends through the VPN. Honouring ok is mandatory: returning the
+			// nil conn to the TLS layer panics it.
+			if conn, ok, derr := proxySrv.DialUpstream(dctx, target); ok || derr != nil {
+				return conn, derr
+			}
+			var d net.Dialer
+			return d.DialContext(dctx, "tcp", target)
 		})
 	go func() {
 		if err := impSrv.Serve(ctx); err != nil {
