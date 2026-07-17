@@ -6,22 +6,50 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
 
-// ImpersonateServer is a plain-HTTP forward proxy that re-originates each
-// request to its target over browser-impersonated TLS (uTLS + h2). A client
-// points a normal HTTP proxy at it and requests http://<host>/<path>; the
-// server upgrades the upstream leg to https with a real browser ClientHello,
-// so the edge sees a genuine browser JA3/JA4 instead of the client's default
-// TLS stack.
+// TargetHostHeader names the upstream host a client wants fetched. Passed
+// per-request so tundler stays vendor-neutral: it never hardcodes whose pages
+// are being fetched — the caller's deployment decides.
+const TargetHostHeader = "X-Tundler-Target-Host"
+
+// ImpersonateServer fetches upstream pages ON BEHALF OF a client, so the TLS
+// that leaves this pod is originated here — in Go, with a real browser
+// ClientHello (see ImpersonatingTransport) — rather than by the client.
+//
+// Why it exists: some edges fingerprint the TLS ClientHello (JA3/JA4) and
+// blocklist non-browser signatures with 4xx regardless of exit IP or
+// User-Agent. A client whose TLS stack can't reproduce a browser hello (e.g.
+// a JVM: no GREASE, wrong extension order) cannot talk its way out — and
+// reordering its ciphers only produces a NOVEL fingerprint, which such edges
+// flag just as readily. The fix is for the client not to do the handshake at
+// all: it asks us, and we fetch.
+//
+// Contract: the client sends an ordinary request to this server —
+//
+//	GET /<path> HTTP/1.1
+//	X-Tundler-Target-Host: example.com
+//
+// and gets the upstream response relayed back.
+//
+// The UPSTREAM leg is always https — the scheme is hardcoded here, not taken
+// from the caller, so no client can make this proxy fetch a target in the
+// clear. That leg is the one that leaves the pod and the one the edge sees;
+// it carries this pod's browser ClientHello.
+//
+// The CLIENT leg is plain HTTP by design: it never leaves the cluster, and it
+// carries only whatever public page the caller asked for — no credentials. The
+// operator's deployment decides whether that network is trusted.
 //
 // One browser profile per pod (PickProfile(podName)) — stable identity, and
-// the fleet spreads across profiles because pods have distinct names. This
-// complements the CONNECT proxy on the other port; it does NOT replace it
-// until clients are switched over.
+// the fleet spreads across profiles because pods have distinct names. Runs
+// alongside the CONNECT proxy during migration; it does NOT replace it until
+// clients are switched over.
 type ImpersonateServer struct {
 	addr      string
 	transport *ImpersonatingTransport
@@ -63,7 +91,11 @@ func (s *ImpersonateServer) Serve(ctx context.Context) error {
 		_ = srv.Shutdown(shutCtx)
 	}()
 	log.Printf("impersonate-proxy: listening on %s as %s", s.addr, s.hello.Str())
-	return srv.ListenAndServe()
+	err := srv.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 // hopByHop headers must not be forwarded across the proxy boundary (RFC 7230).
@@ -74,31 +106,33 @@ var hopByHop = map[string]bool{
 }
 
 func (s *ImpersonateServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Forward-proxy requests carry an absolute-form URL (GET http://host/path).
-	// CONNECT is handled by the other proxy; reject it here to avoid confusion.
-	if r.Method == http.MethodConnect || !r.URL.IsAbs() {
-		http.Error(w, "impersonate-proxy expects absolute-form forward-proxy requests", http.StatusBadRequest)
+	host := strings.TrimSpace(r.Header.Get(TargetHostHeader))
+	if host == "" {
+		http.Error(w, TargetHostHeader+" is required (names the upstream host to fetch)",
+			http.StatusBadRequest)
+		return
+	}
+	// Defend the upstream leg from a malformed/hostile header: a value carrying
+	// a scheme, path or port would otherwise be pasted straight into the URL.
+	if strings.ContainsAny(host, "/\\ :") {
+		http.Error(w, TargetHostHeader+" must be a bare host name", http.StatusBadRequest)
 		return
 	}
 
-	target := *r.URL
-	target.Scheme = "https" // always upgrade the upstream leg to TLS
-	if target.Host == "" {
-		target.Host = r.Host
-	}
-
+	target := url.URL{Scheme: "https", Host: host, Opaque: "", Path: r.URL.Path, RawQuery: r.URL.RawQuery}
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
 	if err != nil {
 		http.Error(w, "bad target: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	copyHeaders(outReq.Header, r.Header)
-	outReq.Host = target.Hostname()
+	outReq.Header.Del(TargetHostHeader) // ours, not the upstream's
+	outReq.Host = host
 
 	resp, err := s.transport.RoundTrip(outReq)
 	if err != nil {
-		// 502 mirrors what a forward proxy returns when the upstream leg fails;
-		// the crawler's retry/AIMD treats it like any transient tunnel error.
+		// 502 is what a gateway owes its client when the upstream leg fails;
+		// the caller's retry/backoff treats it like any transient tunnel error.
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
