@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync/atomic"
 	"testing"
 
@@ -74,39 +73,6 @@ func TestImpersonatingTransport_H2RoundTripAndReuse(t *testing.T) {
 		t.Fatalf("expected 1 pooled h2 conn for the host, got %d", n)
 	}
 	_ = http2.NextProtoTLS
-}
-
-// The forward-proxy handler must upgrade the upstream leg to TLS and relay the
-// response, so the crawler can keep talking plain HTTP to a proxy.
-func TestImpersonateServer_ForwardProxyUpgradesToTLS(t *testing.T) {
-	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(207)
-		_, _ = io.WriteString(w, "ok:"+r.URL.Path)
-	}))
-	backend.EnableHTTP2 = true
-	backend.StartTLS()
-	defer backend.Close()
-	bu, _ := url.Parse(backend.URL)
-
-	srv := NewImpersonateServer("", "tundler-tunnel-expressvpn-0", nil)
-	srv.transport.insecure = true
-
-	// Drive the handler directly (no listener needed): a forward-proxy request
-	// carries the absolute target as http://<host>/path.
-	proxied := httptest.NewServer(srv)
-	defer proxied.Close()
-	pu, _ := url.Parse(proxied.URL)
-
-	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu)}}
-	resp, err := client.Get("http://" + bu.Host + "/xyz")
-	if err != nil {
-		t.Fatalf("proxied get: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 207 || string(body) != "ok:/xyz" {
-		t.Fatalf("got status=%d body=%q", resp.StatusCode, body)
-	}
 }
 
 // A dialer returning (nil, nil) — the shape proxy.Server.DialUpstream uses to

@@ -60,11 +60,12 @@ const (
 	// points here.
 	proxyListenPort = 8485
 
-	// Port the browser-impersonating forward proxy listens on. Unlike the
-	// CONNECT proxy (which byte-pipes the client's own TLS), this one
-	// originates the upstream TLS itself with a real browser ClientHello
-	// (uTLS + h2) so an edge sees a genuine browser JA3/JA4. Runs alongside
-	// :8485 during migration; clients switch over in a later phase.
+	// Port the browser-impersonating fetch proxy listens on. Unlike the
+	// CONNECT proxy (which byte-pipes the client's own TLS end-to-end), a
+	// client asks THIS one to fetch a page, so the upstream TLS is originated
+	// here with a real browser ClientHello (uTLS + h2) and an edge sees a
+	// genuine browser JA3/JA4 instead of the client's. Runs alongside :8485
+	// during migration; clients switch over in a later phase.
 	impersonateListenPort = 8486
 )
 
@@ -192,24 +193,27 @@ func main() {
 		contractProbeDialer = proxySrv.DialUpstream
 	}
 
-	// Browser-impersonating forward proxy on :8486, sharing the CONNECT
-	// proxy's upstream dialer (so it routes through the VPN / proxy-chain
-	// identically — DialUpstream honours SetDialer installed by AttachProxy
-	// above). Started here, after AttachProxy, for exactly that reason.
+	// Browser-impersonating fetch proxy on :8486 — clients ask IT to fetch a
+	// page so the upstream TLS is originated here with a real browser
+	// ClientHello (their own TLS stack can't produce one). Shares the CONNECT
+	// proxy's upstream dialer so it routes through the VPN / proxy-chain
+	// identically — DialUpstream honours the SetDialer installed by
+	// AttachProxy above, which is why this is started AFTER it.
+	//
+	impDial := func(dctx context.Context, target string) (net.Conn, error) {
+		// DialUpstream's ok=false means "no custom dialer installed"
+		// (kernel-tunnel providers) and returns a nil conn — the caller
+		// must fall back to a direct dial, which the pod's default route
+		// sends through the VPN. Honouring ok is mandatory: returning the
+		// nil conn to the TLS layer panics it.
+		if conn, ok, derr := proxySrv.DialUpstream(dctx, target); ok || derr != nil {
+			return conn, derr
+		}
+		var d net.Dialer
+		return d.DialContext(dctx, "tcp", target)
+	}
 	impSrv := proxy.NewImpersonateServer(
-		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), podName,
-		func(dctx context.Context, target string) (net.Conn, error) {
-			// DialUpstream's ok=false means "no custom dialer installed"
-			// (kernel-tunnel providers) and returns a nil conn — the caller
-			// must fall back to a direct dial, which the pod's default route
-			// sends through the VPN. Honouring ok is mandatory: returning the
-			// nil conn to the TLS layer panics it.
-			if conn, ok, derr := proxySrv.DialUpstream(dctx, target); ok || derr != nil {
-				return conn, derr
-			}
-			var d net.Dialer
-			return d.DialContext(dctx, "tcp", target)
-		})
+		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), podName, impDial)
 	go func() {
 		if err := impSrv.Serve(ctx); err != nil {
 			log.Printf("tundler-tunnel: impersonate proxy: %v", err)
