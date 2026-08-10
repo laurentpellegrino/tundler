@@ -1,6 +1,6 @@
 module github.com/laurentpellegrino/tundler
 
-go 1.25.0
+go 1.25.12
 
 require (
 	github.com/ProtonMail/go-srp v0.0.7
