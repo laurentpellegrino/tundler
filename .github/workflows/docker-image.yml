@@ -48,6 +48,24 @@ jobs:
       fail-fast: false
       matrix:
         provider: [cyberghost, expressvpn, fastvpn, ipvanish, mullvad, nordvpn, ovpn, pia, protonvpn, psiphon, purevpn, surfshark, tunnelbear, veepn, warp, windscribe]
+    # Resolved once at job level so the build step and its retry below cannot
+    # drift apart.
+    env:
+      # expressvpn builds on Ubuntu 26.04; everything else on 24.04.
+      # 2026-06-09: the 24.04 glibc security update 2.39-0ubuntu8.7
+      # (CVE-2026-0861 "memalign: reinstate alignment") trips a latent
+      # heap bug in the ExpressVPN daemon (observed on 14.1.1.13156) →
+      # "free(): corrupted unsorted chunks" → daemon wedges → connect
+      # fails. 26.04's glibc 2.43 does NOT trigger it (verified: stable
+      # daemon, successful rotations). Not re-tested on 24.04 since the
+      # 14.2.0 bump, so the pin stays. The other providers are unaffected,
+      # so keep them on 24.04 to avoid a fleet-wide LTS jump.
+      BASE_IMAGE: ${{ matrix.provider == 'expressvpn' && 'ubuntu:26.04' || 'ubuntu:24.04' }}
+      IMAGE_TAGS: |
+        ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:latest
+        ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:${{ github.sha }}
+        docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler-${{ matrix.provider }}:latest
+        docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler-${{ matrix.provider }}:${{ github.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -62,6 +80,16 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Without an explicit builder, build-push-action falls back to the
+      # bundled "docker" driver, which exports through the local daemon's
+      # image store and pushes each tag from there. That path intermittently
+      # fails the four-tag / two-registry push with
+      # "ERROR: failed to build: unknown blob" *after* every build stage has
+      # succeeded (run 31369562554, 2026-08-10). The docker-container driver
+      # uses BuildKit's registry exporter, which does cross-registry blob
+      # mounting properly.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
       # ExpressVPN's CDN serves a Cloudflare block page to GitHub Actions
       # runner IPs, so the in-build curl gets HTML instead of the .run. Same
       # fix as the proton/ipvanish refresh workflows: route the runner's
@@ -96,24 +124,30 @@ jobs:
         if: matrix.provider == 'expressvpn'
         run: sudo warp-cli --accept-tos disconnect || true
       - name: Build and push tundler-${{ matrix.provider }}
+        id: build
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.tunnel
           push: true
-          # expressvpn builds on Ubuntu 26.04; everything else on 24.04.
-          # 2026-06-09: the 24.04 glibc security update 2.39-0ubuntu8.7
-          # (CVE-2026-0861 "memalign: reinstate alignment") trips a latent
-          # heap bug in the ExpressVPN daemon (14.1.1.13156) →
-          # "free(): corrupted unsorted chunks" → daemon wedges → connect
-          # fails. 26.04's glibc 2.43 does NOT trigger it (verified: stable
-          # daemon, successful rotations). The other providers are unaffected,
-          # so keep them on 24.04 to avoid a fleet-wide LTS jump.
           build-args: |
             PROVIDER=${{ matrix.provider }}
-            BASE_IMAGE=${{ matrix.provider == 'expressvpn' && 'ubuntu:26.04' || 'ubuntu:24.04' }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:latest
-            ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:${{ github.sha }}
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler-${{ matrix.provider }}:latest
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/tundler-${{ matrix.provider }}:${{ github.sha }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+          tags: ${{ env.IMAGE_TAGS }}
+      # The registry can still reject a push that follows a clean build, and
+      # a matrix leg that dies there costs the whole day's image for that
+      # provider (the schedule only runs once). One retry turns that into a
+      # slow build instead of a missing image; a genuinely broken build fails
+      # twice and still reports failure.
+      - name: Retry build and push tundler-${{ matrix.provider }}
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.tunnel
+          push: true
+          build-args: |
+            PROVIDER=${{ matrix.provider }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+          tags: ${{ env.IMAGE_TAGS }}
