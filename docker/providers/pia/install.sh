@@ -13,7 +13,7 @@ LATEST_VERSION=$(curl -s --max-time 30 "${CHANGELOG_URL}" | grep -oP 'pia-linux-
 
 if [ -z "${LATEST_VERSION}" ]; then
     echo "Failed to fetch latest version, falling back to known version"
-    LATEST_VERSION="3.7-08412"
+    LATEST_VERSION="3.7.2-08420"
 fi
 
 echo "Latest PIA version: ${LATEST_VERSION}"
@@ -23,11 +23,11 @@ ARCH=$(uname -m)
 case "${ARCH}" in
     x86_64)
         PIA_URL="https://installers.privateinternetaccess.com/download/pia-linux-${LATEST_VERSION}.run"
-        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-3.7-08412.run"
+        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-3.7.2-08420.run"
         ;;
     aarch64|arm64)
         PIA_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-${LATEST_VERSION}.run"
-        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-3.7-08412.run"
+        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-3.7.2-08420.run"
         ;;
     *)
         echo "Unsupported architecture: ${ARCH}"
