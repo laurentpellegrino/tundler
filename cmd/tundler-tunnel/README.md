@@ -200,5 +200,27 @@ response-header IP without locking.
 | `ROTATION_ATTEMPT_TIMEOUT_SECONDS`| 20      | per-attempt timeout in `connectWithRetry`                  |
 | `WEDGE_GUARD_THRESHOLD_SECONDS`   | 900     | non-Ready window before `os.Exit(1)` + systemd respawn     |
 | `TUNDLER_CLUSTER_BYPASS_CIDR`     | —       | route /16 around VPN tunnel for in-cluster traffic         |
-| `POD_NAME`                        | downward| → `x-tundler-tunnel-id` response header on CONNECT         |
+| `POD_NAME`                        | downward| → `x-tundler-tunnel-id` header; ordinal selects the account|
 | `TUNDLER_TUNNEL_NODE_IP`          | —       | → `x-tundler-node-ip` response header                      |
+| `TUNDLER_ACCOUNTS_DIR`            | `/etc/tundler/accounts` | account directories (one per account, one file per field) |
+| `TUNDLER_ACCOUNTS`                | —       | ordered `<id>:<slots>` CSV; authoritative ordinal→account partition |
+| `TUNDLER_ACCOUNT_<FIELD>`         | —       | local-dev single-account fallback (e.g. `TUNDLER_ACCOUNT_USERNAME`) |
+| `TUNDLER_FLEET_SLOT_BASE`         | —       | first fleet-global region-preference slot of this StatefulSet |
+| `TUNDLER_FLEET_SLOTS`             | —       | fleet-wide pod total; with SLOT_BASE enables the soft region spread |
+
+## Accounts & region preference
+
+At boot the binary selects THIS pod's account: `accounts.Select` loads
+the account pool (directory → local-dev env → legacy env shim) and maps
+the pod ordinal onto the contiguous slots blocks (`main:5,backup:3` →
+ordinals 0-4→main, 5-7→backup). Selection failures (Secret not mounted,
+ordinal beyond `sum(slots)`) retry forever in-process, recorded as auth
+failures on `/status` — a projected Secret updates in place, so fixing
+it heals the pod with zero restarts and zero logins. `/status` reports
+`account_id` + `account_source` (`dir`|`env`|`legacy`).
+
+When the fleet-slot env is present, location picks prefer the first
+country of an epoch-shuffled shared ordering (walked from this pod's
+offset) that the provider actually offers; every rotation advances the
+walk one position. Any miss falls back to the uniform-random pick —
+`preferred_country` is empty on `/status` when the fallback won.
