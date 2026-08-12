@@ -3,10 +3,10 @@ package nordvpn
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -27,7 +27,12 @@ var (
 	activeMu       sync.RWMutex
 )
 
-func init() { provider.Registry[name] = NordVPN{} }
+func init() {
+	provider.Registry[name] = NordVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldToken: "NORDVPN_TOKEN",
+	}))
+}
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
@@ -94,9 +99,13 @@ func (n NordVPN) LoggedIn(ctx context.Context) bool {
 }
 
 func (n NordVPN) Login(ctx context.Context) error {
-	token := os.Getenv("NORDVPN_TOKEN")
-	if token == "" {
-		return fmt.Errorf("NORDVPN_TOKEN environment variable not set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return err
+	}
+	token, err := acct.Require(accounts.FieldToken, "NORDVPN_TOKEN")
+	if err != nil {
+		return err
 	}
 	if n.LoggedIn(ctx) {
 		return nil

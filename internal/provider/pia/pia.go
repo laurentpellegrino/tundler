@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -90,12 +91,35 @@ const rateLimitCooldown = 15 * time.Minute
 type PIA struct{}
 
 var (
-	loggedIn          bool
-	rateLimitedUntil  time.Time
-	rateLimitMu       sync.Mutex
+	loggedIn         bool
+	rateLimitedUntil time.Time
+	rateLimitMu      sync.Mutex
 )
 
-func init() { provider.Registry[name] = PIA{} }
+func init() {
+	provider.Registry[name] = PIA{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "PRIVATEINTERNETACCESS_USERNAME",
+		accounts.FieldPassword: "PRIVATEINTERNETACCESS_PASSWORD",
+	}))
+}
+
+// getCredentials resolves this pod's PIA account login.
+func getCredentials() (string, string, error) {
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "PRIVATEINTERNETACCESS_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "PRIVATEINTERNETACCESS_PASSWORD")
+	if err != nil {
+		return "", "", err
+	}
+	return user, pass, nil
+}
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
@@ -268,9 +292,7 @@ func (p PIA) LoggedIn(ctx context.Context) bool {
 		return true
 	}
 	// Check if credentials are available (required for login)
-	username := os.Getenv("PRIVATEINTERNETACCESS_USERNAME")
-	password := os.Getenv("PRIVATEINTERNETACCESS_PASSWORD")
-	if username == "" || password == "" {
+	if _, _, err := getCredentials(); err != nil {
 		shared.Debugf("PIA: LoggedIn() - missing credentials")
 	}
 	return false
@@ -279,12 +301,10 @@ func (p PIA) LoggedIn(ctx context.Context) bool {
 func (p PIA) Login(ctx context.Context) error {
 	shared.Debugf("PIA: Login() called")
 
-	username := os.Getenv("PRIVATEINTERNETACCESS_USERNAME")
-	password := os.Getenv("PRIVATEINTERNETACCESS_PASSWORD")
-
-	if username == "" || password == "" {
+	username, password, err := getCredentials()
+	if err != nil {
 		shared.Debugf("PIA: Login() - missing credentials")
-		return fmt.Errorf("PRIVATEINTERNETACCESS_USERNAME and PRIVATEINTERNETACCESS_PASSWORD environment variables must be set")
+		return err
 	}
 
 	// Honor any active rate-limit cooldown — refuse to call piactl while
