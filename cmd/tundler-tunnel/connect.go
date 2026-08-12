@@ -110,7 +110,7 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 		return err
 	}
 	available := prov.Locations(ctx)
-	location, err := pickLocation(available, excluded)
+	location, preferredCountry, err := pickPreferredLocation(pref, available, excluded)
 	if err != nil {
 		return fmt.Errorf("pick location for provider=%s (%d available, %d excluded): %w",
 			providerName, len(available), len(excluded), err)
@@ -133,6 +133,7 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 	}
 	exitIP := exitIPOrProbe(status.IP, observed)
 	state.RecordTunnelUp(location, exitIP)
+	state.RecordCountry(preferredCountry, currentCountry(location))
 	state.Set(StateReady)
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
 		providerName, location, exitIP)
@@ -322,7 +323,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 		available := prov.Locations(ctx)
 		combined := append([]string(nil), excluded...)
 		combined = append(combined, recentlyFailed...)
-		location, err := pickLocation(available, combined)
+		location, preferredCountry, err := pickPreferredLocation(pref, available, combined)
 		if err != nil {
 			// No more allowed locations — either all excluded by config,
 			// or we've burned through them via recentlyFailed.
@@ -348,6 +349,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			}
 			exitIP := exitIPOrProbe(status.IP, observed)
 			state.RecordTunnelUp(location, exitIP)
+			state.RecordCountry(preferredCountry, currentCountry(location))
 			state.Set(StateReady)
 			log.Printf("tundler-tunnel: rotation attempt %d/%d succeeded location=%s exit_ip=%s",
 				attempt, maxAttempts, location, exitIP)
