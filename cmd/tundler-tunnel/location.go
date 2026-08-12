@@ -4,7 +4,22 @@ import (
 	"errors"
 	"math/rand/v2"
 	"strings"
+
+	"github.com/laurentpellegrino/tundler/internal/geo"
 )
+
+// pref is the fleet region-spread preference, set once in main() before
+// any goroutine connects (nil = feature off). Package state, matching
+// the lastReloginUnix / recycleRotationLimit precedent — threading it
+// through six call signatures buys nothing for a per-process singleton.
+var pref *locationPreference
+
+// currentCountry best-effort maps the connected location to an ISO code
+// for /status; "" when the vocabulary is unmappable (city names, auto).
+func currentCountry(location string) string {
+	cc, _ := geo.GuessAlpha2(location)
+	return cc
+}
 
 // errNoAllowedLocations is returned by pickLocation when every location
 // reported by the provider is in the excluded set (or the provider
@@ -43,6 +58,21 @@ func pickLocation(locations []string, excluded []string) (string, error) {
 		return "", errNoAllowedLocations
 	}
 	return allowed[rand.IntN(len(allowed))], nil
+}
+
+// pickPreferredLocation applies the fleet region-spread preference when
+// enabled (pref non-nil), falling back to the legacy uniform-random
+// pickLocation — which stays untouched as the tested fallback — on any
+// miss. Returns the chosen location plus the preferred ISO country
+// ("" when the fallback won) for /status.
+func pickPreferredLocation(pref *locationPreference, locations, excluded []string) (string, string, error) {
+	if pref != nil {
+		if loc, country, ok := pref.pick(locations, excluded); ok {
+			return loc, country, nil
+		}
+	}
+	loc, err := pickLocation(locations, excluded)
+	return loc, "", err
 }
 
 // parseExcludedLocations parses a CSV env-var value into a slice. Empty
