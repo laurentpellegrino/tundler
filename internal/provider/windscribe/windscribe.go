@@ -35,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -82,7 +83,13 @@ var (
 
 type Windscribe struct{}
 
-func init() { provider.Registry[name] = Windscribe{} }
+func init() {
+	provider.Registry[name] = Windscribe{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "WINDSCRIBE_USERNAME",
+		accounts.FieldPassword: "WINDSCRIBE_PASSWORD",
+	}))
+}
 
 func configDir() string {
 	if d := os.Getenv("WINDSCRIBE_CONFIG_DIR"); d != "" {
@@ -92,10 +99,17 @@ func configDir() string {
 }
 
 func getCredentials() (user, pass string, err error) {
-	user = strings.TrimSpace(os.Getenv("WINDSCRIBE_USERNAME"))
-	pass = strings.TrimSpace(os.Getenv("WINDSCRIBE_PASSWORD"))
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("WINDSCRIBE_USERNAME and WINDSCRIBE_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err = acct.Require(accounts.FieldUsername, "WINDSCRIBE_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err = acct.Require(accounts.FieldPassword, "WINDSCRIBE_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -210,15 +224,7 @@ key-direction 1
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
 }
 
 func writeActiveConfig(n node, authPath string) (string, error) {

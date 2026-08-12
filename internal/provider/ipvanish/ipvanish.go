@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
@@ -78,7 +79,13 @@ var (
 	deprecatedDirectivesRe = regexp.MustCompile(`(?m)^(keysize|comp-lzo|cipher|tls-cipher)\b.*$`)
 )
 
-func init() { provider.Registry[name] = IPVanish{} }
+func init() {
+	provider.Registry[name] = IPVanish{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "IPVANISH_USERNAME",
+		accounts.FieldPassword: "IPVANISH_PASSWORD",
+	}))
+}
 
 func configDir() string {
 	if dir := os.Getenv("IPVANISH_CONFIG_DIR"); dir != "" {
@@ -88,10 +95,17 @@ func configDir() string {
 }
 
 func getCredentials() (string, string, error) {
-	user := os.Getenv("IPVANISH_USERNAME")
-	pass := os.Getenv("IPVANISH_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("IPVANISH_USERNAME and IPVANISH_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "IPVANISH_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "IPVANISH_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -201,15 +215,7 @@ func pickRandomServer(servers []ipvanishServer) *ipvanishServer {
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
 }
 
 func writeActiveConfig(server *ipvanishServer, credentialsFile string) (string, error) {
