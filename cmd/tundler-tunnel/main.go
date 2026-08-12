@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/notifier"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
@@ -261,6 +262,24 @@ func main() {
 			log.Fatalf("tundler-tunnel: HTTP server: %v", err)
 		}
 	}()
+
+	// Account selection BEFORE the boot jitter: it touches only the
+	// local filesystem/env (never the provider's API), so there is
+	// nothing to jitter against, and failing early gets the actionable
+	// "fix the Secret / slots partition" error onto /status sooner.
+	acct, err := selectAccountWithRetry(ctx, state, providerName, bootConnectBackoff)
+	if err != nil {
+		log.Printf("tundler-tunnel: shutting down during account selection: %v", err)
+		gracefulDisconnect()
+		return
+	}
+	if acct != nil {
+		state.SetAccount(acct.ID, accounts.Source())
+		log.Printf("tundler-tunnel: provider=%s account=%s source=%s ordinal=%d slots=%d",
+			providerName, acct.ID, accounts.Source(), accounts.PodOrdinal(), acct.Slots)
+	} else {
+		log.Printf("tundler-tunnel: provider=%s requires no account", providerName)
+	}
 
 	d := pickJitter(jitterMax)
 	state.RecordBootLoginJitter(d)

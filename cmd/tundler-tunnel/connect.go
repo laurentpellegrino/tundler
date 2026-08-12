@@ -9,8 +9,48 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 )
+
+// selectAccountWithRetry resolves this pod's provider account
+// (accounts.Select over the ordinal block partition), retrying forever
+// in-process — the same never-exit posture as loginInitialWithRetry
+// below, and for the same reason: the two failure modes (accounts
+// Secret not mounted yet, ordinal beyond the declared slots) are both
+// operator-fixable, and a projected Secret updates IN PLACE, so
+// retrying Select lets a fixed Secret heal the pod with zero container
+// restarts and zero provider logins. Failures are recorded via
+// state.RecordAuthFailure — they are credential problems and belong on
+// the same /status alerting channel.
+//
+// Returns (nil, nil) for providers that require no account
+// (warp, psiphon). Returns ctx.Err() only when the pod is shutting
+// down.
+func selectAccountWithRetry(ctx context.Context, state *StateTracker, providerName string, backoff func(attempt int) time.Duration) (*accounts.Account, error) {
+	for attempt := 1; ; attempt++ {
+		accounts.Reset() // re-read the projected Secret each attempt
+		acct, err := accounts.Select(providerName, accounts.PodOrdinal())
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("tundler-tunnel: account selection succeeded on attempt %d", attempt)
+			}
+			return acct, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		state.RecordAuthFailure(err.Error())
+		wait := backoff(attempt)
+		log.Printf("tundler-tunnel: account selection attempt %d failed for provider=%s: %v; retrying in %s (staying up — fix the accounts Secret or the slots partition and the pod heals in place)",
+			attempt, providerName, err, wait.Round(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
 
 // reloginThrottleSec bounds how often this process re-logs-in after finding
 // the daemon logged out mid-life, so a provider/account that keeps
@@ -145,6 +185,16 @@ func loginInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// Deliberately NO account failover here (the natural hook if it
+		// is ever added): switching accounts on a persistent auth
+		// failure means a fresh login against a DIFFERENT shared
+		// account — spreading throttle damage instead of containing it
+		// — and the neighbor account's slots are already fully used by
+		// its own pods, so a failed-over pod would bust its session
+		// budget and cascade. The failure stays on this account,
+		// visible via auth_failures_total + account_id on /status; the
+		// fix is a human editing the Secret, which the projected volume
+		// delivers in place (no restart needed).
 		state.RecordAuthFailure(err.Error())
 		wait := backoff(attempt)
 		log.Printf("tundler-tunnel: initial login attempt %d failed for provider=%s: %v; retrying in %s (staying up, /livez 200 — no container restart, no re-login storm)",
