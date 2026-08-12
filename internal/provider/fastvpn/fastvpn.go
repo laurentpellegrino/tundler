@@ -54,6 +54,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -383,7 +384,10 @@ func loadServers() ([]fastvpnServer, error) {
 			shared.Debugf("FastVPN: skipping unparseable %s", fname)
 			continue
 		}
-		country, found := countryName(cc)
+		// FastVPN filenames use "UK" (not "GB"); geo's code alias
+		// resolves it. Unknown codes degrade to the bare CC — safe,
+		// just less pretty Locations() output.
+		country, found := geo.CountryName(cc)
 		if !found {
 			country = cc
 		}
