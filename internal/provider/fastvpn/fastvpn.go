@@ -17,14 +17,15 @@
 // (table 65743 → CloudflareWARP). Left alone, that shadows
 // openvpn's main-table split-default and every byte would exit via
 // WARP. We add three assertions around the openvpn launch:
-//   1. pin each WLVPN remote /32 → dev CloudflareWARP (outer
-//      tunnel rides WARP),
-//   2. pin Cloudflare WARP's edge ranges → via eth0 gateway (so
-//      WARP's own WireGuard transport doesn't loop into FastVPN's
-//      tun0 — the circular-routing deadlock),
-//   3. add `ip rule from all lookup main pref 32763` (one priority
-//      above WARP's catch-all) so main — carrying openvpn's
-//      0.0.0.0/1 via tun0 — governs general traffic.
+//  1. pin each WLVPN remote /32 → dev CloudflareWARP (outer
+//     tunnel rides WARP),
+//  2. pin Cloudflare WARP's edge ranges → via eth0 gateway (so
+//     WARP's own WireGuard transport doesn't loop into FastVPN's
+//     tun0 — the circular-routing deadlock),
+//  3. add `ip rule from all lookup main pref 32763` (one priority
+//     above WARP's catch-all) so main — carrying openvpn's
+//     0.0.0.0/1 via tun0 — governs general traffic.
+//
 // All three are idempotent and survive warp-svc's route daemon
 // (we add a higher-priority rule rather than deleting WARP's).
 //
