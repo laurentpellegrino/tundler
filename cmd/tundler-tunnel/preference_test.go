@@ -86,17 +86,19 @@ func TestAdvanceShiftsPick(t *testing.T) {
 	p := newTestPref(0, 1)
 	_, before, _ := p.pick(multiCountryCatalog, nil)
 	changed := false
-	// One advance may land on a country the provider doesn't offer and
-	// walk forward onto the same pick; a handful of rotations must
-	// visit something new in a 7-country catalog.
-	for i := 0; i < 5 && !changed; i++ {
+	// Each advance moves the ring cursor one COUNTRY position, and most
+	// positions belong to countries the provider doesn't offer — the
+	// walk then lands on the same next-offered country. The pick is
+	// guaranteed to move only once the cursor passes it, so allow a
+	// full ring traversal.
+	for i := 0; i < 300 && !changed; i++ {
 		p.advance()
 		if _, after, _ := p.pick(multiCountryCatalog, nil); after != before {
 			changed = true
 		}
 	}
 	if !changed {
-		t.Fatal("advance() never moved the pick across 5 rotations")
+		t.Fatal("advance() never moved the pick across a full ring traversal")
 	}
 }
 
