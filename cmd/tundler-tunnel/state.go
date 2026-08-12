@@ -69,6 +69,15 @@ type StateTracker struct {
 	authFailuresTotal     int
 	lastAuthFailureAt     time.Time
 	lastAuthFailureReason string
+
+	// accountID/accountSource identify which provider account this pod
+	// selected at boot (accounts.Select) and where it came from
+	// ("dir" | "env" | "legacy"). The ID is an operator label, never a
+	// secret — exposing it on /status is what lets an operator see at a
+	// glance which pods ride which account mid-migration and after a
+	// multi-account split.
+	accountID     string
+	accountSource string
 }
 
 // RotationRecord is the JSON shape under `last_rotation` in /status.
@@ -114,6 +123,14 @@ func (s *StateTracker) LastReadyAt() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastReadyAt
+}
+
+// SetAccount records the boot-selected account identity for /status.
+func (s *StateTracker) SetAccount(id, source string) {
+	s.mu.Lock()
+	s.accountID = id
+	s.accountSource = source
+	s.mu.Unlock()
 }
 
 // RecordBootLoginJitter records the actual random duration slept before
@@ -204,6 +221,8 @@ func (s *StateTracker) Snapshot() Snapshot {
 	snap := Snapshot{
 		State:                        s.state,
 		Provider:                     s.provider,
+		AccountID:                    s.accountID,
+		AccountSource:                s.accountSource,
 		CurrentLocation:              s.currentLocation,
 		CurrentExitIP:                s.currentExitIP,
 		RotationCountTotal:           s.rotationCountTotal,
@@ -250,8 +269,14 @@ func (s *StateTracker) RecordAuthFailure(reason string) {
 // omitempty rules: a slot consumer (crawler / leak detector) reads
 // these to introspect the tunnel's current state.
 type Snapshot struct {
-	State                        State           `json:"state"`
-	Provider                     string          `json:"provider"`
+	State    State  `json:"state"`
+	Provider string `json:"provider"`
+	// AccountID/AccountSource: which provider account this pod selected
+	// at boot (an operator label, not a secret) and where the loader
+	// found it ("dir" = accounts directory, "env" = local-dev env,
+	// "legacy" = deprecated pre-accounts env vars).
+	AccountID                    string          `json:"account_id,omitempty"`
+	AccountSource                string          `json:"account_source,omitempty"`
 	CurrentLocation              string          `json:"current_location,omitempty"`
 	CurrentExitIP                string          `json:"current_exit_ip,omitempty"`
 	TunnelAgeSeconds             int             `json:"tunnel_age_seconds"`
