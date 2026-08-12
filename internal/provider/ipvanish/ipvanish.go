@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -111,7 +112,9 @@ func parseFilename(filename string) (ipvanishServer, bool) {
 	}
 	city = strings.ReplaceAll(city, "-", " ")
 
-	country, ok := countryName(cc)
+	// IPVanish filenames use "UK" (not "GB"); geo's code alias
+	// resolves it. Unknown codes degrade to the bare CC.
+	country, ok := geo.CountryName(cc)
 	if !ok {
 		country = cc
 	}
