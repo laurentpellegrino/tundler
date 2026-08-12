@@ -13,11 +13,18 @@ mkdir -p "$(dirname "$ENV_FILE")"
 #
 # Categories matched:
 #   POD_                — downward API (POD_NAME, POD_NAMESPACE)
-#   EXPRESSVPN_, ...    — per-provider credentials
-#   TUNDLER_            — pod identity + routing
+#   EXPRESSVPN_, ...    — per-provider LEGACY credentials (the accounts
+#                          directory at /etc/tundler/accounts is the
+#                          successor and bypasses this filter entirely —
+#                          which is the point: this line-oriented pipe
+#                          truncates multi-line PEM values to their
+#                          first line, files don't)
+#   TUNDLER_            — pod identity + routing + accounts/region knobs
 #                          (TUNDLER_TUNNEL_PROVIDER, TUNDLER_TUNNEL_NODE_IP,
 #                           TUNDLER_CLUSTER_BYPASS_CIDR, TUNDLER_PROXY_PORT,
-#                           TUNDLER_PRERESOLVE_HOSTNAMES)
+#                           TUNDLER_PRERESOLVE_HOSTNAMES, TUNDLER_ACCOUNTS,
+#                           TUNDLER_ACCOUNTS_DIR, TUNDLER_ACCOUNT_<FIELD>,
+#                           TUNDLER_FLEET_SLOT_BASE, TUNDLER_FLEET_SLOTS)
 #   The tail alternation — explicit tundler-tunnel config knobs that
 #                          don't share a common prefix yet. Each
 #                          corresponds to a const in
