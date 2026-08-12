@@ -26,11 +26,10 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -88,44 +87,35 @@ var (
 	activeLocation string
 	activeMu       sync.RWMutex
 	loggedIn       bool
-
-	// Extracts the ordinal suffix from a StatefulSet pod name (e.g.
-	// tundler-tunnel-mullvad-3 → 3) so each pod reads only its own
-	// POD_<ordinal>_MULLVAD_* WireGuard identity.
-	podOrdinalRe = regexp.MustCompile(`-(\d+)$`)
 )
 
-func init() { provider.Registry[name] = Mullvad{} }
-
-// podOrdinal extracts this pod's ordinal from POD_NAME (downward API).
-// Returns 0 when POD_NAME is unset (local-dev fallback).
-func podOrdinal() int {
-	pod := os.Getenv("POD_NAME")
-	if pod == "" {
-		return 0
-	}
-	if m := podOrdinalRe.FindStringSubmatch(pod); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil {
-			return n
-		}
-	}
-	return 0
+func init() {
+	provider.Registry[name] = Mullvad{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyPerPodEnv("POD_%d_MULLVAD_", map[string]string{
+		accounts.FieldPrivateKey: "PRIVATE_KEY",
+		accounts.FieldAddress:    "ADDRESS",
+	}))
 }
 
 // wgIdentity returns this pod's WireGuard private key and the [Interface]
-// Address line (Mullvad's assigned internal address for that key). v1
-// routes IPv4 only — POD_<n>_MULLVAD_ADDRESS6 is provisioned in the
-// secret for a future dual-stack flip but is not used here (a v4-only
-// tunnel still reaches ipinfo for both the v4 and v6 crawlers).
+// Address line (Mullvad's assigned internal address for that key) from
+// its Slots=1 account (POD_<n>_MULLVAD_* via the legacy shim). v1
+// routes IPv4 only — the address6 field is provisioned in the secret
+// for a future dual-stack flip but is not used here (a v4-only tunnel
+// still reaches ipinfo for both the v4 and v6 crawlers).
 func wgIdentity() (privKey, address string, err error) {
-	ord := podOrdinal()
-	prefix := fmt.Sprintf("POD_%d_MULLVAD_", ord)
-	privKey = strings.TrimSpace(os.Getenv(prefix + "PRIVATE_KEY"))
-	address = strings.TrimSpace(os.Getenv(prefix + "ADDRESS"))
-	if privKey == "" || address == "" {
-		return "", "", fmt.Errorf(
-			"missing Mullvad WireGuard identity for pod ordinal %d (need %sPRIVATE_KEY, %sADDRESS)",
-			ord, prefix, prefix)
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	ord := accounts.PodOrdinal()
+	privKey, err = acct.Require(accounts.FieldPrivateKey, fmt.Sprintf("POD_%d_MULLVAD_PRIVATE_KEY", ord))
+	if err != nil {
+		return "", "", err
+	}
+	address, err = acct.Require(accounts.FieldAddress, fmt.Sprintf("POD_%d_MULLVAD_ADDRESS", ord))
+	if err != nil {
+		return "", "", err
 	}
 	return privKey, address, nil
 }
