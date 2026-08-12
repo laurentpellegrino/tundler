@@ -45,13 +45,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -101,14 +100,12 @@ var (
 	activeLocation string
 	activeMu       sync.RWMutex
 	loggedIn       bool
-
-	// Extracts the ordinal suffix from a StatefulSet pod name
-	// (e.g. "tundler-tunnel-cyberghost-3" → 3). The provider reads
-	// its per-pod credentials from POD_<ordinal>_* env vars.
-	podOrdinalRe = regexp.MustCompile(`-(\d+)$`)
 )
 
-func init() { provider.Registry[name] = CyberGhost{} }
+func init() {
+	provider.Registry[name] = CyberGhost{}
+	accounts.RegisterLegacyShim(name, legacyCredsDirShim)
+}
 
 func configDir() string {
 	if dir := os.Getenv("CYBERGHOST_CONFIG_DIR"); dir != "" {
@@ -117,60 +114,67 @@ func configDir() string {
 	return defaultConfigDir
 }
 
-// podOrdinal extracts this pod's ordinal index from POD_NAME (downward
-// API). Returns 0 when POD_NAME is unset (local-dev fallback — Login
-// still verifies POD_0_* creds exist before declaring success).
-func podOrdinal() (int, error) {
-	pod := os.Getenv("POD_NAME")
-	if pod == "" {
-		return 0, nil
-	}
-	m := podOrdinalRe.FindStringSubmatch(pod)
-	if m == nil {
-		return 0, fmt.Errorf("POD_NAME=%q has no -N ordinal suffix", pod)
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0, fmt.Errorf("POD_NAME=%q ordinal parse: %w", pod, err)
-	}
-	return n, nil
-}
-
-// credsDir is where the StatefulSet projects the vpn-credentials-
-// cyberghost Secret as a directory (one file per key). Reading from
-// files (not env) sidesteps the entrypoint's printenv|grep filter
-// that truncates multi-line PEMs to their first line — see the
-// comment in render-vpn-manifests.py next to the cyberghost-creds
-// volume for the full history.
+// credsDir is where the pre-accounts StatefulSet projected the
+// vpn-credentials-cyberghost Secret as a directory (one flat file per
+// POD_<n>_* key). Reading from files (not env) sidestepped the
+// entrypoint's printenv|grep filter that truncates multi-line PEMs to
+// their first line — the very bug the accounts directory now solves for
+// every provider. This path survives only as the legacy shim below.
 const credsDir = "/etc/cyberghost/creds"
 
-// getCredentials returns the per-pod (cert, key, username, password)
-// quadruple. Each pod ordinal reads POD_<n>_CERTIFICATE,
-// POD_<n>_KEY, POD_<n>_USERNAME, POD_<n>_PASSWORD as separate files
-// projected from the Secret at /etc/cyberghost/creds/. username
-// and password are trimmed of trailing whitespace; cert and key
-// are passed through untouched (PEM is whitespace-sensitive).
+// legacyCredsDirShim synthesizes Slots=1 accounts from the flat
+// POD_<n>_{CERTIFICATE,KEY,USERNAME,PASSWORD} files under credsDir,
+// scanning ordinals from 0 until the first gap — the file-based twin of
+// accounts.LegacyPerPodEnv.
+func legacyCredsDirShim() []accounts.Account {
+	var accts []accounts.Account
+	for n := 0; ; n++ {
+		prefix := fmt.Sprintf("POD_%d_", n)
+		acct := accounts.Account{ID: fmt.Sprintf("pod-%d", n), Slots: 1, Fields: map[string]string{}}
+		complete := true
+		for field, suffix := range map[string]string{
+			accounts.FieldCertificate: "CERTIFICATE",
+			accounts.FieldKey:         "KEY",
+			accounts.FieldUsername:    "USERNAME",
+			accounts.FieldPassword:    "PASSWORD",
+		} {
+			b, err := os.ReadFile(filepath.Join(credsDir, prefix+suffix))
+			if err != nil || len(b) == 0 {
+				complete = false
+				break
+			}
+			acct.Fields[field] = string(b)
+		}
+		if !complete {
+			return accts
+		}
+		accts = append(accts, acct)
+	}
+}
+
+// getCredentials returns this pod's (cert, key, username, password)
+// quadruple from its account. username and password are trimmed of
+// surrounding whitespace; cert and key are passed through untouched
+// (PEM is whitespace-sensitive).
 func getCredentials() (cert, key, user, pass string, err error) {
-	ord, err := podOrdinal()
+	acct, err := accounts.Current(name)
 	if err != nil {
 		return "", "", "", "", err
 	}
-	prefix := fmt.Sprintf("POD_%d_", ord)
-	read := func(name string) (string, error) {
-		b, err := os.ReadFile(filepath.Join(credsDir, name))
-		return string(b), err
+	hint := fmt.Sprintf("%s/POD_%d_*", credsDir, accounts.PodOrdinal())
+	if cert, err = acct.RequireRaw(accounts.FieldCertificate, hint); err != nil {
+		return "", "", "", "", err
 	}
-	certB, errCert := read(prefix + "CERTIFICATE")
-	keyB, errKey := read(prefix + "KEY")
-	userB, errUser := read(prefix + "USERNAME")
-	passB, errPass := read(prefix + "PASSWORD")
-	if errCert != nil || errKey != nil || errUser != nil || errPass != nil {
-		return "", "", "", "", fmt.Errorf(
-			"missing CyberGhost credentials for pod ordinal %d in %s "+
-				"(need %sCERTIFICATE, %sKEY, %sUSERNAME, %sPASSWORD)",
-			ord, credsDir, prefix, prefix, prefix, prefix)
+	if key, err = acct.RequireRaw(accounts.FieldKey, hint); err != nil {
+		return "", "", "", "", err
 	}
-	return certB, keyB, strings.TrimSpace(userB), strings.TrimSpace(passB), nil
+	if user, err = acct.Require(accounts.FieldUsername, hint); err != nil {
+		return "", "", "", "", err
+	}
+	if pass, err = acct.Require(accounts.FieldPassword, hint); err != nil {
+		return "", "", "", "", err
+	}
+	return cert, key, user, pass, nil
 }
 
 func loadServers() ([]cyberghostServer, error) {

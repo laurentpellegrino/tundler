@@ -21,10 +21,11 @@
 // only costs the few locations whose IPs have since rotated.
 //
 // Per-pod credentials: each VeePN device-credential consumes one of the
-// account's connection slots (Pro = 10). Pod N reads
-// POD_<N>_VEEPN_USERNAME / POD_<N>_VEEPN_PASSWORD from env (populated by
-// the StatefulSet's envFrom of vpn-credentials-veepn, one pair per pod
-// from OpenBao vpn/veepn/pod-<n>).
+// account's connection slots (Pro = 10), so each pod owns exactly one —
+// a Slots=1 account in the accounts model. Account mode reads
+// /etc/tundler/accounts/<id>/{username,password}; the legacy shim keeps
+// POD_<N>_VEEPN_USERNAME / POD_<N>_VEEPN_PASSWORD env pairs working
+// (one pair per pod from OpenBao vpn/veepn/pod-<n>).
 package veepn
 
 import (
@@ -34,11 +35,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -58,7 +59,6 @@ var (
 	// every upstream .ovpn. We rewrite it so openvpn reads our per-pod
 	// credentials file instead of prompting on the (absent) console.
 	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
-	podOrdinalRe   = regexp.MustCompile(`-(\d+)$`)
 
 	serverCache   []veepnServer
 	serverCacheMu sync.RWMutex
@@ -79,7 +79,13 @@ type veepnServer struct {
 
 type VeePN struct{}
 
-func init() { provider.Registry[name] = VeePN{} }
+func init() {
+	provider.Registry[name] = VeePN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyPerPodEnv("POD_%d_VEEPN_", map[string]string{
+		accounts.FieldUsername: "USERNAME",
+		accounts.FieldPassword: "PASSWORD",
+	}))
+}
 
 func configDir() string {
 	if d := os.Getenv("VEEPN_CONFIG_DIR"); d != "" {
@@ -88,32 +94,20 @@ func configDir() string {
 	return defaultConfigDir
 }
 
-// podOrdinal extracts this pod's ordinal from POD_NAME (downward API);
-// 0 when unset (local-dev fallback).
-func podOrdinal() int {
-	pod := os.Getenv("POD_NAME")
-	if pod == "" {
-		return 0
-	}
-	if m := podOrdinalRe.FindStringSubmatch(pod); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil {
-			return n
-		}
-	}
-	return 0
-}
-
 // getCredentials returns this pod's VeePN manual-config username/password
-// from POD_<ordinal>_VEEPN_{USERNAME,PASSWORD}.
+// (its Slots=1 account; POD_<n>_VEEPN_* via the legacy shim).
 func getCredentials() (user, pass string, err error) {
-	ord := podOrdinal()
-	prefix := fmt.Sprintf("POD_%d_VEEPN_", ord)
-	user = strings.TrimSpace(os.Getenv(prefix + "USERNAME"))
-	pass = strings.TrimSpace(os.Getenv(prefix + "PASSWORD"))
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf(
-			"missing VeePN credentials for pod ordinal %d (need %sUSERNAME, %sPASSWORD)",
-			ord, prefix, prefix)
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err = acct.Require(accounts.FieldUsername, fmt.Sprintf("POD_%d_VEEPN_USERNAME", accounts.PodOrdinal()))
+	if err != nil {
+		return "", "", err
+	}
+	pass, err = acct.Require(accounts.FieldPassword, fmt.Sprintf("POD_%d_VEEPN_PASSWORD", accounts.PodOrdinal()))
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -181,15 +175,7 @@ func pickServer(servers []veepnServer, location string) *veepnServer {
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
 }
 
 func writeActiveConfig(server *veepnServer, credentialsFile string) (string, error) {
