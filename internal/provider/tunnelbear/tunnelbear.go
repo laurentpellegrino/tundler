@@ -24,11 +24,11 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/proxy"
 	"github.com/laurentpellegrino/tundler/internal/shared"
@@ -59,7 +59,13 @@ var countries = []string{
 
 type TunnelBear struct{}
 
-func init() { provider.Registry[name] = TunnelBear{} }
+func init() {
+	provider.Registry[name] = TunnelBear{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "TUNNELBEAR_USERNAME",
+		accounts.FieldPassword: "TUNNELBEAR_PASSWORD",
+	}))
+}
 
 // ---- package state ----------------------------------------------------
 
@@ -89,11 +95,22 @@ func disconnectedDialer(context.Context, string) (net.Conn, error) {
 	return nil, fmt.Errorf("tunnelbear: no edge selected (not connected)")
 }
 
+// getCredentials resolves the account login. The per-pod DEVICE
+// identity is deliberately NOT part of the account: deviceID() stays
+// derived from POD_NAME so a pod keeps the same registered device
+// across account edits and never churns TunnelBear's device list.
 func getCredentials() (string, string, error) {
-	user := os.Getenv("TUNNELBEAR_USERNAME")
-	pass := os.Getenv("TUNNELBEAR_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("TUNNELBEAR_USERNAME and TUNNELBEAR_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "TUNNELBEAR_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "TUNNELBEAR_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }

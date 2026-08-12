@@ -55,23 +55,33 @@ func selectLocked(providerName string, ordinal int) (*Account, error) {
 	return acct, nil
 }
 
-// Current returns the selected account, lazily selecting via
-// PodOrdinal() when Select was never called — that keeps every provider
-// package usable standalone (unit tests just set legacy env vars,
-// exactly like today) while production selects eagerly at boot for the
-// clear failure mode.
+// Current returns the selected account. When Select was never called
+// (unit tests, standalone library use) it resolves FRESH on every call
+// via PodOrdinal() — without pinning — which preserves today's
+// "providers re-read env at each Login/Connect" behavior for tests that
+// flip credential env vars between cases. Production pins the choice
+// once at boot via Select.
 func Current(providerName string) (*Account, error) {
 	selMu.Lock()
 	defer selMu.Unlock()
-	if !selDone {
-		if _, err := selectLocked(providerName, PodOrdinal()); err != nil {
+	var acct *Account
+	if selDone {
+		acct = selAccount
+	} else {
+		pool, err := Load(providerName)
+		if err != nil {
 			return nil, err
 		}
+		if len(pool.Accounts) > 0 {
+			if acct, err = pool.ForOrdinal(PodOrdinal()); err != nil {
+				return nil, fmt.Errorf("provider %s: %w", providerName, err)
+			}
+		}
 	}
-	if selAccount == nil {
+	if acct == nil {
 		return nil, fmt.Errorf("%w for provider %s", ErrNoAccounts, providerName)
 	}
-	return selAccount, nil
+	return acct, nil
 }
 
 // Source reports where the current selection came from

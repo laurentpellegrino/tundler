@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -49,7 +50,12 @@ func run(ctx context.Context, args ...string) (string, error) {
 
 type ExpressVPN struct{}
 
-func init() { provider.Registry[name] = ExpressVPN{} }
+func init() {
+	provider.Registry[name] = ExpressVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldActivationCode: "EXPRESSVPN_ACTIVATION_CODE",
+	}))
+}
 
 func quiet(ctx context.Context, args ...string) { _, _ = run(ctx, args...) }
 
@@ -286,9 +292,13 @@ func isColdStartPlaceholder(fields []string) bool {
 }
 
 func (e ExpressVPN) Login(ctx context.Context) error {
-	token := os.Getenv("EXPRESSVPN_ACTIVATION_CODE")
-	if token == "" {
-		return fmt.Errorf("EXPRESSVPN_ACTIVATION_CODE environment variable not set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return err
+	}
+	token, err := acct.Require(accounts.FieldActivationCode, "EXPRESSVPN_ACTIVATION_CODE")
+	if err != nil {
+		return err
 	}
 
 	// Disable Network Lock (settings.json "killswitch": auto → off) BEFORE

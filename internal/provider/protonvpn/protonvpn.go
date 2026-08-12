@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -86,13 +87,29 @@ var (
 	loggedIn       bool
 )
 
-func init() { provider.Registry[name] = ProtonVPN{} }
+func init() {
+	provider.Registry[name] = ProtonVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "PROTON_OPENVPN_USERNAME",
+		accounts.FieldPassword: "PROTON_OPENVPN_PASSWORD",
+	}))
+}
 
+// getCredentials resolves the OpenVPN credential pair (NOT the Proton
+// account login — see cmd/proton-updater for that). Protocol/port/
+// config-dir knobs stay plain env: they are config, not credentials.
 func getCredentials() (string, string, error) {
-	user := os.Getenv("PROTON_OPENVPN_USERNAME")
-	pass := os.Getenv("PROTON_OPENVPN_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("PROTON_OPENVPN_USERNAME and PROTON_OPENVPN_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "PROTON_OPENVPN_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "PROTON_OPENVPN_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -343,8 +360,8 @@ func connectOpenVPN(ctx context.Context, server *protonServer) error {
 		return fmt.Errorf("failed to create ProtonVPN config dir: %w", err)
 	}
 
-	credentialsFile := filepath.Join(dir, "auth.txt")
-	if err := os.WriteFile(credentialsFile, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
+	credentialsFile, err := shared.WriteUserPassFile(dir, "auth.txt", user, pass)
+	if err != nil {
 		return fmt.Errorf("failed to write ProtonVPN credentials: %w", err)
 	}
 
