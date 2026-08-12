@@ -78,6 +78,16 @@ type StateTracker struct {
 	// multi-account split.
 	accountID     string
 	accountSource string
+
+	// fleetSlot is this pod's fleet-global region-preference slot
+	// (nil when the preference is disabled). preferredCountry is the
+	// ISO code the preference walk chose for the CURRENT tunnel (""
+	// when the random fallback won); currentCountry is the best-effort
+	// ISO mapping of current_location. Together they let an operator
+	// check the fleet's country spread with one /status sweep.
+	fleetSlot        *int
+	preferredCountry string
+	currentCountry   string
 }
 
 // RotationRecord is the JSON shape under `last_rotation` in /status.
@@ -130,6 +140,23 @@ func (s *StateTracker) SetAccount(id, source string) {
 	s.mu.Lock()
 	s.accountID = id
 	s.accountSource = source
+	s.mu.Unlock()
+}
+
+// SetFleetSlot records the region-preference fleet slot for /status.
+func (s *StateTracker) SetFleetSlot(slot int) {
+	s.mu.Lock()
+	s.fleetSlot = &slot
+	s.mu.Unlock()
+}
+
+// RecordCountry records the preference outcome for the current tunnel:
+// preferred is the walk's choice ("" when the random fallback won),
+// current the best-effort ISO mapping of the connected location.
+func (s *StateTracker) RecordCountry(preferred, current string) {
+	s.mu.Lock()
+	s.preferredCountry = preferred
+	s.currentCountry = current
 	s.mu.Unlock()
 }
 
@@ -223,6 +250,9 @@ func (s *StateTracker) Snapshot() Snapshot {
 		Provider:                     s.provider,
 		AccountID:                    s.accountID,
 		AccountSource:                s.accountSource,
+		FleetSlot:                    s.fleetSlot,
+		PreferredCountry:             s.preferredCountry,
+		CurrentCountry:               s.currentCountry,
 		CurrentLocation:              s.currentLocation,
 		CurrentExitIP:                s.currentExitIP,
 		RotationCountTotal:           s.rotationCountTotal,
@@ -275,8 +305,15 @@ type Snapshot struct {
 	// at boot (an operator label, not a secret) and where the loader
 	// found it ("dir" = accounts directory, "env" = local-dev env,
 	// "legacy" = deprecated pre-accounts env vars).
-	AccountID                    string          `json:"account_id,omitempty"`
-	AccountSource                string          `json:"account_source,omitempty"`
+	AccountID     string `json:"account_id,omitempty"`
+	AccountSource string `json:"account_source,omitempty"`
+	// FleetSlot is the region-preference slot (absent when disabled).
+	// PreferredCountry is the preference walk's ISO pick for the current
+	// tunnel ("" / absent when the random fallback won); CurrentCountry
+	// is the best-effort ISO mapping of CurrentLocation.
+	FleetSlot                    *int            `json:"fleet_slot,omitempty"`
+	PreferredCountry             string          `json:"preferred_country,omitempty"`
+	CurrentCountry               string          `json:"current_country,omitempty"`
 	CurrentLocation              string          `json:"current_location,omitempty"`
 	CurrentExitIP                string          `json:"current_exit_ip,omitempty"`
 	TunnelAgeSeconds             int             `json:"tunnel_age_seconds"`

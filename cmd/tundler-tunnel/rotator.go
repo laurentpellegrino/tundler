@@ -125,6 +125,13 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 	// location. The connectWithRetry helper tracks recentlyFailed within
 	// this rotation so the same broken location isn't retried twice.
 	state.Set(StateRotating)
+	// Advance the region-preference walk one country per ROTATION (not
+	// per watchdog reconnect — a drop is not a rotation) so the pod
+	// explores the ring over its lifetime instead of pinning one
+	// country forever.
+	if pref != nil {
+		pref.advance()
+	}
 	if err := prov.Disconnect(ctx); err != nil {
 		// Disconnect failures are surprisingly common when the network
 		// is already flaky. Log + continue — the subsequent Connect

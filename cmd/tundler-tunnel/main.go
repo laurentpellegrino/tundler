@@ -252,6 +252,17 @@ func main() {
 	// The drain controller now backs onto the in-process proxy (no more
 	// envoy admin HTTP calls).
 	excluded := parseExcludedLocations(os.Getenv(envExcludedLocations))
+
+	// Fleet region-spread preference (soft): set the package-level pref
+	// BEFORE any goroutine can connect, so every pick goes through it.
+	pref = newLocationPreferenceFromEnv()
+	if pref != nil {
+		state.SetFleetSlot(pref.slot)
+		log.Printf("tundler-tunnel: region preference enabled (fleet_slot=%d/%d)", pref.slot, pref.slots)
+	} else {
+		log.Printf("tundler-tunnel: region preference disabled (no %s/%s)", envFleetSlotBase, envFleetSlots)
+	}
+
 	drain := newProxyDrainController(proxySrv)
 	triggerRotation := func() {
 		rotateIfReady(ctx, prov, state, providerName, excluded, drain, baselineEgressIP)
