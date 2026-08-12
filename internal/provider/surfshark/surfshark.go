@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -42,7 +43,14 @@ var (
 	loggedIn        bool
 )
 
-func init() { provider.Registry[name] = Surfshark{} }
+func init() {
+	provider.Registry[name] = Surfshark{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername:    "SURFSHARK_OPENVPN_USERNAME",
+		accounts.FieldPassword:    "SURFSHARK_OPENVPN_PASSWORD",
+		accounts.FieldPrivateKeys: "SURFSHARK_WIREGUARD_PRIVATE_KEYS",
+	}))
+}
 
 func activeRegion() string {
 	if activeServer == nil {
@@ -139,39 +147,54 @@ func getProtocol() string {
 
 // getOpenVPNCredentials returns OpenVPN username and password
 func getOpenVPNCredentials() (string, string, error) {
-	user := os.Getenv("SURFSHARK_OPENVPN_USERNAME")
-	pass := os.Getenv("SURFSHARK_OPENVPN_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD required for OpenVPN")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "SURFSHARK_OPENVPN_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "SURFSHARK_OPENVPN_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
 
-// getWireGuardKeys returns the pool of WireGuard private keys
-func getWireGuardKeys() ([]string, error) {
-	keysStr := os.Getenv("SURFSHARK_WIREGUARD_PRIVATE_KEYS")
-	if keysStr == "" {
-		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS required for WireGuard")
+// pickWireGuardKey returns this pod's WireGuard private key.
+//
+// Account mode: the singular `private_key` field — one key pinned per
+// account, so no two pods ever share a WireGuard identity concurrently
+// (slots partitioning guarantees it).
+//
+// Legacy mode: the `private_keys` comma pool from
+// SURFSHARK_WIREGUARD_PRIVATE_KEYS with a random pick per connect —
+// today's behavior, preserved because a legacy fleet may run more pods
+// than it has keys.
+func pickWireGuardKey() (string, error) {
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", err
 	}
-
+	if key, ok := acct.Line(accounts.FieldPrivateKey); ok {
+		return key, nil
+	}
+	pool, ok := acct.Line(accounts.FieldPrivateKeys)
+	if !ok {
+		_, err := acct.Require(accounts.FieldPrivateKey, "SURFSHARK_WIREGUARD_PRIVATE_KEYS")
+		return "", err
+	}
 	var keys []string
-	for _, k := range strings.Split(keysStr, ",") {
-		k = strings.TrimSpace(k)
-		if k != "" {
+	for _, k := range strings.Split(pool, ",") {
+		if k = strings.TrimSpace(k); k != "" {
 			keys = append(keys, k)
 		}
 	}
-
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS is empty")
+		return "", fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS is empty")
 	}
-
-	return keys, nil
-}
-
-// pickRandomKey selects a random WireGuard private key from the pool
-func pickRandomKey(keys []string) string {
-	return keys[rand.Intn(len(keys))]
+	return keys[rand.Intn(len(keys))], nil
 }
 
 // connectOpenVPN connects using OpenVPN
@@ -181,9 +204,8 @@ func connectOpenVPN(ctx context.Context, server *Server) error {
 		return err
 	}
 
-	// Write credentials file
-	credFile := "/etc/surfshark/openvpn/auth.txt"
-	if err := os.WriteFile(credFile, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
+	credFile, err := shared.WriteUserPassFile("/etc/surfshark/openvpn", "auth.txt", user, pass)
+	if err != nil {
 		return fmt.Errorf("failed to write credentials: %w", err)
 	}
 
@@ -237,12 +259,10 @@ tls-auth /etc/surfshark/ta.key 1
 
 // connectWireGuard connects using WireGuard
 func connectWireGuard(ctx context.Context, server *Server) error {
-	keys, err := getWireGuardKeys()
+	privateKey, err := pickWireGuardKey()
 	if err != nil {
 		return err
 	}
-
-	privateKey := pickRandomKey(keys)
 
 	// Generate WireGuard config
 	config := fmt.Sprintf(`[Interface]
@@ -467,12 +487,12 @@ func (s Surfshark) LoggedIn(ctx context.Context) bool {
 func (s Surfshark) Login(ctx context.Context) error {
 	proto := getProtocol()
 	if proto == "wireguard" {
-		if _, err := getWireGuardKeys(); err != nil {
-			return fmt.Errorf("SURFSHARK_WIREGUARD_PRIVATE_KEYS not configured")
+		if _, err := pickWireGuardKey(); err != nil {
+			return err
 		}
 	} else {
 		if _, _, err := getOpenVPNCredentials(); err != nil {
-			return fmt.Errorf("SURFSHARK_OPENVPN_USERNAME and SURFSHARK_OPENVPN_PASSWORD not configured")
+			return err
 		}
 	}
 	loggedIn = true
