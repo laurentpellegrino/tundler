@@ -20,8 +20,9 @@ proxy and the pod handles everything VPN-related behind it.
 
 Each pod is a single container running `systemd` → `tundler-tunnel`, which:
 
-1. **Logs in** to the provider (env-supplied credentials) and **connects** a
-   tunnel to a randomly chosen allowed location.
+1. **Logs in** to the provider with its pod's account (see
+   [Accounts](#accounts)) and **connects** a tunnel to a randomly chosen
+   allowed location.
 2. Verifies the tunnel actually routes traffic out a different IP than the
    node (the **exit-IP contract test**) before reporting ready.
 3. Serves an in-process **CONNECT proxy on `:8485`** — crawler traffic dialed
@@ -48,29 +49,76 @@ integration shapes:
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
 
-Credentials come from environment variables (in the fleet, injected from
-OpenBao via ExternalSecret). Most providers share one account credential
-across pods; a few are **per-pod** because each pod needs its own
-session/key/device:
+## Accounts
 
-| Provider | Credential env |
+Every provider supports **multiple accounts**. An account is a named bag of
+credential fields plus an explicit `slots` capacity (how many pods it can
+serve concurrently — the provider's device/session cap made enforceable).
+Pod ordinals are block-partitioned over accounts in order: accounts
+`main` (slots 5) + `backup` (slots 3) serve ordinals 0-4 and 5-7. An
+ordinal beyond the declared capacity is a loud boot error surfaced on
+`/status` — not a login storm.
+
+Accounts arrive as a **directory** (in the fleet: a projected Secret, kept
+in sync from OpenBao via ExternalSecret):
+
+```
+/etc/tundler/accounts/
+  main/
+    username        # one file per field
+    password
+  backup/
+    username
+    password
+```
+
+- `TUNDLER_ACCOUNTS` (env, e.g. `main:5,backup:3`) pins account ordering +
+  slots in production; without it, lexicographic directory order + an
+  optional `slots` file per account (default 1) apply — name dirs
+  `00-main`, `01-backup` to make order visible.
+- Local dev shortcut: `TUNDLER_ACCOUNT_<FIELD>` env vars (e.g.
+  `TUNDLER_ACCOUNT_USERNAME`) synthesize a single account.
+- Files, not env, on purpose: the entrypoint's line-oriented env filter
+  truncates multi-line PEMs (the bug that once forced cyberghost's
+  bespoke `/etc/cyberghost/creds` path), and a projected Secret updates
+  in place — credential fixes heal pods without restarts or re-logins.
+
+Field names per provider (also the OpenBao property names):
+
+| Provider | Account fields |
 |----------|----------------|
-| expressvpn | `EXPRESSVPN_ACTIVATION_CODE` |
-| nordvpn | `NORDVPN_TOKEN` |
-| pia | `PRIVATEINTERNETACCESS_USERNAME` / `_PASSWORD` |
-| ipvanish | `IPVANISH_USERNAME` / `_PASSWORD` |
-| ovpn | `OVPN_USERNAME` / `_PASSWORD` |
-| purevpn | `PUREVPN_USERNAME` / `_PASSWORD` |
-| fastvpn | `FASTVPN_USERNAME` / `_PASSWORD` |
-| protonvpn | `PROTON_OPENVPN_USERNAME` / `_PASSWORD` |
-| surfshark | `SURFSHARK_OPENVPN_USERNAME` / `_PASSWORD` (or `SURFSHARK_WIREGUARD_PRIVATE_KEYS` + `SURFSHARK_PROTOCOL=wireguard`) |
-| windscribe | `WINDSCRIBE_USERNAME` / `_PASSWORD` (the OpenVPN credential, not the account login) |
-| tunnelbear | `TUNNELBEAR_USERNAME` / `_PASSWORD` |
-| mullvad *(per-pod)* | `POD_<n>_MULLVAD_PRIVATE_KEY` / `_ADDRESS` |
-| cyberghost *(per-pod)* | `POD_<n>_CERTIFICATE` / `_KEY` / `_USERNAME` / `_PASSWORD` |
-| veepn *(per-pod)* | `POD_<n>_VEEPN_USERNAME` / `_PASSWORD` (each device credential = one connection slot) |
-| warp | none (anonymous registration) |
+| expressvpn | `activation_code` |
+| nordvpn | `token` |
+| pia, ipvanish, ovpn, purevpn, fastvpn, veepn, tunnelbear | `username`, `password` |
+| protonvpn | `username`, `password` (the OpenVPN pair, not the Proton login) |
+| windscribe | `username`, `password` (the OpenVPN credential, not the account login) |
+| surfshark | `username`, `password` (OpenVPN) or `private_key` (WireGuard, one key pinned per pod) |
+| mullvad | `private_key`, `address` (`address6` reserved) — one device identity per Slots=1 account |
+| cyberghost | `certificate`, `key`, `username`, `password` — one device profile per Slots=1 account |
+| warp | none (anonymous/mdm registration) |
 | psiphon | none (embedded network config) |
+
+**Legacy env vars keep working** (deprecated, one log line at boot): the
+pre-accounts variables — `PRIVATEINTERNETACCESS_USERNAME/_PASSWORD`,
+`EXPRESSVPN_ACTIVATION_CODE`, `NORDVPN_TOKEN`,
+`SURFSHARK_WIREGUARD_PRIVATE_KEYS` (comma pool, random pick),
+per-pod `POD_<n>_MULLVAD_*` / `POD_<n>_VEEPN_*` and cyberghost's
+`/etc/cyberghost/creds/POD_<n>_*` files — are synthesized into an
+equivalent account pool when the accounts directory is absent, so images
+and deployment manifests can roll independently.
+
+## Region spread (soft)
+
+When the deployment renderer injects `TUNDLER_FLEET_SLOT_BASE` +
+`TUNDLER_FLEET_SLOTS`, each pod derives a fleet-unique slot
+(`base + ordinal`) and walks a shared epoch-seeded country ordering from
+its own offset, preferring the first country its provider offers — so
+tunnels spread across distinct countries with **zero coordination** (no
+peer traffic, no extra RBAC). It is a preference, never a guarantee:
+any miss falls back to the classic uniform-random pick, and providers
+with unmappable location vocabularies (city names, `auto`) simply ignore
+it. `/status` exposes `fleet_slot`, `preferred_country` and
+`current_country`. Absent env = feature off.
 
 ## Build & run
 
@@ -110,7 +158,10 @@ curl http://localhost:4242/status
 | `MIN_ROTATION_SECONDS` / `MAX_ROTATION_SECONDS` | rotation interval window (each interval is a fresh uniform pick) |
 | `BOOT_LOGIN_JITTER_SECONDS` | spread simultaneous boot logins to avoid bursting the auth API |
 | `TUNDLER_PROXY_PORT` | CONNECT proxy port (default `8485`) |
-| `POD_NAME` / `POD_NAMESPACE` | downward-API identity; per-pod providers derive their ordinal from `POD_NAME` |
+| `POD_NAME` / `POD_NAMESPACE` | downward-API identity; the pod's ordinal (from `POD_NAME`) selects its account |
+| `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
+| `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition |
+| `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | enable the soft region-spread preference |
 
 The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md#environment-knobs).
 
