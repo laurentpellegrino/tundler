@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -53,7 +54,13 @@ var (
 	loggedIn       bool
 )
 
-func init() { provider.Registry[name] = PureVPN{} }
+func init() {
+	provider.Registry[name] = PureVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "PUREVPN_USERNAME",
+		accounts.FieldPassword: "PUREVPN_PASSWORD",
+	}))
+}
 
 // slugHostname builds the OpenVPN remote for a server slug.
 func slugHostname(slug string) string {
@@ -70,10 +77,17 @@ func slugCountry(slug string) string {
 }
 
 func getCredentials() (string, string, error) {
-	user := os.Getenv("PUREVPN_USERNAME")
-	pass := os.Getenv("PUREVPN_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("PUREVPN_USERNAME and PUREVPN_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "PUREVPN_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "PUREVPN_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -135,14 +149,7 @@ func findServers(slugs []string, location string) []string {
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(configDir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir, credentialsName, user, pass)
 }
 
 // writeConfig builds the .ovpn from PureVPN's directives (UDP, AES-256-GCM,

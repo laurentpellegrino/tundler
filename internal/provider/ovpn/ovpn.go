@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
@@ -67,13 +68,26 @@ var (
 	loggedIn       bool
 )
 
-func init() { provider.Registry[name] = OVPN{} }
+func init() {
+	provider.Registry[name] = OVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "OVPN_USERNAME",
+		accounts.FieldPassword: "OVPN_PASSWORD",
+	}))
+}
 
 func getCredentials() (string, string, error) {
-	user := os.Getenv("OVPN_USERNAME")
-	pass := os.Getenv("OVPN_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf("OVPN_USERNAME and OVPN_PASSWORD environment variables must be set")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "OVPN_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "OVPN_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -145,14 +159,7 @@ func pickRandomServer(servers []Server) *Server {
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(configDir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir, credentialsName, user, pass)
 }
 
 // writeConfig builds the .ovpn from OVPN's directives (taken verbatim from

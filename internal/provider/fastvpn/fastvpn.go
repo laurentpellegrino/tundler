@@ -55,6 +55,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
@@ -137,7 +138,13 @@ var (
 	remoteRe = regexp.MustCompile(`(?m)^remote\s+(\S+)`)
 )
 
-func init() { provider.Registry[name] = FastVPN{} }
+func init() {
+	provider.Registry[name] = FastVPN{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "FASTVPN_USERNAME",
+		accounts.FieldPassword: "FASTVPN_PASSWORD",
+	}))
+}
 
 func configDir() string {
 	if dir := os.Getenv("FASTVPN_CONFIG_DIR"); dir != "" {
@@ -146,13 +153,21 @@ func configDir() string {
 	return defaultConfigDir
 }
 
+// getCredentials resolves the OpenVPN credential pair — generated
+// separately from the Namecheap dashboard login at FastVPN account
+// panel → "Network access information".
 func getCredentials() (string, string, error) {
-	user := os.Getenv("FASTVPN_USERNAME")
-	pass := os.Getenv("FASTVPN_PASSWORD")
-	if user == "" || pass == "" {
-		return "", "", fmt.Errorf(
-			"FASTVPN_USERNAME and FASTVPN_PASSWORD must be set " +
-				"(from FastVPN dashboard → Account Panel → Network access information)")
+	acct, err := accounts.Current(name)
+	if err != nil {
+		return "", "", err
+	}
+	user, err := acct.Require(accounts.FieldUsername, "FASTVPN_USERNAME")
+	if err != nil {
+		return "", "", err
+	}
+	pass, err := acct.Require(accounts.FieldPassword, "FASTVPN_PASSWORD")
+	if err != nil {
+		return "", "", err
 	}
 	return user, pass, nil
 }
@@ -449,15 +464,7 @@ func pickRandomServer(servers []fastvpnServer) *fastvpnServer {
 }
 
 func writeCredentials(user, pass string) (string, error) {
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, credentialsName)
-	if err := os.WriteFile(path, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
 }
 
 func writeActiveConfig(server *fastvpnServer, credentialsFile string) (string, error) {
