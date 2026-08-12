@@ -14,14 +14,14 @@ func TestGuessAlpha2(t *testing.T) {
 		ok   bool
 	}{
 		// Rule 1 — bare codes.
-		{"DE", "DE", true},   // PureVPN
-		{"de", "DE", true},   // TunnelBear
-		{"UK", "GB", true},   // FastVPN/IPVanish catalogs
-		{"uk", "GB", true},   // TunnelBear
-		{"gb", "GB", true},   // ISO-correct input
-		{"xx", "", false},    // unknown code
-		{"a", "", false},     // too short
-		{"", "", false},      // empty
+		{"DE", "DE", true}, // PureVPN
+		{"de", "DE", true}, // TunnelBear
+		{"UK", "GB", true}, // FastVPN/IPVanish catalogs
+		{"uk", "GB", true}, // TunnelBear
+		{"gb", "GB", true}, // ISO-correct input
+		{"xx", "", false},  // unknown code
+		{"a", "", false},   // too short
+		{"", "", false},    // empty
 		{"  se ", "SE", true},
 
 		// Rule 2 — cc-city slugs (PIA).
@@ -33,18 +33,18 @@ func TestGuessAlpha2(t *testing.T) {
 		{"zz-nowhere", "", false},
 
 		// Rule 3 — country names.
-		{"Germany", "DE", true},           // NordVPN, mullvad, proton, ...
-		{"United_States", "US", true},     // NordVPN
-		{"United States", "US", true},     // country-name catalogs
-		{"united states", "US", true},     // case-insensitive
-		{"Czech Republic", "CZ", true},    // canonical
-		{"Czechia", "CZ", true},           // alias
-		{"North Macedonia", "MK", true},   // canonical
-		{"Macedonia", "MK", true},         // legacy fastvpn table name
-		{"Macau", "MO", true},             // legacy ipvanish table name
-		{"South Korea", "KR", true},       // canonical
+		{"Germany", "DE", true},                         // NordVPN, mullvad, proton, ...
+		{"United_States", "US", true},                   // NordVPN
+		{"United States", "US", true},                   // country-name catalogs
+		{"united states", "US", true},                   // case-insensitive
+		{"Czech Republic", "CZ", true},                  // canonical
+		{"Czechia", "CZ", true},                         // alias
+		{"North Macedonia", "MK", true},                 // canonical
+		{"Macedonia", "MK", true},                       // legacy fastvpn table name
+		{"Macau", "MO", true},                           // legacy ipvanish table name
+		{"South Korea", "KR", true},                     // canonical
 		{"Lao_Peoples_Democratic_Republic", "LA", true}, // NordVPN
-		{"Cote d'Ivoire", "CI", true},     // proton exclusion-list spelling
+		{"Cote d'Ivoire", "CI", true},                   // proton exclusion-list spelling
 		{"Bosnia and Herzegovina", "BA", true},
 		{"United Kingdom", "GB", true},
 		{"Russian Federation", "RU", true},
