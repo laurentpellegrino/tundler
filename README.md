@@ -142,9 +142,15 @@ Run it (needs `NET_ADMIN` and `/dev/net/tun` for the kernel-tunnel providers):
 ```bash
 docker run --rm \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -e WINDSCRIBE_USERNAME=... -e WINDSCRIBE_PASSWORD=... \
+  -e TUNDLER_ACCOUNT_USERNAME=... -e TUNDLER_ACCOUNT_PASSWORD=... \
   -p 8485:8485 -p 4242:4242 \
   laurentpellegrino/tundler-windscribe:latest
+
+# multi-account: mount a directory instead (one subdir per account,
+# one file per field — see "Accounts" above):
+#   -v ./accounts:/etc/tundler/accounts:ro -e TUNDLER_ACCOUNTS=main:0
+# the provider's pre-accounts env vars (WINDSCRIBE_USERNAME=...) still
+# work as a deprecated fallback.
 
 # crawl through the tunnel:
 curl -x http://localhost:8485 https://ipinfo.io
@@ -199,7 +205,10 @@ The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.m
 4. Add `<name>` to the allow-list in `docker/Dockerfile.tunnel`, the matrix in
    `.github/workflows/docker-image.yml`, and the env-passthrough regex in
    `docker/services/tundler-entrypoint.sh`.
-5. Document the credential env vars in the tables above.
+5. Resolve credentials through the accounts package — `accounts.Current(name)`
+   + `acct.Require(accounts.Field…)` — and add the provider's field names to
+   the "Account fields" table above. Only providers that predate the accounts
+   model register a legacy env shim; a new provider doesn't need one.
 
 ## Contributing
 
