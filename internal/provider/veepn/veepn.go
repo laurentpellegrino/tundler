@@ -101,11 +101,11 @@ func getCredentials() (user, pass string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	user, err = acct.Require(accounts.FieldUsername, fmt.Sprintf("POD_%d_VEEPN_USERNAME", accounts.PodOrdinal()))
+	user, err = acct.Require(accounts.FieldUsername)
 	if err != nil {
 		return "", "", err
 	}
-	pass, err = acct.Require(accounts.FieldPassword, fmt.Sprintf("POD_%d_VEEPN_PASSWORD", accounts.PodOrdinal()))
+	pass, err = acct.Require(accounts.FieldPassword)
 	if err != nil {
 		return "", "", err
 	}

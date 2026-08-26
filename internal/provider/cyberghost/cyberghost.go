@@ -104,7 +104,15 @@ var (
 
 func init() {
 	provider.Registry[name] = CyberGhost{}
-	accounts.RegisterLegacyShim(name, legacyCredsDirShim)
+	accounts.RegisterLegacyShim(name, accounts.LegacyShim{
+		Accounts: legacyCredsDirShim,
+		// The legacy source is a FILE (the pre-accounts Secret
+		// projection), not an env var.
+		Hint: func(field string) string {
+			return fmt.Sprintf("%s/POD_%d_%s", credsDir,
+				accounts.PodOrdinal(), strings.ToUpper(field))
+		},
+	})
 }
 
 func configDir() string {
@@ -161,17 +169,16 @@ func getCredentials() (cert, key, user, pass string, err error) {
 	if err != nil {
 		return "", "", "", "", err
 	}
-	hint := fmt.Sprintf("%s/POD_%d_*", credsDir, accounts.PodOrdinal())
-	if cert, err = acct.RequireRaw(accounts.FieldCertificate, hint); err != nil {
+	if cert, err = acct.RequireRaw(accounts.FieldCertificate); err != nil {
 		return "", "", "", "", err
 	}
-	if key, err = acct.RequireRaw(accounts.FieldKey, hint); err != nil {
+	if key, err = acct.RequireRaw(accounts.FieldKey); err != nil {
 		return "", "", "", "", err
 	}
-	if user, err = acct.Require(accounts.FieldUsername, hint); err != nil {
+	if user, err = acct.Require(accounts.FieldUsername); err != nil {
 		return "", "", "", "", err
 	}
-	if pass, err = acct.Require(accounts.FieldPassword, hint); err != nil {
+	if pass, err = acct.Require(accounts.FieldPassword); err != nil {
 		return "", "", "", "", err
 	}
 	return cert, key, user, pass, nil

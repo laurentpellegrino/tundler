@@ -76,6 +76,20 @@ func DirFromEnv() string {
 // and nothing was configured — i.e. it requires no credentials
 // (warp, psiphon).
 func Load(providerName string) (*Pool, error) {
+	shim, hasShim := legacyShim(providerName)
+	pool, err := resolvePool(providerName, shim, hasShim)
+	if pool != nil && hasShim && shim.Hint != nil {
+		// Stamp the legacy hint on every account, dir-sourced ones
+		// included, so a Require error mid-migration names both the
+		// expected file and the still-working legacy source.
+		for i := range pool.Accounts {
+			pool.Accounts[i].legacyHint = shim.Hint
+		}
+	}
+	return pool, err
+}
+
+func resolvePool(providerName string, shim LegacyShim, hasShim bool) (*Pool, error) {
 	accts, err := loadDir(DirFromEnv())
 	if err != nil {
 		return nil, err
@@ -88,8 +102,8 @@ func Load(providerName string) (*Pool, error) {
 		return &Pool{Accounts: accts, Source: "env"}, nil
 	}
 
-	if fn := legacyShim(providerName); fn != nil {
-		accts := fn()
+	if hasShim {
+		accts := shim.Accounts()
 		if len(accts) > 0 {
 			log.Printf("accounts: no %s dir — synthesized %d account(s) from legacy %s env vars (deprecated; migrate to the accounts directory, see README)",
 				DirFromEnv(), len(accts), strings.ToUpper(providerName))

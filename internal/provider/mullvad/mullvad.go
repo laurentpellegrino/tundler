@@ -108,12 +108,11 @@ func wgIdentity() (privKey, address string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	ord := accounts.PodOrdinal()
-	privKey, err = acct.Require(accounts.FieldPrivateKey, fmt.Sprintf("POD_%d_MULLVAD_PRIVATE_KEY", ord))
+	privKey, err = acct.Require(accounts.FieldPrivateKey)
 	if err != nil {
 		return "", "", err
 	}
-	address, err = acct.Require(accounts.FieldAddress, fmt.Sprintf("POD_%d_MULLVAD_ADDRESS", ord))
+	address, err = acct.Require(accounts.FieldAddress)
 	if err != nil {
 		return "", "", err
 	}

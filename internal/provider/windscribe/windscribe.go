@@ -103,11 +103,11 @@ func getCredentials() (user, pass string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	user, err = acct.Require(accounts.FieldUsername, "WINDSCRIBE_USERNAME")
+	user, err = acct.Require(accounts.FieldUsername)
 	if err != nil {
 		return "", "", err
 	}
-	pass, err = acct.Require(accounts.FieldPassword, "WINDSCRIBE_PASSWORD")
+	pass, err = acct.Require(accounts.FieldPassword)
 	if err != nil {
 		return "", "", err
 	}

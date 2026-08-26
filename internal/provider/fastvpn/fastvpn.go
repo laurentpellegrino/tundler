@@ -161,11 +161,11 @@ func getCredentials() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	user, err := acct.Require(accounts.FieldUsername, "FASTVPN_USERNAME")
+	user, err := acct.Require(accounts.FieldUsername)
 	if err != nil {
 		return "", "", err
 	}
-	pass, err := acct.Require(accounts.FieldPassword, "FASTVPN_PASSWORD")
+	pass, err := acct.Require(accounts.FieldPassword)
 	if err != nil {
 		return "", "", err
 	}

@@ -223,12 +223,12 @@ func TestEnvSingleAccountFallback(t *testing.T) {
 
 func TestLegacyShimPrecedenceAndDeprecation(t *testing.T) {
 	testEnv(t, filepath.Join(t.TempDir(), "nonexistent"))
-	RegisterLegacyShim("fakeprov", func() []Account {
+	RegisterLegacyShim("fakeprov", LegacyShim{Accounts: func() []Account {
 		if v := os.Getenv("FAKEPROV_USERNAME"); v != "" {
 			return []Account{{ID: "default", Slots: 0, Fields: map[string]string{FieldUsername: v}}}
 		}
 		return nil
-	})
+	}})
 	t.Setenv("FAKEPROV_USERNAME", "legacyuser")
 
 	pool, err := Load("fakeprov")
@@ -351,16 +351,35 @@ func TestSelectAndCurrent(t *testing.T) {
 }
 
 func TestRequireErrorNamesFileAndLegacyHint(t *testing.T) {
-	testEnv(t, "/etc/tundler/accounts")
-	a := Account{ID: "00-main", Fields: map[string]string{}}
-	_, err := a.Require(FieldUsername, "PROTON_OPENVPN_USERNAME")
+	// The hint comes from the registered shim, stamped by Load onto
+	// every account — DIR-sourced ones included, so mid-migration
+	// errors name both worlds.
+	dir := t.TempDir()
+	testEnv(t, dir)
+	RegisterLegacyShim("hintprov", LegacyEnvFields(map[string]string{
+		FieldUsername: "HINTPROV_USERNAME",
+	}))
+	writeAccount(t, dir, "00-main", map[string]string{"password": "p"})
+
+	pool, err := Load("hintprov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pool.Accounts[0].Require(FieldUsername)
 	if err == nil {
 		t.Fatal("want error")
 	}
-	for _, want := range []string{"00-main", "username", "/etc/tundler/accounts/00-main/username", "PROTON_OPENVPN_USERNAME"} {
+	for _, want := range []string{"00-main", "username", dir + "/00-main/username", "HINTPROV_USERNAME"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
+	}
+
+	// An Account constructed directly (no Load) has no hint — the
+	// error simply drops the legacy clause.
+	a := Account{ID: "x", Fields: map[string]string{}}
+	if _, err := a.Require(FieldUsername); err == nil || strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("hintless error should omit the legacy clause, got %v", err)
 	}
 }
 

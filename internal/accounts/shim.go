@@ -19,21 +19,35 @@ import "sync"
 // ordinal — which reproduces today's ordinal→identity mapping exactly
 // under the block partition.
 
+// LegacyShim is a provider's bridge to its pre-accounts credential
+// source. Accounts synthesizes the pool from the deprecated env vars
+// (or files); Hint names, for one field, where that source lives (an
+// env var name, or cyberghost's creds-file path) so Require errors can
+// point mid-migration operators at both worlds. Registering the hint
+// HERE — next to the map the shim itself reads — keeps the env-var
+// vocabulary in one place instead of repeating it at every Require
+// call site.
+type LegacyShim struct {
+	Accounts func() []Account
+	Hint     func(field string) string
+}
+
 var (
 	shimMu sync.Mutex
-	shims  = map[string]func() []Account{}
+	shims  = map[string]LegacyShim{}
 )
 
 // RegisterLegacyShim installs the deprecated-env synthesizer for a
 // provider. Call once from the provider package's init().
-func RegisterLegacyShim(providerName string, fn func() []Account) {
+func RegisterLegacyShim(providerName string, s LegacyShim) {
 	shimMu.Lock()
 	defer shimMu.Unlock()
-	shims[providerName] = fn
+	shims[providerName] = s
 }
 
-func legacyShim(providerName string) func() []Account {
+func legacyShim(providerName string) (LegacyShim, bool) {
 	shimMu.Lock()
 	defer shimMu.Unlock()
-	return shims[providerName]
+	s, ok := shims[providerName]
+	return s, ok
 }
