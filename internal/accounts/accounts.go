@@ -55,9 +55,10 @@ type Account struct {
 	ID string
 
 	// Slots is how many pods this account serves concurrently (the
-	// provider's device/session cap for it). 0 means "all ordinals" and
-	// is only produced by the single-account legacy/env fallbacks,
-	// preserving today's shared-credential behavior exactly.
+	// provider's device/session cap for it). 0 means "all ordinals" —
+	// produced by the single-account legacy/env fallbacks (preserving
+	// today's shared-credential behavior exactly) and by the renderer
+	// for uncapped providers (`slots: unlimited` → "<id>:0").
 	Slots int
 
 	// Fields maps field name (lowercased file name) → value. Values

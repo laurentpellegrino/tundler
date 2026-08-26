@@ -203,7 +203,7 @@ response-header IP without locking.
 | `POD_NAME`                        | downward| → `x-tundler-tunnel-id` header; ordinal selects the account|
 | `TUNDLER_TUNNEL_NODE_IP`          | —       | → `x-tundler-node-ip` response header                      |
 | `TUNDLER_ACCOUNTS_DIR`            | `/etc/tundler/accounts` | account directories (one per account, one file per field) |
-| `TUNDLER_ACCOUNTS`                | —       | ordered `<id>:<slots>` CSV; authoritative ordinal→account partition |
+| `TUNDLER_ACCOUNTS`                | —       | ordered `<id>:<slots>` CSV; authoritative partition (`0` = sole uncapped account) |
 | `TUNDLER_ACCOUNT_<FIELD>`         | —       | local-dev single-account fallback (e.g. `TUNDLER_ACCOUNT_USERNAME`) |
 | `TUNDLER_FLEET_SLOT_BASE`         | —       | first fleet-global region-preference slot of this StatefulSet |
 | `TUNDLER_FLEET_SLOTS`             | —       | fleet-wide pod total; with SLOT_BASE enables the soft region spread |

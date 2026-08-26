@@ -19,7 +19,9 @@ const (
 
 	// envAccountsManifest is the ordered partition map emitted by the
 	// deployment renderer: a CSV of <id>:<slots> entries, e.g.
-	// "main:5,backup:3". When set it is AUTHORITATIVE for both account
+	// "main:5,backup:3". Slots 0 marks a sole UNCAPPED account
+	// ("main:0", the renderer's `slots: unlimited`) serving every
+	// ordinal. When set it is AUTHORITATIVE for both account
 	// ordering and slot counts — a directory listing is unordered and
 	// a `slots` file can drift, so production always pins the
 	// partition here (the env value doubles as the pod-roll trigger
@@ -177,8 +179,8 @@ func loadAccountDir(dir, id string) (Account, error) {
 		}
 		if strings.EqualFold(name, slotsFileName) {
 			n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-			if err != nil || n < 1 {
-				return acct, fmt.Errorf("%w: account %q: slots file %q must be a positive integer",
+			if err != nil || n < 0 {
+				return acct, fmt.Errorf("%w: account %q: slots file %q must be a non-negative integer (0 = unlimited, sole account only)",
 					ErrBadSlots, id, strings.TrimSpace(string(raw)))
 			}
 			acct.Slots = n
@@ -207,8 +209,8 @@ func orderByManifest(byID map[string]Account, manifest, dir string) ([]Account, 
 			return nil, fmt.Errorf("%w: %s entry %q is not <id>:<slots>", ErrBadSlots, envAccountsManifest, part)
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(slotsStr))
-		if err != nil || n < 1 {
-			return nil, fmt.Errorf("%w: %s entry %q: slots must be a positive integer", ErrBadSlots, envAccountsManifest, part)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("%w: %s entry %q: slots must be a non-negative integer (0 = unlimited, sole account only)", ErrBadSlots, envAccountsManifest, part)
 		}
 		acct, ok := byID[id]
 		if !ok {
@@ -219,6 +221,16 @@ func orderByManifest(byID map[string]Account, manifest, dir string) ([]Account, 
 	}
 	if len(accts) == 0 {
 		return nil, fmt.Errorf("%w: %s is set but empty", ErrNoAccounts, envAccountsManifest)
+	}
+	// Slots 0 = "serves every ordinal" (the renderer's `slots:
+	// unlimited` for uncapped providers) — only coherent for a sole
+	// account, same rule ForOrdinal enforces for the legacy/env pools.
+	if len(accts) > 1 {
+		for _, a := range accts {
+			if a.Slots == 0 {
+				return nil, fmt.Errorf("%w: %s lists account %q with slots 0 (unlimited) next to others — an uncapped account must be the sole account", ErrBadSlots, envAccountsManifest, a.ID)
+			}
+		}
 	}
 	return accts, nil
 }
@@ -270,8 +282,9 @@ func (p *Pool) TotalSlots() int {
 //
 // A single account with Slots==0 serves every ordinal — that preserves
 // today's "all pods share the one env credential" behavior byte-for-
-// byte for the legacy/env fallbacks. Slots==0 anywhere else is a
-// configuration error.
+// byte for the legacy/env fallbacks, and is how the renderer expresses
+// an uncapped provider (`slots: unlimited` → "<id>:0"). Slots==0
+// anywhere else is a configuration error.
 func (p *Pool) ForOrdinal(ord int) (*Account, error) {
 	if len(p.Accounts) == 0 {
 		return nil, ErrNoAccounts
@@ -287,7 +300,7 @@ func (p *Pool) ForOrdinal(ord int) (*Account, error) {
 	for i := range p.Accounts {
 		a := &p.Accounts[i]
 		if a.Slots < 1 {
-			return nil, fmt.Errorf("%w: account %q has slots=%d (0 is only valid for a lone legacy/env account)",
+			return nil, fmt.Errorf("%w: account %q has slots=%d (0 = unlimited is only valid for a sole account)",
 				ErrBadSlots, a.ID, a.Slots)
 		}
 		if ord < cursor+a.Slots {
