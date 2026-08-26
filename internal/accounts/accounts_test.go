@@ -143,6 +143,42 @@ func TestManifestAuthoritativeOrderAndSlots(t *testing.T) {
 	}
 }
 
+func TestManifestUnlimitedSoleAccount(t *testing.T) {
+	// "main:0" is the renderer's `slots: unlimited` (uncapped provider):
+	// the sole account serves every ordinal, and scaling max_tunnels
+	// never changes the env value.
+	dir := t.TempDir()
+	testEnv(t, dir)
+	writeAccount(t, dir, "main", map[string]string{"username": "m"})
+	t.Setenv("TUNDLER_ACCOUNTS", "main:0")
+
+	pool, err := Load("windscribe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ord := range []int{0, 7, 42} {
+		acct, err := pool.ForOrdinal(ord)
+		if err != nil || acct.ID != "main" {
+			t.Fatalf("ordinal %d: got %v, %v; want main", ord, acct, err)
+		}
+	}
+	if pool.TotalSlots() != -1 {
+		t.Fatalf("TotalSlots = %d, want -1 (unbounded)", pool.TotalSlots())
+	}
+}
+
+func TestManifestUnlimitedNextToCappedIsError(t *testing.T) {
+	dir := t.TempDir()
+	testEnv(t, dir)
+	writeAccount(t, dir, "main", map[string]string{"username": "m"})
+	writeAccount(t, dir, "backup", map[string]string{"username": "b"})
+	t.Setenv("TUNDLER_ACCOUNTS", "main:0,backup:3")
+
+	if _, err := Load("pia"); !errors.Is(err, ErrBadSlots) {
+		t.Fatalf("want ErrBadSlots for unlimited next to capped, got %v", err)
+	}
+}
+
 func TestManifestMissingDirIsHardError(t *testing.T) {
 	dir := t.TempDir()
 	testEnv(t, dir)

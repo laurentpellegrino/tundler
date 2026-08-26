@@ -75,7 +75,9 @@ in sync from OpenBao via ExternalSecret):
 - `TUNDLER_ACCOUNTS` (env, e.g. `main:5,backup:3`) pins account ordering +
   slots in production; without it, lexicographic directory order + an
   optional `slots` file per account (default 1) apply — name dirs
-  `00-main`, `01-backup` to make order visible.
+  `00-main`, `01-backup` to make order visible. Slots `0` marks a sole
+  UNCAPPED account (`main:0`): it serves every ordinal, so the value
+  never changes when the fleet scales.
 - Local dev shortcut: `TUNDLER_ACCOUNT_<FIELD>` env vars (e.g.
   `TUNDLER_ACCOUNT_USERNAME`) synthesize a single account.
 - Files, not env, on purpose: the entrypoint's line-oriented env filter
@@ -160,7 +162,7 @@ curl http://localhost:4242/status
 | `TUNDLER_PROXY_PORT` | CONNECT proxy port (default `8485`) |
 | `POD_NAME` / `POD_NAMESPACE` | downward-API identity; the pod's ordinal (from `POD_NAME`) selects its account |
 | `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
-| `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition |
+| `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
 | `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | enable the soft region-spread preference |
 
 The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md#environment-knobs).
