@@ -63,7 +63,7 @@ func TestSelectAccountWithRetryCtxCancel(t *testing.T) {
 	t.Setenv("TUNDLER_ACCOUNTS", "")
 	t.Setenv("POD_NAME", "")
 	t.Cleanup(accounts.Reset)
-	accounts.RegisterLegacyShim("cancelprov", func() []accounts.Account { return nil })
+	accounts.RegisterLegacyShim("cancelprov", accounts.LegacyShim{Accounts: func() []accounts.Account { return nil }})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {

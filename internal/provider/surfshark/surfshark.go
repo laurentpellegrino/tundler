@@ -45,11 +45,22 @@ var (
 
 func init() {
 	provider.Registry[name] = Surfshark{}
-	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+	shim := accounts.LegacyEnvFields(map[string]string{
 		accounts.FieldUsername:    "SURFSHARK_OPENVPN_USERNAME",
 		accounts.FieldPassword:    "SURFSHARK_OPENVPN_PASSWORD",
 		accounts.FieldPrivateKeys: "SURFSHARK_WIREGUARD_PRIVATE_KEYS",
-	}))
+	})
+	// The singular private_key (dir-mode: one key pinned per pod) has
+	// no legacy env var of its own — point operators at the comma-pool
+	// var the shim reads instead.
+	base := shim.Hint
+	shim.Hint = func(field string) string {
+		if field == accounts.FieldPrivateKey {
+			return "SURFSHARK_WIREGUARD_PRIVATE_KEYS"
+		}
+		return base(field)
+	}
+	accounts.RegisterLegacyShim(name, shim)
 }
 
 func activeRegion() string {
@@ -151,11 +162,11 @@ func getOpenVPNCredentials() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	user, err := acct.Require(accounts.FieldUsername, "SURFSHARK_OPENVPN_USERNAME")
+	user, err := acct.Require(accounts.FieldUsername)
 	if err != nil {
 		return "", "", err
 	}
-	pass, err := acct.Require(accounts.FieldPassword, "SURFSHARK_OPENVPN_PASSWORD")
+	pass, err := acct.Require(accounts.FieldPassword)
 	if err != nil {
 		return "", "", err
 	}
@@ -182,7 +193,7 @@ func pickWireGuardKey() (string, error) {
 	}
 	pool, ok := acct.Line(accounts.FieldPrivateKeys)
 	if !ok {
-		_, err := acct.Require(accounts.FieldPrivateKey, "SURFSHARK_WIREGUARD_PRIVATE_KEYS")
+		_, err := acct.Require(accounts.FieldPrivateKey)
 		return "", err
 	}
 	var keys []string

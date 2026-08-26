@@ -22,16 +22,20 @@ import (
 //
 // The account is returned even when every var is empty: a missing
 // credential then surfaces through Require's precise "create file X or
-// set legacy env Y" error instead of a generic no-accounts error.
-func LegacyEnvFields(fields map[string]string) func() []Account {
-	return func() []Account {
-		acct := Account{ID: "default", Slots: 0, Fields: map[string]string{}}
-		for field, env := range fields {
-			if v := strings.TrimSpace(os.Getenv(env)); v != "" {
-				acct.Fields[field] = v
+// set legacy env Y" error instead of a generic no-accounts error. The
+// same mapping doubles as the Hint source for those errors.
+func LegacyEnvFields(fields map[string]string) LegacyShim {
+	return LegacyShim{
+		Accounts: func() []Account {
+			acct := Account{ID: "default", Slots: 0, Fields: map[string]string{}}
+			for field, env := range fields {
+				if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+					acct.Fields[field] = v
+				}
 			}
-		}
-		return []Account{acct}
+			return []Account{acct}
+		},
+		Hint: func(field string) string { return fields[field] },
 	}
 }
 
@@ -42,26 +46,37 @@ func LegacyEnvFields(fields map[string]string) func() []Account {
 // "POD_%d_VEEPN_"; fields maps canonical field name → env suffix.
 //
 // Under the block partition, N Slots=1 accounts in ordinal order map
-// pod ordinal n to account pod-<n> — exactly today's behavior.
-func LegacyPerPodEnv(prefixFmt string, fields map[string]string) func() []Account {
-	return func() []Account {
-		var accts []Account
-		for n := 0; ; n++ {
-			prefix := fmt.Sprintf(prefixFmt, n)
-			acct := Account{ID: fmt.Sprintf("pod-%d", n), Slots: 1, Fields: map[string]string{}}
-			complete := true
-			for field, suffix := range fields {
-				v := strings.TrimSpace(os.Getenv(prefix + suffix))
-				if v == "" {
-					complete = false
-					break
+// pod ordinal n to account pod-<n> — exactly today's behavior. Hint
+// names THIS pod's var (POD_<ordinal>_…), resolved at error time so
+// tests that move POD_NAME between cases stay accurate.
+func LegacyPerPodEnv(prefixFmt string, fields map[string]string) LegacyShim {
+	return LegacyShim{
+		Accounts: func() []Account {
+			var accts []Account
+			for n := 0; ; n++ {
+				prefix := fmt.Sprintf(prefixFmt, n)
+				acct := Account{ID: fmt.Sprintf("pod-%d", n), Slots: 1, Fields: map[string]string{}}
+				complete := true
+				for field, suffix := range fields {
+					v := strings.TrimSpace(os.Getenv(prefix + suffix))
+					if v == "" {
+						complete = false
+						break
+					}
+					acct.Fields[field] = v
 				}
-				acct.Fields[field] = v
+				if !complete {
+					return accts
+				}
+				accts = append(accts, acct)
 			}
-			if !complete {
-				return accts
+		},
+		Hint: func(field string) string {
+			suffix, ok := fields[field]
+			if !ok {
+				return ""
 			}
-			accts = append(accts, acct)
-		}
+			return fmt.Sprintf(prefixFmt, PodOrdinal()) + suffix
+		},
 	}
 }
