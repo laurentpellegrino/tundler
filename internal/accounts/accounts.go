@@ -66,6 +66,14 @@ type Account struct {
 	// newline (Secret files conventionally end with one; PEM blocks are
 	// unharmed because they terminate with their own newline).
 	Fields map[string]string
+
+	// legacyHint names a field's pre-accounts source (env var, or
+	// cyberghost's creds-file path) for Require's error message.
+	// Stamped by Load from the provider's registered LegacyShim — for
+	// EVERY source, dir included, so mid-migration errors point at both
+	// worlds. nil (tests constructing Account directly, providers with
+	// no shim) just drops the clause.
+	legacyHint func(field string) string
 }
 
 // Field returns the raw value of a field — PEM-safe, no trimming beyond
@@ -95,26 +103,29 @@ func (a *Account) Line(name string) (string, bool) {
 
 // Require returns Line(name) or an error that tells the operator
 // exactly what to fix: the account, the missing field, the file the
-// loader looked for, and — when non-empty — the legacy env var that
-// still works during the migration window. This message surfaces on
-// /status via the auth-failure fields, so it must be self-contained.
-func (a *Account) Require(name, legacyHint string) (string, error) {
+// loader looked for, and — when the provider registered a shim — the
+// legacy source (env var or file) that still works during the
+// migration window. This message surfaces on /status via the
+// auth-failure fields, so it must be self-contained.
+func (a *Account) Require(name string) (string, error) {
 	if v, ok := a.Line(name); ok {
 		return v, nil
 	}
 	msg := fmt.Sprintf("account %q: missing field %q (file %s/%s/%s",
 		a.ID, name, DirFromEnv(), a.ID, name)
-	if legacyHint != "" {
-		msg += fmt.Sprintf(", or legacy env %s", legacyHint)
+	if a.legacyHint != nil {
+		if hint := a.legacyHint(name); hint != "" {
+			msg += fmt.Sprintf(", or legacy %s", hint)
+		}
 	}
 	return "", fmt.Errorf("%s)", msg)
 }
 
 // RequireRaw is Require for multi-line fields (PEM certificates/keys):
 // same error contract, no whitespace trimming.
-func (a *Account) RequireRaw(name, legacyHint string) (string, error) {
+func (a *Account) RequireRaw(name string) (string, error) {
 	if v, ok := a.Field(name); ok {
 		return v, nil
 	}
-	return a.Require(name, legacyHint) // reuse the error message
+	return a.Require(name) // reuse the error message
 }

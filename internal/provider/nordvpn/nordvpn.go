@@ -103,7 +103,7 @@ func (n NordVPN) Login(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	token, err := acct.Require(accounts.FieldToken, "NORDVPN_TOKEN")
+	token, err := acct.Require(accounts.FieldToken)
 	if err != nil {
 		return err
 	}

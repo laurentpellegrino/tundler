@@ -296,7 +296,7 @@ func (e ExpressVPN) Login(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	token, err := acct.Require(accounts.FieldActivationCode, "EXPRESSVPN_ACTIVATION_CODE")
+	token, err := acct.Require(accounts.FieldActivationCode)
 	if err != nil {
 		return err
 	}
