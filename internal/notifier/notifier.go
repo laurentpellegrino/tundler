@@ -12,6 +12,12 @@
 //	TUNDLER_EVENT_SINKS              JSON array of destinations (see Sink). When
 //	                                 empty/unset the hook is disabled.
 //	TUNDLER_EVENT_INTERVAL_SECONDS   heartbeat cadence (default 300).
+//	TUNDLER_CLUSTER_RESOLV_CONF      resolv.conf saved by the entrypoint before
+//	                                 any provider client could rewrite the live
+//	                                 one (default /run/tundler/resolv.conf).
+//	                                 When present, sink hostnames resolve through
+//	                                 its nameservers at dial time; otherwise they
+//	                                 are pinned to an IP once at boot.
 //
 // Example TUNDLER_EVENT_SINKS:
 //
@@ -89,6 +95,18 @@ type Notifier struct {
 	snapshot SnapshotFunc
 }
 
+// httpClient dials sinks through the cluster resolver when the entrypoint
+// saved one, so delivery no longer depends on the live /etc/resolv.conf.
+func httpClient(resolver *clusterResolver) *http.Client {
+	hc := &http.Client{Timeout: httpTimeout}
+	if resolver != nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DialContext = resolver.dialContext
+		hc.Transport = transport
+	}
+	return hc
+}
+
 // FromEnv builds a Notifier from the environment. The bool is false (and the
 // pointer nil) when no sinks are configured, so the caller can skip wiring.
 func FromEnv(snapshot SnapshotFunc) (*Notifier, bool) {
@@ -103,20 +121,30 @@ func FromEnv(snapshot SnapshotFunc) (*Notifier, bool) {
 		return nil, false
 	}
 
+	// Several provider clients (expressvpn, veepn, windscribe) rewrite
+	// resolv.conf to an in-tunnel resolver that cannot resolve
+	// cluster-internal names, so sink hostnames must not depend on the
+	// live resolver. Preferred: the entrypoint saved the kubelet-written
+	// resolv.conf before any provider code ran, and every POST resolves
+	// through those nameservers at dial time (see resolver.go). Fallback,
+	// when no saved copy exists: pin each hostname to an IP now, while the
+	// container hopefully still uses cluster DNS — bounded by the pod's
+	// own recycle cadence, the same trade-off as the cluster-bypass route.
+	resolver := loadClusterResolver()
+	if resolver != nil {
+		log.Printf("notifier: resolving sink hosts through cluster nameservers %v (from %s)",
+			resolver.nameservers, resolver.source)
+	}
+
 	valid := sinks[:0]
 	for _, s := range sinks {
 		if strings.TrimSpace(s.URL) == "" {
 			log.Printf("notifier: skipping sink with empty url")
 			continue
 		}
-		// Pin the sink's hostname to an IP NOW, while the container still
-		// uses cluster DNS. FromEnv runs before Login/Connect, and several
-		// provider clients (expressvpn, veepn, windscribe) rewrite
-		// resolv.conf to an in-tunnel resolver that cannot resolve
-		// cluster-internal names — a dial-time lookup would then fail on
-		// every emit. Boot-time pinning is bounded by the pod's own
-		// recycle cadence, the same trade-off as the cluster-bypass route.
-		s.URL = pinHost(s.URL)
+		if resolver == nil {
+			s.URL = pinHost(s.URL)
+		}
 		valid = append(valid, s)
 	}
 	if len(valid) == 0 {
@@ -136,7 +164,7 @@ func FromEnv(snapshot SnapshotFunc) (*Notifier, bool) {
 	return &Notifier{
 		sinks:    valid,
 		interval: interval,
-		hc:       &http.Client{Timeout: httpTimeout},
+		hc:       httpClient(resolver),
 		snapshot: snapshot,
 	}, true
 }
