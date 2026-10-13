@@ -24,7 +24,8 @@ mkdir -p "$(dirname "$ENV_FILE")"
 #                           TUNDLER_CLUSTER_BYPASS_CIDR, TUNDLER_PROXY_PORT,
 #                           TUNDLER_PRERESOLVE_HOSTNAMES, TUNDLER_ACCOUNTS,
 #                           TUNDLER_ACCOUNTS_DIR, TUNDLER_ACCOUNT_<FIELD>,
-#                           TUNDLER_FLEET_SLOT_BASE, TUNDLER_FLEET_SLOTS)
+#                           TUNDLER_FLEET_SLOT_BASE, TUNDLER_FLEET_SLOTS,
+#                           TUNDLER_CLUSTER_RESOLV_CONF, TUNDLER_EVENT_*)
 #   The tail alternation — explicit tundler-tunnel config knobs that
 #                          don't share a common prefix yet. Each
 #                          corresponds to a const in
@@ -41,6 +42,27 @@ mkdir -p "$(dirname "$ENV_FILE")"
 # 'TUNDLER_' to be followed immediately by '=' — turning TUNDLER_
 # into a single literal var instead of a prefix.
 printenv | grep -E '^(POD_|EXPRESSVPN_|FASTVPN_|IPVANISH_|MULLVAD_|NORDVPN_|OVPN_|PRIVATEINTERNETACCESS_|PROTON_|PUREVPN_|SURFSHARK_|TUNNELBEAR_|VEEPN_|WINDSCRIBE_|TUNDLER_)|^(BOOT_LOGIN_JITTER_SECONDS|EXCLUDED_LOCATIONS|MIN_ROTATION_SECONDS|MAX_ROTATION_SECONDS|TUNNEL_WATCHDOG_INTERVAL_SECONDS|WEDGE_GUARD_THRESHOLD_SECONDS|ROTATION_RETRY_MAX|ROTATION_ATTEMPT_TIMEOUT_SECONDS|RECYCLE_AFTER_SECONDS|RECYCLE_AFTER_ROTATIONS)=' | sort > "$ENV_FILE"
+
+# Save the kubelet-written resolver config ONCE per pod sandbox, before
+# any provider code runs. Several VPN clients (expressvpn, veepn,
+# windscribe) rewrite /etc/resolv.conf to an in-tunnel resolver, and
+# expressvpn's prestart repair swaps in public resolvers — neither can
+# resolve cluster-internal names, which silently killed every event-sink
+# POST from the ExpressVPN fleet between 2026-08-13 and 2026-10-13.
+# /etc/resolv.conf is bind-mounted from the pod sandbox, so a container
+# restart inherits whatever the previous container left there; the copy
+# therefore lives under /run (a pod-scoped emptyDir that outlives the
+# container) and is only written when no earlier container saved one.
+# tundler-tunnel's notifier resolves sink hostnames through these
+# nameservers (see internal/notifier/resolver.go).
+SAVED_RESOLV_CONF="${TUNDLER_CLUSTER_RESOLV_CONF:-/run/tundler/resolv.conf}"
+if [[ -s "$SAVED_RESOLV_CONF" ]]; then
+    echo "[tundler-entrypoint] keeping cluster resolver config saved by an earlier container: $SAVED_RESOLV_CONF ($(awk '/^nameserver/{print $2}' "$SAVED_RESOLV_CONF" | tr '\n' ' '))"
+elif mkdir -p "$(dirname "$SAVED_RESOLV_CONF")" && cp /etc/resolv.conf "$SAVED_RESOLV_CONF" 2>/dev/null; then
+    echo "[tundler-entrypoint] saved cluster resolver config to $SAVED_RESOLV_CONF ($(awk '/^nameserver/{print $2}' "$SAVED_RESOLV_CONF" | tr '\n' ' '))"
+else
+    echo "[tundler-entrypoint] WARNING: could not save /etc/resolv.conf to $SAVED_RESOLV_CONF — event sinks fall back to boot-time host pinning"
+fi
 
 # Run each installed provider's configure.sh once per pod boot. This
 # downloads OpenVPN configs (fastvpn/protonvpn/surfshark), seeds CLI
