@@ -143,4 +143,28 @@ if [[ -n "$TUNDLER_CLUSTER_BYPASS_CIDR" ]]; then
     fi
 fi
 
+# Keep DNS to the saved cluster resolver(s) allowed no matter what
+# firewall the VPN client installs. ExpressVPN arms an evpn.* chain set
+# on every connect — with network lock off — whose blockDNS member
+# REJECTs port 53 to anything but its in-tunnel resolver, which killed
+# every event-sink lookup (and so every exit-IP report) from that fleet.
+# One ACCEPT per nameserver and protocol at the HEAD of OUTPUT wins over
+# whatever the provider appends or prepends later; tundler-tunnel
+# re-asserts the same rules after every connect (internal/clusterdns)
+# and expressvpn's prestart before every daemon start. Only the
+# resolver's private address on eth0 is matched — traffic the bypass
+# route above already carries — so nothing can slip around the tunnel.
+for NS in $(awk '/^nameserver/{print $2}' "$SAVED_RESOLV_CONF" 2>/dev/null); do
+    case "$NS" in *:*) IPT=ip6tables ;; *) IPT=iptables ;; esac
+    for PROTO in udp tcp; do
+        RULE=(-o eth0 -d "$NS" -p "$PROTO" --dport 53 -j ACCEPT)
+        while "$IPT" -w 5 -D OUTPUT "${RULE[@]}" 2>/dev/null; do :; done
+        if "$IPT" -w 5 -I OUTPUT 1 "${RULE[@]}" 2>/dev/null; then
+            echo "[tundler-entrypoint] allowed $PROTO DNS to cluster resolver $NS ahead of any provider firewall"
+        else
+            echo "[tundler-entrypoint] WARNING: could not allow $PROTO DNS to cluster resolver $NS — event sinks may be unreachable behind a provider firewall"
+        fi
+    done
+done
+
 exec /lib/systemd/systemd

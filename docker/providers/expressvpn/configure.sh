@@ -52,6 +52,17 @@ for hook in INPUT OUTPUT FORWARD; do
 done
 for c in $(iptables -S 2>/dev/null | awk '/^-N evpn/{print $2}'); do iptables -F "$c" 2>/dev/null; done
 for c in $(iptables -S 2>/dev/null | awk '/^-N evpn/{print $2}'); do iptables -X "$c" 2>/dev/null; done
+# Re-assert the cluster-DNS exception the entrypoint installed (see
+# internal/clusterdns): the daemon's evpn.310.blockDNS REJECTs port 53
+# to anything but its in-tunnel resolver on every connect, so the ACCEPT
+# for the saved cluster resolver must stay at the head of OUTPUT.
+for NS in $(awk '/^nameserver/{print $2}' "${TUNDLER_CLUSTER_RESOLV_CONF:-/run/tundler/resolv.conf}" 2>/dev/null); do
+    case "$NS" in *:*) IPT=ip6tables ;; *) IPT=iptables ;; esac
+    for PROTO in udp tcp; do
+        while "$IPT" -w 5 -D OUTPUT -o eth0 -d "$NS" -p "$PROTO" --dport 53 -j ACCEPT 2>/dev/null; do :; done
+        "$IPT" -w 5 -I OUTPUT 1 -o eth0 -d "$NS" -p "$PROTO" --dport 53 -j ACCEPT 2>/dev/null
+    done
+done
 # Same class of damage, DNS layer: on connect the daemon rewrites
 # /etc/resolv.conf to its in-tunnel resolver (100.64.100.1, reachable
 # ONLY through the tunnel) and never restores it when the session dies.
