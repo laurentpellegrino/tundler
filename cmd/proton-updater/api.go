@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -53,6 +54,7 @@ type cookieState struct {
 	sessionID string
 	uid       string
 	token     string // bearer-style cookie token, suitable for the Cookie: AUTH-…= header
+	refresh   string // REFRESH-<UID> cookie value; only sent on /auth/refresh
 }
 
 func (c cookieState) header() string {
@@ -62,6 +64,9 @@ func (c cookieState) header() string {
 	}
 	if c.token != "" {
 		parts = append(parts, "AUTH-"+c.uid+"="+c.token)
+	}
+	if c.refresh != "" {
+		parts = append(parts, "REFRESH-"+c.uid+"="+c.refresh)
 	}
 	return strings.Join(parts, "; ")
 }
@@ -236,11 +241,10 @@ type cookieTokenResponse struct {
 	UID  string `json:"UID"`
 }
 
-// exchangeForCookieToken swaps a refresh token for an auth cookie via
-// /core/v4/auth/cookies. Returns the AUTH-<UID> cookie token plus any rotated
-// refresh token (REFRESH-<UID> cookie) Proton hands back — empty when none.
-// accessToken may be "" (the refresh-token grant carries identity in the body
-// + UID header), in which case no Authorization header is sent.
+// exchangeForCookieToken swaps a token-mode session (access + refresh token)
+// for an auth cookie via /core/v4/auth/cookies. Returns the AUTH-<UID> cookie
+// token plus any refresh token (REFRESH-<UID> cookie) Proton hands back —
+// empty when none. Requires a live access token; see refreshSession.
 func (c *apiClient) exchangeForCookieToken(ctx context.Context, cookie cookieState, tokenType, accessToken, refreshToken string) (cookieToken, newRefreshToken string, err error) {
 	body := cookieTokenRequest{
 		GrantType:    "refresh_token",
@@ -302,29 +306,119 @@ func (c *apiClient) exchangeForCookieToken(ctx context.Context, cookie cookieSta
 	return cookieToken, newRefreshToken, nil
 }
 
+type refreshRequest struct {
+	UID          string `json:"UID"`
+	RefreshToken string `json:"RefreshToken"`
+	ResponseType string `json:"ResponseType"`
+	GrantType    string `json:"GrantType"`
+	RedirectURI  string `json:"RedirectURI"`
+	State        string `json:"State"`
+}
+
+type refreshResponse struct {
+	Code         uint   `json:"Code"`
+	AccessToken  string `json:"AccessToken"`
+	RefreshToken string `json:"RefreshToken"`
+}
+
 // refreshSession rebuilds an authenticated cookie from a previously stored
 // session (UID + refresh token) instead of running the CAPTCHA-gated SRP
 // login. Returns the cookie ready for /vpn/v1/logicals plus the refresh token
 // to persist for next time (rotated when Proton returns a new one, otherwise
 // the same one back).
+//
+// Cookie-mode sessions refresh via POST /auth/refresh, the endpoint the web
+// client uses (its REFRESH-<UID> cookie is scoped to path=/api/auth/refresh).
+// /core/v4/auth/cookies is NOT a refresh endpoint: it converts a token-mode
+// session into cookies and demands a live access token, so calling it with
+// only a refresh token always answers 401 "Invalid access token".
 func (c *apiClient) refreshSession(ctx context.Context, uid, refreshToken string) (cookieState, string, error) {
 	sessionID, err := c.fetchSessionID(ctx)
 	if err != nil {
 		return cookieState{}, "", fmt.Errorf("session id: %w", err)
 	}
-	cs := cookieState{sessionID: sessionID, uid: uid}
+	cs := cookieState{sessionID: sessionID, uid: uid, refresh: refreshToken}
 
-	cookieToken, rotated, err := c.exchangeForCookieToken(ctx, cs, "", "", refreshToken)
+	body, err := json.Marshal(refreshRequest{
+		UID:          uid,
+		RefreshToken: innerRefreshToken(refreshToken),
+		ResponseType: "token",
+		GrantType:    "refresh_token",
+		RedirectURI:  "https://protonmail.com",
+		State:        c.randomState(24),
+	})
 	if err != nil {
-		return cookieState{}, "", fmt.Errorf("refresh exchange: %w", err)
+		return cookieState{}, "", err
 	}
-	cs.token = cookieToken
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/auth/refresh", bytes.NewReader(body))
+	if err != nil {
+		return cookieState{}, "", err
+	}
+	c.setHeaders(req, cs)
+	req.Header.Set("Content-Type", "application/json")
 
-	next := rotated
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return cookieState{}, "", err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return cookieState{}, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return cookieState{}, "", fmt.Errorf("refresh: %w", apiError(resp.StatusCode, respBody))
+	}
+	var parsed refreshResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return cookieState{}, "", fmt.Errorf("decode refresh: %w (body=%q)", err, snippet(respBody))
+	}
+	if parsed.Code != 1000 {
+		return cookieState{}, "", fmt.Errorf("refresh code %d (body=%q)", parsed.Code, snippet(respBody))
+	}
+
+	// Cookie mode answers with AUTH-<UID> / REFRESH-<UID> Set-Cookies; fall
+	// back to the JSON body's tokens should Proton answer in token mode.
+	next := ""
+	for _, ck := range resp.Cookies() {
+		switch {
+		case strings.HasPrefix(ck.Name, "AUTH-"):
+			cs.token = ck.Value
+		case strings.HasPrefix(ck.Name, "REFRESH-"):
+			next = ck.Value
+		}
+	}
+	if cs.token == "" {
+		cs.token = parsed.AccessToken
+	}
+	if next == "" {
+		next = parsed.RefreshToken
+	}
+	if cs.token == "" {
+		return cookieState{}, "", errors.New("refresh: neither AUTH-<UID> cookie nor AccessToken in response")
+	}
 	if next == "" {
 		next = refreshToken
 	}
+	cs.refresh = ""
 	return cs, next, nil
+}
+
+// innerRefreshToken extracts the bare refresh token from a REFRESH-<UID>
+// cookie value, which Proton may encode as URL-escaped JSON
+// ({"RefreshToken":"…","UID":"…",…}). Plain tokens pass through unchanged.
+func innerRefreshToken(stored string) string {
+	decoded, err := url.QueryUnescape(stored)
+	if err != nil {
+		return stored
+	}
+	var wrapped struct {
+		RefreshToken string `json:"RefreshToken"`
+	}
+	if json.Unmarshal([]byte(decoded), &wrapped) == nil && wrapped.RefreshToken != "" {
+		return wrapped.RefreshToken
+	}
+	return stored
 }
 
 // -----------------------------------------------------------------
