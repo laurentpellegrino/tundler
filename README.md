@@ -118,15 +118,18 @@ then switch each provider's manifest to the accounts directory.
 ## Region spread (soft)
 
 When the deployment renderer injects `TUNDLER_FLEET_SLOT_BASE` +
-`TUNDLER_FLEET_SLOTS`, each pod derives a fleet-unique slot
-(`base + ordinal`) and walks a shared epoch-seeded country ordering from
-its own offset, preferring the first country its provider offers — so
-tunnels spread across distinct countries with **zero coordination** (no
-peer traffic, no extra RBAC). It is a preference, never a guarantee:
-any miss falls back to the classic uniform-random pick, and providers
-with unmappable location vocabularies (city names, `auto`) simply ignore
-it. `/status` exposes `fleet_slot`, `preferred_country` and
-`current_country`. Absent env = feature off.
+`TUNDLER_FLEET_SLOTS`, every pod computes the same epoch-seeded country
+ordering. The provider's block start (`base / slots` of the way around
+that ring) picks where the provider begins, and its pods take
+consecutive countries from the ring-ordered list of countries the
+provider actually offers (ordinal 0 the first, ordinal 1 the next, …),
+so siblings land on distinct countries with **zero coordination** (no
+peer traffic, no extra RBAC) for as long as the catalog has one to
+spare. Each rotation advances a pod one country. It is a preference,
+never a guarantee: any miss falls back to the classic uniform-random
+pick, and providers with unmappable location vocabularies (city names,
+`auto`) simply ignore it. `/status` exposes `fleet_slot`,
+`preferred_country` and `current_country`. Absent env = feature off.
 
 ## Build & run
 
