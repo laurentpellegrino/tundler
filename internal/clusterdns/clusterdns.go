@@ -12,9 +12,16 @@
 // resolver, so every exit-IP event from the ExpressVPN fleet died on that
 // rule (observed 2026-10-19: 203 exit IPs used, 6 delivered).
 //
-// The fix is one ACCEPT per saved nameserver and protocol, kept at the
-// HEAD of OUTPUT so it wins regardless of whether the provider appends or
-// prepends its jump. It is asserted by the entrypoint before the VPN comes
+// The fix is one ACCEPT per protocol for DNS leaving over the cluster
+// interface towards the cluster CIDR, kept at the HEAD of OUTPUT so it
+// wins regardless of whether the provider appends or prepends its jump.
+// The match is the CIDR (TUNDLER_CLUSTER_BYPASS_CIDR, the same one the
+// bypass route uses), not the resolver's Service IP: with Cilium's
+// socket-level load balancing the kernel rewrites the kube-dns ClusterIP
+// to a CoreDNS pod address inside connect(), so a rule on the Service IP
+// never matches (verified 2026-10-19: zero hits while blockDNS kept
+// counting). Without a CIDR (local runs) the saved nameservers are
+// matched individually. It is asserted by the entrypoint before the VPN comes
 // up, by ExpressVPN's prestart before every daemon start, and by the
 // tunnel-up listener after every connect (the moment a provider re-arms
 // its chains). On providers that never firewall DNS the rule matches
@@ -44,6 +51,9 @@ const (
 	// notifier and the entrypoint.
 	EnvResolvConf     = "TUNDLER_CLUSTER_RESOLV_CONF"
 	DefaultResolvConf = "/run/tundler/resolv.conf"
+	// EnvBypassCIDR is the cluster CIDR the entrypoint routes around the
+	// tunnel; DNS towards it is what the rules allow.
+	EnvBypassCIDR = "TUNDLER_CLUSTER_BYPASS_CIDR"
 
 	// clusterIface is the pod's cluster-facing interface, the same one
 	// the entrypoint pins the bypass route to.
@@ -103,37 +113,55 @@ func LoadNameservers(path string) []net.IP {
 	return ParseNameservers(f)
 }
 
-// rule is the OUTPUT-chain match for one nameserver and protocol.
-func rule(ns net.IP, proto string) []string {
-	return []string{"-o", clusterIface, "-d", ns.String(), "-p", proto, "--dport", "53", "-j", "ACCEPT"}
+// Destinations picks what the rules match: the cluster CIDR when one is
+// configured (Service IPs are rewritten to pod IPs before the packet
+// exists, so only the CIDR is reliable), otherwise each saved nameserver.
+func Destinations(nameservers []net.IP, cidr string) []string {
+	cidr = strings.TrimSpace(cidr)
+	if cidr != "" {
+		if _, _, err := net.ParseCIDR(cidr); err == nil {
+			return []string{cidr}
+		}
+		log.Printf("clusterdns: ignoring invalid %s=%q", EnvBypassCIDR, cidr)
+	}
+	var dests []string
+	for _, ns := range nameservers {
+		dests = append(dests, ns.String())
+	}
+	return dests
 }
 
-func binaryFor(ns net.IP) string {
-	if ns.To4() == nil {
+// rule is the OUTPUT-chain match for one destination and protocol.
+func rule(dest, proto string) []string {
+	return []string{"-o", clusterIface, "-d", dest, "-p", proto, "--dport", "53", "-j", "ACCEPT"}
+}
+
+func binaryFor(dest string) string {
+	if strings.Contains(dest, ":") {
 		return "ip6tables"
 	}
 	return "iptables"
 }
 
-// Allow puts an ACCEPT for DNS to every nameserver at the head of
+// Allow puts an ACCEPT for DNS towards every destination at the head of
 // OUTPUT. Stale copies (from an earlier call, or left at a lower position
 // by a provider that prepended its own jump) are removed first so the
 // surviving rule is always the first one evaluated. Errors from the
 // insert are collected and returned; a failing delete just ends the
 // cleanup loop.
-func Allow(ctx context.Context, nameservers []net.IP, run Runner) error {
+func Allow(ctx context.Context, destinations []string, run Runner) error {
 	var errs []error
-	for _, ns := range nameservers {
-		bin := binaryFor(ns)
+	for _, dest := range destinations {
+		bin := binaryFor(dest)
 		for _, proto := range protocols {
-			r := rule(ns, proto)
+			r := rule(dest, proto)
 			for i := 0; i < maxDeletes; i++ {
 				if err := run(ctx, bin, append([]string{"-w", "5", "-D", "OUTPUT"}, r...)...); err != nil {
 					break
 				}
 			}
 			if err := run(ctx, bin, append([]string{"-w", "5", "-I", "OUTPUT", "1"}, r...)...); err != nil {
-				errs = append(errs, fmt.Errorf("%s %s to %s: %w", bin, proto, ns, err))
+				errs = append(errs, fmt.Errorf("%s %s to %s: %w", bin, proto, dest, err))
 			}
 		}
 	}
@@ -165,9 +193,10 @@ func Ensure(ctx context.Context) {
 		_, err := shared.RunCmdSilent(ctx, name, args...)
 		return err
 	}
-	if err := Allow(ctx, nameservers, run); err != nil {
-		log.Printf("clusterdns: could not allow DNS to cluster resolvers %v: %v", nameservers, err)
+	dests := Destinations(nameservers, os.Getenv(EnvBypassCIDR))
+	if err := Allow(ctx, dests, run); err != nil {
+		log.Printf("clusterdns: could not allow DNS towards %v: %v", dests, err)
 		return
 	}
-	log.Printf("clusterdns: DNS to cluster resolvers %v allowed ahead of any provider firewall", nameservers)
+	log.Printf("clusterdns: DNS towards %v (cluster resolvers %v) allowed ahead of any provider firewall", dests, nameservers)
 }

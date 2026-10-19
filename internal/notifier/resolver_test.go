@@ -119,6 +119,7 @@ func TestDialContextIPLiteralSkipsLookup(t *testing.T) {
 
 func TestDialContextLookupFailure(t *testing.T) {
 	c := newClusterResolver("test", []string{"10.0.96.10:53"})
+	c.repair = nil
 	c.lookup = func(context.Context, string) ([]net.IPAddr, error) {
 		return nil, errors.New("no such host")
 	}
@@ -128,9 +129,32 @@ func TestDialContextLookupFailure(t *testing.T) {
 	}
 }
 
+func TestDialContextRepairsAndRetriesOnce(t *testing.T) {
+	_, port := listen(t)
+	c := newClusterResolver("test", []string{"10.0.96.10:53"})
+	repaired, lookups := 0, 0
+	c.repair = func(context.Context) { repaired++ }
+	c.lookup = func(context.Context, string) ([]net.IPAddr, error) {
+		lookups++
+		if repaired == 0 {
+			return nil, errors.New("write udp: operation not permitted")
+		}
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	conn, err := c.dialContext(context.Background(), "tcp", "collector.svc.cluster.local:"+port)
+	if err != nil {
+		t.Fatalf("dial should succeed after repair: %v", err)
+	}
+	conn.Close()
+	if repaired != 1 || lookups != 2 {
+		t.Fatalf("repaired=%d lookups=%d, want 1 and 2", repaired, lookups)
+	}
+}
+
 func TestDialContextFallsBackToLastGoodAnswer(t *testing.T) {
 	_, port := listen(t)
 	c := newClusterResolver("test", []string{"10.0.96.10:53"})
+	c.repair = nil
 	fail := false
 	c.lookup = func(context.Context, string) ([]net.IPAddr, error) {
 		if fail {

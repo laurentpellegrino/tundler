@@ -148,21 +148,29 @@ fi
 # on every connect — with network lock off — whose blockDNS member
 # REJECTs port 53 to anything but its in-tunnel resolver, which killed
 # every event-sink lookup (and so every exit-IP report) from that fleet.
-# One ACCEPT per nameserver and protocol at the HEAD of OUTPUT wins over
-# whatever the provider appends or prepends later; tundler-tunnel
-# re-asserts the same rules after every connect (internal/clusterdns)
-# and expressvpn's prestart before every daemon start. Only the
-# resolver's private address on eth0 is matched — traffic the bypass
-# route above already carries — so nothing can slip around the tunnel.
-for NS in $(awk '/^nameserver/{print $2}' "$SAVED_RESOLV_CONF" 2>/dev/null); do
-    case "$NS" in *:*) IPT=ip6tables ;; *) IPT=iptables ;; esac
+# One ACCEPT per protocol at the HEAD of OUTPUT wins over whatever the
+# provider appends or prepends later; tundler-tunnel re-asserts the same
+# rules after every connect (internal/clusterdns) and expressvpn's
+# prestart before every daemon start. The match is DNS over eth0 towards
+# the cluster CIDR — the traffic the bypass route above already carries,
+# so nothing can slip around the tunnel. It is NOT the resolver's Service
+# IP: Cilium's socket-level load balancing rewrites that to a CoreDNS pod
+# address inside connect(), so a rule on the Service IP never matches.
+# Without a CIDR (local runs) each saved nameserver is matched instead.
+if [[ -n "$TUNDLER_CLUSTER_BYPASS_CIDR" ]]; then
+    DNS_DESTS="$TUNDLER_CLUSTER_BYPASS_CIDR"
+else
+    DNS_DESTS=$(awk '/^nameserver/{print $2}' "$SAVED_RESOLV_CONF" 2>/dev/null)
+fi
+for DEST in $DNS_DESTS; do
+    case "$DEST" in *:*) IPT=ip6tables ;; *) IPT=iptables ;; esac
     for PROTO in udp tcp; do
-        RULE=(-o eth0 -d "$NS" -p "$PROTO" --dport 53 -j ACCEPT)
+        RULE=(-o eth0 -d "$DEST" -p "$PROTO" --dport 53 -j ACCEPT)
         while "$IPT" -w 5 -D OUTPUT "${RULE[@]}" 2>/dev/null; do :; done
         if "$IPT" -w 5 -I OUTPUT 1 "${RULE[@]}" 2>/dev/null; then
-            echo "[tundler-entrypoint] allowed $PROTO DNS to cluster resolver $NS ahead of any provider firewall"
+            echo "[tundler-entrypoint] allowed $PROTO DNS towards $DEST over eth0 ahead of any provider firewall"
         else
-            echo "[tundler-entrypoint] WARNING: could not allow $PROTO DNS to cluster resolver $NS — event sinks may be unreachable behind a provider firewall"
+            echo "[tundler-entrypoint] WARNING: could not allow $PROTO DNS towards $DEST — event sinks may be unreachable behind a provider firewall"
         fi
     done
 done

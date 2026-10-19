@@ -53,9 +53,22 @@ func TestParseNameservers(t *testing.T) {
 	}
 }
 
+func TestDestinationsPrefersClusterCIDR(t *testing.T) {
+	ns := []net.IP{net.ParseIP("10.0.96.10"), net.ParseIP("fd00::53")}
+	if got := Destinations(ns, "10.0.0.0/16"); len(got) != 1 || got[0] != "10.0.0.0/16" {
+		t.Fatalf("with a CIDR got %v", got)
+	}
+	if got := Destinations(ns, ""); len(got) != 2 || got[0] != "10.0.96.10" || got[1] != "fd00::53" {
+		t.Fatalf("without a CIDR got %v", got)
+	}
+	if got := Destinations(ns, "not-a-cidr"); len(got) != 2 {
+		t.Fatalf("with an invalid CIDR got %v", got)
+	}
+}
+
 func TestAllowRemovesStaleCopiesThenInsertsAtHead(t *testing.T) {
 	rec := &recorder{stale: 2}
-	ns := []net.IP{net.ParseIP("10.0.96.10"), net.ParseIP("fd00::53")}
+	ns := []string{"10.0.96.10", "fd00::53"}
 	if err := Allow(context.Background(), ns, rec.run); err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
@@ -84,7 +97,7 @@ func TestAllowRemovesStaleCopiesThenInsertsAtHead(t *testing.T) {
 
 func TestAllowReportsInsertFailures(t *testing.T) {
 	rec := &recorder{failIns: true}
-	err := Allow(context.Background(), []net.IP{net.ParseIP("10.0.96.10")}, rec.run)
+	err := Allow(context.Background(), []string{"10.0.96.10"}, rec.run)
 	if err == nil || !strings.Contains(err.Error(), "udp to 10.0.96.10") || !strings.Contains(err.Error(), "tcp to 10.0.96.10") {
 		t.Fatalf("expected both inserts reported, got %v", err)
 	}
@@ -99,7 +112,7 @@ func TestAllowNoNameserversIsNoop(t *testing.T) {
 
 func TestAllowDeleteLoopIsBounded(t *testing.T) {
 	rec := &recorder{stale: 1000}
-	if err := Allow(context.Background(), []net.IP{net.ParseIP("10.0.96.10")}, rec.run); err != nil {
+	if err := Allow(context.Background(), []string{"10.0.96.10"}, rec.run); err != nil {
 		t.Fatalf("Allow: %v", err)
 	}
 	if len(rec.calls) != 2*(maxDeletes+1) {

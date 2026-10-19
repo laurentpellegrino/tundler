@@ -206,7 +206,7 @@ response-header IP without locking.
 | `ROTATION_ATTEMPT_TIMEOUT_SECONDS`| 20      | per-attempt timeout in `connectWithRetry`                  |
 | `WEDGE_GUARD_THRESHOLD_SECONDS`   | 900     | non-Ready window before `os.Exit(1)` + systemd respawn     |
 | `TUNDLER_CLUSTER_BYPASS_CIDR`     | —       | route /16 around VPN tunnel for in-cluster traffic         |
-| `TUNDLER_CLUSTER_RESOLV_CONF`     | /run/tundler/resolv.conf | saved cluster resolver; event sinks resolve through it and DNS to it is kept allowed ahead of any provider firewall (`internal/clusterdns`), re-asserted after every connect |
+| `TUNDLER_CLUSTER_RESOLV_CONF`     | /run/tundler/resolv.conf | saved cluster resolver; event sinks resolve through it; DNS over eth0 towards the bypass CIDR (or these nameservers without one) is kept allowed ahead of any provider firewall (`internal/clusterdns`), re-asserted after every connect |
 | `POD_NAME`                        | downward| → `x-tundler-tunnel-id` header; ordinal selects the account|
 | `TUNDLER_TUNNEL_NODE_IP`          | —       | → `x-tundler-node-ip` response header                      |
 | `TUNDLER_ACCOUNTS_DIR`            | `/etc/tundler/accounts` | account directories (one per account, one file per field) |
