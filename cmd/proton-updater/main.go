@@ -148,10 +148,13 @@ func runLogin(ctx context.Context, client *apiClient, hvToken, hvType string) {
 	if err != nil {
 		var apiErr *protonAPIError
 		if errors.As(err, &apiErr) && apiErr.isHumanVerification() {
+			// The page shows no code: solving it marks this challenge token as
+			// verified server-side, and the retry replays the same token (as
+			// Proton's own go-proton-api client does).
 			fmt.Fprintf(os.Stderr,
 				"\nProton requires a CAPTCHA. Solve it in a browser:\n  %s\n"+
-					"then re-run from the SAME machine:\n  proton-updater -login -hv-token <token-from-that-page>\n\n",
-				apiErr.verifyURL())
+					"then, soon after and from the SAME machine, re-run:\n  proton-updater -login -hv-token %s\n\n",
+				apiErr.verifyURL(), apiErr.HVToken)
 		}
 		log.Fatalf("login: %v", err)
 	}
