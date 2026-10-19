@@ -46,7 +46,7 @@ jobs:
       RELEASE_TAG: cyberghost-servers
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run DNS sweep
         run: |
