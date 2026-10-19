@@ -65,13 +65,8 @@ type outputServer struct {
 	TCP        bool     `json:"tcp"`
 	UDP        bool     `json:"udp"`
 	IPs        []string `json:"ips"`
-	// ExitIPs is where the server's traffic egresses — what remote sites
-	// see. Not read by the runtime (which dials IPs, the entry side);
-	// kept for exit-IP attribution. Differs from IPs on SecureCore servers
-	// (entry in CH/IS/SE, exit in the destination country), among others.
-	ExitIPs  []string `json:"exit_ips"`
-	Features int      `json:"features"`
-	Tier     int      `json:"tier"`
+	Features   int      `json:"features"`
+	Tier       int      `json:"tier"`
 }
 
 type outputFile struct {
@@ -264,10 +259,6 @@ func transform(data *logicalsResponse) []outputServer {
 			if ip != "" {
 				ips = []string{ip}
 			}
-			exitIPs := []string(nil)
-			if exit := strings.TrimSpace(ps.ExitIP); exit != "" {
-				exitIPs = []string{exit}
-			}
 			out = append(out, outputServer{
 				VPN:        "openvpn",
 				Country:    country,
@@ -278,7 +269,6 @@ func transform(data *logicalsResponse) []outputServer {
 				TCP:        true,
 				UDP:        true,
 				IPs:        ips,
-				ExitIPs:    exitIPs,
 				Features:   ls.Features,
 				Tier:       tier,
 			})
