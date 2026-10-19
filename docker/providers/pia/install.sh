@@ -9,11 +9,13 @@ echo "Fetching latest PIA version..."
 
 # Get the latest version from PIA changelog page with better error handling
 CHANGELOG_URL="https://www.privateinternetaccess.com/pages/changelog"
-LATEST_VERSION=$(curl -s --max-time 30 "${CHANGELOG_URL}" | grep -oP 'pia-linux-\K[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -1 || echo "")
+# Versions are either x.y.z-build (3.7.2-08420) or x.y-build (3.8-08539):
+# the patch component is optional, so accept both shapes.
+LATEST_VERSION=$(curl -s --max-time 30 "${CHANGELOG_URL}" | grep -oP 'pia-linux-\K[0-9]+\.[0-9]+(\.[0-9]+)?-[0-9]+' | head -1 || echo "")
 
 if [ -z "${LATEST_VERSION}" ]; then
     echo "Failed to fetch latest version, falling back to known version"
-    LATEST_VERSION="3.7.2-08420"
+    LATEST_VERSION="3.8-08539"
 fi
 
 echo "Latest PIA version: ${LATEST_VERSION}"
@@ -23,11 +25,11 @@ ARCH=$(uname -m)
 case "${ARCH}" in
     x86_64)
         PIA_URL="https://installers.privateinternetaccess.com/download/pia-linux-${LATEST_VERSION}.run"
-        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-3.7.2-08420.run"
+        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-3.8-08539.run"
         ;;
     aarch64|arm64)
         PIA_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-${LATEST_VERSION}.run"
-        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-3.7.2-08420.run"
+        FALLBACK_URL="https://installers.privateinternetaccess.com/download/pia-linux-arm64-3.8-08539.run"
         ;;
     *)
         echo "Unsupported architecture: ${ARCH}"
