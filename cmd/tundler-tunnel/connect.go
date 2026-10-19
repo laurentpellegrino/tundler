@@ -105,20 +105,28 @@ func ensureLoggedIn(ctx context.Context, prov provider.VPNProvider, providerName
 //	(any) → StateConnecting → (Connect call + exit-IP verify) → StateReady (success)
 //	                                                          → (return error) (failure; caller sets Failed)
 func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string) error {
+	_, err := connectTunnelAt(ctx, prov, state, providerName, excluded, baselineEgressIP)
+	return err
+}
+
+// connectTunnelAt is connectTunnel that also reports the location it
+// tried ("" when no location could be picked), so a retry loop can
+// steer the next attempt away from it.
+func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string) (string, error) {
 	state.Set(StateConnecting)
 	if err := ensureLoggedIn(ctx, prov, providerName); err != nil {
-		return err
+		return "", err
 	}
 	available := prov.Locations(ctx)
 	location, preferredCountry, err := pickPreferredLocation(pref, available, excluded)
 	if err != nil {
-		return fmt.Errorf("pick location for provider=%s (%d available, %d excluded): %w",
+		return "", fmt.Errorf("pick location for provider=%s (%d available, %d excluded): %w",
 			providerName, len(available), len(excluded), err)
 	}
 	log.Printf("tundler-tunnel: provider=%s connecting to location=%s", providerName, location)
 	status := prov.Connect(ctx, location)
 	if !status.Connected {
-		return fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
+		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
 	observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
@@ -129,7 +137,7 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 		// a failure path, and the subsequent retry / fail-and-exit
 		// will fire either way.
 		_ = prov.Disconnect(ctx)
-		return fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
+		return location, fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
 	}
 	exitIP := exitIPOrProbe(status.IP, observed)
 	state.RecordTunnelUp(location, exitIP)
@@ -137,7 +145,7 @@ func connectTunnel(ctx context.Context, prov provider.VPNProvider, state *StateT
 	state.Set(StateReady)
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
 		providerName, location, exitIP)
-	return nil
+	return location, nil
 }
 
 // exitIPOrProbe prefers the provider CLI's self-reported IP, falling back to
@@ -229,8 +237,21 @@ func loginInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state
 // backoff is injected so tests can drive it without real sleeps;
 // production passes bootConnectBackoff.
 func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string, backoff func(attempt int) time.Duration) error {
+	// Locations that failed during this boot are excluded from the
+	// next pick, exactly like connectWithRetry does for rotations.
+	// Without this the region preference — deterministic by design,
+	// and only advanced by completed rotations — re-picked the same
+	// country on every attempt, so one dead preferred server pinned
+	// the pod in Connecting for the whole startup-probe budget
+	// (nordvpn pod 4 on 2026-10-19 retried Montenegro seven times in
+	// a row). Once every location has failed once, the list is
+	// cleared so a provider-wide outage or throttle keeps cycling
+	// instead of ending in errNoAllowedLocations forever.
+	var recentlyFailed []string
 	for attempt := 1; ; attempt++ {
-		err := connectTunnel(ctx, prov, state, providerName, excluded, baselineEgressIP)
+		combined := append([]string(nil), excluded...)
+		combined = append(combined, recentlyFailed...)
+		location, err := connectTunnelAt(ctx, prov, state, providerName, combined, baselineEgressIP)
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("tundler-tunnel: initial connect succeeded on attempt %d (stayed up, no re-login)", attempt)
@@ -239,6 +260,12 @@ func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, sta
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, errNoAllowedLocations) && len(recentlyFailed) > 0 {
+			log.Printf("tundler-tunnel: every one of the %d locations tried this boot failed once; forgetting them and starting over", len(recentlyFailed))
+			recentlyFailed = nil
+		} else if location != "" {
+			recentlyFailed = append(recentlyFailed, location)
 		}
 		wait := backoff(attempt)
 		log.Printf("tundler-tunnel: initial connect attempt %d failed: %v; retrying in %s (staying up, no re-login)",
