@@ -144,6 +144,14 @@ func configureDaemon(ctx context.Context) {
 	// the pod talk to its sibling slot-controller via cluster DNS);
 	// firewall off because we manage iptables ourselves; meshnet/
 	// notify off to skip the eager remote-config fetch.
+	//
+	// NordLynx is requested twice on purpose: the 5.x CLI selects it
+	// with `set technology NordLynx`, while 6.0 (changelog 6.0.0,
+	// PR NordSecurity/nordvpn-linux#1841) removes `set technology`
+	// and folds the choice into `set protocol nordlynx`. Each
+	// spelling is rejected by the other version, so issuing both
+	// (quiet, best-effort) keeps the image working across the
+	// vendor's stable-repo cut-over without a rebuild.
 	for _, args := range [][]string{
 		{"set", "analytics", "disabled"},
 		{"set", "autoconnect", "disabled"},
@@ -152,14 +160,25 @@ func configureDaemon(ctx context.Context) {
 		{"set", "meshnet", "off"},
 		{"set", "notify", "off"},
 		{"set", "pq", "on"},
-		{"set", "technology", "NordLynx"},
+		{"set", "technology", "NordLynx"}, // nordvpn <= 5.x
+		{"set", "protocol", "nordlynx"},   // nordvpn >= 6.0
 	} {
 		quiet(ctx, args...)
 	}
 }
 
 func (n NordVPN) Logout(ctx context.Context) error {
-	_, err := shared.RunCmd(ctx, bin, "logout", "--persist-token")
+	// nordvpn <= 5.x: `logout` REVOKES the token (which every pod of
+	// this provider shares) unless --persist-token is given. 6.0 flips
+	// the default: plain `logout` keeps the token, --revoke-token
+	// revokes it, and --persist-token is rejected as an unknown flag
+	// before the daemon is contacted. Fall back to the 6.0 spelling on
+	// that specific rejection only — never on other failures, where a
+	// plain `logout` against a 5.x CLI would revoke the fleet's token.
+	out, err := shared.RunCmd(ctx, bin, "logout", "--persist-token")
+	if err != nil && strings.Contains(out, "flag provided but not defined") {
+		_, err = shared.RunCmd(ctx, bin, "logout")
+	}
 	return err
 }
 
