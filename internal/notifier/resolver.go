@@ -56,6 +56,11 @@ type clusterResolver struct {
 	// does a fresh lookup first, so a recreated Service is picked up on
 	// the next emit; the cache is only ever a fallback.
 	lastGood sync.Map // host -> []net.IPAddr
+	// repair runs when a lookup fails before the one retry: it re-asserts
+	// the cluster-DNS firewall exception (clusterdns.Ensure), because a
+	// provider that prepends its firewall jump a moment after reporting
+	// "connected" can overtake the tunnel-up re-assert.
+	repair func(context.Context)
 }
 
 // loadClusterResolver reads the saved resolver config and returns nil when
@@ -79,6 +84,7 @@ func newClusterResolver(source string, nameservers []string) *clusterResolver {
 		source:      source,
 		nameservers: nameservers,
 		dialer:      &net.Dialer{Timeout: dnsDialTimeout},
+		repair:      clusterdns.Ensure,
 	}
 	r := &net.Resolver{
 		PreferGo: true,
@@ -118,6 +124,14 @@ func (c *clusterResolver) dialContext(ctx context.Context, network, addr string)
 	addrs, err := c.lookup(ctx, host)
 	if err == nil && len(addrs) == 0 {
 		err = errors.New("no addresses")
+	}
+	if err != nil && c.repair != nil {
+		log.Printf("notifier: resolve %s via cluster nameservers %v failed (%v); re-asserting the cluster-DNS firewall exception and retrying once", host, c.nameservers, err)
+		c.repair(ctx)
+		addrs, err = c.lookup(ctx, host)
+		if err == nil && len(addrs) == 0 {
+			err = errors.New("no addresses")
+		}
 	}
 	if err != nil {
 		cached, ok := c.lastGood.Load(host)
