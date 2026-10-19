@@ -8,8 +8,10 @@ import (
 // fixedNow pins the epoch so every subtest shares one country ordering.
 var fixedNow = func() time.Time { return time.Unix(1_770_000_000, 0) }
 
+// newTestPref models pod `slot` of a single provider block that spans
+// the whole fleet (base 0, ordinal = slot).
 func newTestPref(slot, slots int) *locationPreference {
-	return &locationPreference{slot: slot, slots: slots, now: fixedNow}
+	return &locationPreference{base: 0, ordinal: slot, slot: slot, slots: slots, now: fixedNow}
 }
 
 // multiCountryCatalog is a provider offering a handful of mappable
@@ -19,22 +21,47 @@ var multiCountryCatalog = []string{
 	"Netherlands", "United_States", "auto",
 }
 
-func TestPickEvenSpreadStartsDiffer(t *testing.T) {
-	// With as many slots as countries on offer, distinct slots must not
-	// all converge on one country: the evenly-spaced starting offsets
-	// should spread the picks. (Not every pair differs — ring walks can
-	// land neighbors on the same country when the catalog is sparse —
-	// but ALL landing identically would mean the offsets do nothing.)
+func TestPickSiblingsTakeDistinctCountries(t *testing.T) {
+	// With as many pods as countries on offer (7 mappable entries in
+	// the catalog), every sibling must land on its own country: pods
+	// index the ring-ordered offered list by ordinal, so collisions
+	// only happen once the catalog runs out.
 	seen := map[string]bool{}
-	for slot := 0; slot < 7; slot++ {
-		_, cc, ok := newTestPref(slot, 7).pick(multiCountryCatalog, nil)
+	for ordinal := 0; ordinal < 7; ordinal++ {
+		_, cc, ok := newTestPref(ordinal, 7).pick(multiCountryCatalog, nil)
 		if !ok {
-			t.Fatalf("slot %d: no preferred country", slot)
+			t.Fatalf("ordinal %d: no preferred country", ordinal)
 		}
 		seen[cc] = true
 	}
-	if len(seen) < 3 {
-		t.Fatalf("7 slots collapsed onto %d countries (%v) — offsets not spreading", len(seen), seen)
+	if len(seen) != 7 {
+		t.Fatalf("7 siblings landed on %d countries (%v) — want 7 distinct", len(seen), seen)
+	}
+	// One more pod than countries wraps onto the first pick.
+	_, first, _ := newTestPref(0, 8).pick(multiCountryCatalog, nil)
+	_, eighth, _ := newTestPref(7, 8).pick(multiCountryCatalog, nil)
+	if first != eighth {
+		t.Fatalf("ordinal 7 of 8 should wrap onto ordinal 0's country %q, got %q", first, eighth)
+	}
+}
+
+func TestPickSparseCatalogStillSpreads(t *testing.T) {
+	// The production case that motivated the ordinal index: a provider
+	// block of 7 adjacent fleet slots (base 26 of 81) over a catalog of
+	// 17 countries drawn from a 146-country ring. Walking the full ring
+	// from each slot collapsed them onto 2 countries.
+	catalog := []string{"AT", "CA", "CH", "DE", "DK", "ES", "FI", "FR", "GB", "IT", "NL", "NO", "PL", "RO", "SE", "UA", "US"}
+	seen := map[string]bool{}
+	for ordinal := 0; ordinal < 7; ordinal++ {
+		p := &locationPreference{base: 26, ordinal: ordinal, slot: 26 + ordinal, slots: 81, now: fixedNow}
+		_, cc, ok := p.pick(catalog, nil)
+		if !ok {
+			t.Fatalf("ordinal %d: no preferred country", ordinal)
+		}
+		seen[cc] = true
+	}
+	if len(seen) != 7 {
+		t.Fatalf("7 siblings over 17 countries landed on %d (%v)", len(seen), seen)
 	}
 }
 
@@ -86,11 +113,8 @@ func TestAdvanceShiftsPick(t *testing.T) {
 	p := newTestPref(0, 1)
 	_, before, _ := p.pick(multiCountryCatalog, nil)
 	changed := false
-	// Each advance moves the ring cursor one COUNTRY position, and most
-	// positions belong to countries the provider doesn't offer — the
-	// walk then lands on the same next-offered country. The pick is
-	// guaranteed to move only once the cursor passes it, so allow a
-	// full ring traversal.
+	// Each advance moves to the next OFFERED country, so the pick
+	// changes on the first step; the loop bound is just slack.
 	for i := 0; i < 300 && !changed; i++ {
 		p.advance()
 		if _, after, _ := p.pick(multiCountryCatalog, nil); after != before {
@@ -121,7 +145,7 @@ func TestNewLocationPreferenceFromEnv(t *testing.T) {
 	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "10")
 	t.Setenv("TUNDLER_FLEET_SLOTS", "20")
 	p := newLocationPreferenceFromEnv()
-	if p == nil || p.slot != 12 || p.slots != 20 {
+	if p == nil || p.slot != 12 || p.slots != 20 || p.base != 10 || p.ordinal != 2 {
 		t.Fatalf("pref = %+v, want slot 12 (base 10 + ordinal 2) of 20", p)
 	}
 
