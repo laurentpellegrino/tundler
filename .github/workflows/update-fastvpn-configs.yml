@@ -41,7 +41,7 @@ jobs:
       RELEASE_TAG: fastvpn-configs
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Build UDP-only configs zip
         run: |
