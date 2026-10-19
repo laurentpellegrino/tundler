@@ -44,6 +44,63 @@ func TestConnectInitialWithRetry_RetriesUntilSuccess(t *testing.T) {
 	}
 }
 
+// TestConnectInitialWithRetry_SkipsFailedLocation verifies a location that
+// failed during boot is not picked again on the next attempt: with one
+// dead location and one live one, the live one is reached without ever
+// retrying the dead one (the region preference would otherwise re-pick
+// the same country forever).
+func TestConnectInitialWithRetry_SkipsFailedLocation(t *testing.T) {
+	fp := &fakeProvider{
+		locations:     []string{"Bahrain", "USA"},
+		connectIP:     "1.2.3.4",
+		connectOK:     true,
+		failLocations: map[string]bool{"Bahrain": true},
+	}
+	st := NewStateTracker("fake")
+	if err := connectInitialWithRetry(context.Background(), fp, st, "fake", nil, "", noBootBackoff); err != nil {
+		t.Fatalf("connectInitialWithRetry: %v", err)
+	}
+	fp.mu.Lock()
+	calls := append([]string(nil), fp.calls...)
+	fp.mu.Unlock()
+	if len(calls) > 2 || calls[len(calls)-1] != "USA" {
+		t.Fatalf("Connect calls = %v, want the dead location at most once then USA", calls)
+	}
+}
+
+// TestConnectInitialWithRetry_ResetsAfterAllLocationsFailed verifies the
+// boot loop keeps cycling through locations when all of them fail (a
+// provider-wide outage or connect throttle) instead of running out of
+// allowed locations: once every location failed once, the failed list is
+// cleared and the next attempts try them again.
+func TestConnectInitialWithRetry_ResetsAfterAllLocationsFailed(t *testing.T) {
+	fp := &fakeProvider{
+		locations:     []string{"A", "B"},
+		connectIP:     "1.2.3.4",
+		connectOK:     true,
+		failLocations: map[string]bool{"A": true, "B": true},
+	}
+	// The third Connect call can only happen after both locations failed
+	// once and the failed list was cleared; it clears the outage so the
+	// fourth call succeeds.
+	fp.onConnect = func(string) {
+		if fp.callCount() == 3 {
+			fp.mu.Lock()
+			fp.failLocations = nil
+			fp.mu.Unlock()
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st := NewStateTracker("fake")
+	if err := connectInitialWithRetry(ctx, fp, st, "fake", nil, "", noBootBackoff); err != nil {
+		t.Fatalf("connectInitialWithRetry: %v (the loop must cycle, not exhaust the location pool)", err)
+	}
+	if got := fp.callCount(); got != 4 {
+		t.Errorf("Connect called %d times, want 4 (A, B, one after the reset, success)", got)
+	}
+}
+
 // TestLoginInitialWithRetry_RetriesUntilSuccess verifies boot login keeps
 // retrying IN-PROCESS (never exits) until a Login succeeds, and records an
 // auth failure for each failed attempt. This is the fix for the 700+ restart
