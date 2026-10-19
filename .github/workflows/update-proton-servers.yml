@@ -18,12 +18,16 @@ name: Update ProtonVPN servers
 #   - SRP code stays out of production — auth happens here only,
 #     not on the tunnel pods.
 #
-# Auth: the Proton session (uid + refresh token) lives in GitHub
-# Actions secrets. Proton ROTATES the refresh token on every use,
-# so after each run the rotated token is written back via
-# `gh secret set`, which needs GH_SECRETS_PAT (fine-grained PAT,
-# Secrets read/write on this repo) — the default GITHUB_TOKEN
-# cannot modify repo secrets. Seed/re-seed the session with
+# Auth: the Proton session (uid + refresh token) lives in OpenBao at
+# lpellegr/kv/vpn/proton/session. vault-action exchanges this
+# workflow's GitHub OIDC token for a short-lived OpenBao token via
+# the `tundler` role, bound to this repo's main branch so forks and
+# PR runs can't obtain it. Proton ROTATES the refresh token on every
+# use, so after each run the rotated token is written back with that
+# same token — the role's policy grants read/write on that single
+# path only. Role + policy are managed by
+# elaunira-openbao/scripts/configure-github-jwt.sh (SCOPED_ROLES
+# "lpellegr|tundler"). Seed/re-seed the session with
 # `proton-updater -login` (see cmd/proton-updater).
 
 on:
@@ -36,6 +40,7 @@ on:
 
 permissions:
   contents: write   # upload to the GH release
+  id-token: write   # for vault-action JWT auth
 
 concurrency:
   group: update-proton-servers
@@ -60,13 +65,27 @@ jobs:
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
 
+      - name: Fetch ProtonVPN session from OpenBao
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://bao.elaunira.com
+          method: jwt
+          path: github-actions
+          role: tundler
+          namespace: lpellegr
+          jwtGithubAudience: https://github.com/laurentpellegrino
+          # Export the short-lived OpenBao token so the write-back step can
+          # persist the rotated refresh token.
+          exportToken: true
+          secrets: |
+            kv/data/vpn/proton/session uid | PROTON_SESSION_UID ;
+            kv/data/vpn/proton/session refresh_token | PROTON_SESSION_REFRESH_TOKEN
+
       - name: Run proton-updater
         env:
           # Refresh mode: reuse the stored session (no SRP login → no CAPTCHA).
           # The (possibly rotated) refresh token is written here for write-back.
           PROTON_SESSION_OUT: /tmp/proton-session.json
-          PROTON_SESSION_UID: ${{ secrets.PROTON_SESSION_UID }}
-          PROTON_SESSION_REFRESH_TOKEN: ${{ secrets.PROTON_SESSION_REFRESH_TOKEN }}
         run: |
           set -euo pipefail
           go run ./cmd/proton-updater > /tmp/servers.json
@@ -74,26 +93,32 @@ jobs:
           # non-JSON if the API path ever returns one despite exit 0).
           python3 -c "import json; d=json.load(open('/tmp/servers.json')); assert d.get('protonvpn', {}).get('servers'), 'no servers in response'; print(f'fetched {len(d[\"protonvpn\"][\"servers\"])} server entries')"
 
-      - name: Persist rotated session to repo secrets
+      - name: Persist rotated session to OpenBao
         if: always()
-        env:
-          # Fine-grained PAT with Secrets read/write on this repo — the
-          # default GITHUB_TOKEN cannot modify Actions secrets.
-          GH_TOKEN: ${{ secrets.GH_SECRETS_PAT }}
         run: |
           set -euo pipefail
           if [[ ! -f /tmp/proton-session.json ]]; then
             echo "no rotated session file (refresh did not run); skipping write-back"
             exit 0
           fi
-          NEW_UID=$(jq -r .uid /tmp/proton-session.json)
-          NEW_RT=$(jq -r .refresh_token /tmp/proton-session.json)
-          echo "::add-mask::$NEW_RT"
+          if [[ -z "${VAULT_TOKEN:-}" ]]; then
+            # Without write-back the rotated token is lost and every later
+            # run fails with 401 until a manual re-seed.
+            echo "::error::no OpenBao token — cannot persist the rotated Proton refresh token"
+            exit 1
+          fi
+          echo "::add-mask::$(jq -r .refresh_token /tmp/proton-session.json)"
           # Proton rotates the refresh token on use; persist it or the next
-          # run's stored token is already consumed and refresh fails.
-          gh secret set PROTON_SESSION_UID --repo "$GITHUB_REPOSITORY" --body "$NEW_UID"
-          gh secret set PROTON_SESSION_REFRESH_TOKEN --repo "$GITHUB_REPOSITORY" --body "$NEW_RT"
-          echo "Rotated session persisted to repo secrets."
+          # run's stored token is already consumed and refresh fails. KV v2
+          # write — the path holds only the session, so a full overwrite is
+          # safe.
+          jq '{data: {uid, refresh_token}}' /tmp/proton-session.json \
+            | curl -sS --fail-with-body \
+                -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                -H "X-Vault-Namespace: lpellegr" \
+                -X POST https://bao.elaunira.com/v1/kv/data/vpn/proton/session \
+                --data @- >/dev/null
+          echo "Rotated session persisted to OpenBao."
 
       - name: Skip when checksum matches current release
         id: skip
