@@ -28,6 +28,8 @@ type fakeProvider struct {
 
 	noLocations bool // when true, Locations() returns nil to force pick-fail
 
+	failLocations map[string]bool // Connect(location) fails for these, whatever connectOK says
+
 	disconnectCalls   atomic.Int32 // number of Disconnect() invocations
 	disconnectCtxErrd atomic.Bool  // true if any Disconnect saw a cancelled ctx
 
@@ -47,7 +49,7 @@ func (f *fakeProvider) Connect(_ context.Context, location string) provider.Stat
 	f.mu.Lock()
 	f.calls = append(f.calls, location)
 	hook := f.onConnect
-	ok := f.connectOK
+	ok := f.connectOK && !f.failLocations[location]
 	ip := f.connectIP
 	f.mu.Unlock()
 	if hook != nil {

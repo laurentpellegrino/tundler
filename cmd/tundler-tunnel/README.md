@@ -143,6 +143,12 @@ Two triggers, one path:
   bucket; when it decides to rotate, it POSTs straight to this pod's
   `:4242/rotate` via the headless-service DNS — no aggregator hop.
 
+Both the boot connect loop and the rotation loop remember the locations
+that failed and pick a different one next time (the boot loop forgets
+them once every location failed once, so a provider-wide outage keeps
+cycling); with the region preference on, that moves the pod to the next
+country the provider offers.
+
 Both go through `rotateIfReady`. State transitions
 Ready → Draining (proxy stops accepting new CONNECTs) →
 Rotating (Disconnect + Connect with up to `ROTATION_RETRY_MAX`
