@@ -557,7 +557,6 @@ type physicalServer struct {
 	ID         string `json:"ID"`
 	Domain     string `json:"Domain"`
 	EntryIP    string `json:"EntryIP"`
-	ExitIP     string `json:"ExitIP"`
 	Status     int    `json:"Status"`
 	Generation int    `json:"Generation"`
 }
