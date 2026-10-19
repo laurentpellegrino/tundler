@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/accounts"
+	"github.com/laurentpellegrino/tundler/internal/clusterdns"
 	"github.com/laurentpellegrino/tundler/internal/notifier"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	_ "github.com/laurentpellegrino/tundler/internal/provider/register"
@@ -169,10 +170,17 @@ func main() {
 		}, true
 	})
 
+	// Keep the cluster resolver reachable: asserted once now (the
+	// entrypoint already did, this covers a bare `tundler-tunnel` restart)
+	// and again after every connect, which is when a provider such as
+	// ExpressVPN re-arms the firewall that would otherwise reject the
+	// event hook's DNS lookups. See internal/clusterdns.
+	clusterdns.Ensure(ctx)
 	state.SetTunnelUpListener(func(exitIP string) {
 		// In-process pointer swap — read by proxy.handle on every
 		// subsequent CONNECT, no IPC, no file IO.
 		proxySrv.SetExitIP(exitIP)
+		clusterdns.Ensure(ctx)
 		if notifEnabled {
 			// Fire a fresh-exit-IP event without blocking this listener.
 			notif.OnTunnelUp()

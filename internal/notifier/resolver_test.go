@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/laurentpellegrino/tundler/internal/clusterdns"
 )
 
 func TestParseNameservers(t *testing.T) {
@@ -33,7 +35,7 @@ func TestLoadClusterResolver(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "resolv.conf")
 
-	t.Setenv(envClusterResolvConf, path)
+	t.Setenv(clusterdns.EnvResolvConf, path)
 	if c := loadClusterResolver(); c != nil {
 		t.Fatalf("expected nil resolver for a missing file, got %v", c.nameservers)
 	}
@@ -123,5 +125,32 @@ func TestDialContextLookupFailure(t *testing.T) {
 	_, err := c.dialContext(context.Background(), "tcp", "collector.svc.cluster.local:8080")
 	if err == nil || !strings.Contains(err.Error(), "10.0.96.10:53") || !strings.Contains(err.Error(), "no such host") {
 		t.Fatalf("expected a lookup error naming the nameserver, got %v", err)
+	}
+}
+
+func TestDialContextFallsBackToLastGoodAnswer(t *testing.T) {
+	_, port := listen(t)
+	c := newClusterResolver("test", []string{"10.0.96.10:53"})
+	fail := false
+	c.lookup = func(context.Context, string) ([]net.IPAddr, error) {
+		if fail {
+			return nil, errors.New("write udp: operation not permitted")
+		}
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	conn, err := c.dialContext(context.Background(), "tcp", "collector.svc.cluster.local:"+port)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	conn.Close()
+	fail = true
+	conn, err = c.dialContext(context.Background(), "tcp", "collector.svc.cluster.local:"+port)
+	if err != nil {
+		t.Fatalf("dial after lookup failure should use the last good answer: %v", err)
+	}
+	conn.Close()
+	// A host that never resolved still fails.
+	if _, err := c.dialContext(context.Background(), "tcp", "other.svc.cluster.local:"+port); err == nil {
+		t.Fatal("expected an error for a host with no cached answer")
 	}
 }

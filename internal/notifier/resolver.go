@@ -1,17 +1,19 @@
 package notifier
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sort"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/laurentpellegrino/tundler/internal/clusterdns"
 )
 
 // Cluster-resolver pinning.
@@ -34,10 +36,8 @@ import (
 // the file (local dev, non-Kubernetes hosts) the boot-time pin remains
 // the fallback.
 const (
-	envClusterResolvConf     = "TUNDLER_CLUSTER_RESOLV_CONF"
-	defaultClusterResolvConf = "/run/tundler/resolv.conf"
-	dnsPort                  = "53"
-	dnsDialTimeout           = 3 * time.Second
+	dnsPort        = "53"
+	dnsDialTimeout = 3 * time.Second
 )
 
 type lookupFunc func(ctx context.Context, host string) ([]net.IPAddr, error)
@@ -50,15 +50,18 @@ type clusterResolver struct {
 	lookup      lookupFunc
 	dialer      *net.Dialer
 	next        atomic.Uint32
+	// lastGood remembers the last successful answer per host so a
+	// transient resolver failure (a provider firewall briefly in the way,
+	// a CoreDNS pod restarting) does not drop the event. Every dial still
+	// does a fresh lookup first, so a recreated Service is picked up on
+	// the next emit; the cache is only ever a fallback.
+	lastGood sync.Map // host -> []net.IPAddr
 }
 
 // loadClusterResolver reads the saved resolver config and returns nil when
 // there is none (file absent, unreadable or without nameservers).
 func loadClusterResolver() *clusterResolver {
-	path := strings.TrimSpace(os.Getenv(envClusterResolvConf))
-	if path == "" {
-		path = defaultClusterResolvConf
-	}
+	path := clusterdns.ResolvConfPath()
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -95,26 +98,8 @@ func newClusterResolver(source string, nameservers []string) *clusterResolver {
 // deduplicated and in file order, each as host:port.
 func parseNameservers(r io.Reader) []string {
 	var servers []string
-	seen := map[string]bool{}
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if i := strings.IndexAny(line, "#;"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 || fields[0] != "nameserver" {
-			continue
-		}
-		ip := net.ParseIP(fields[1])
-		if ip == nil {
-			continue
-		}
-		addr := net.JoinHostPort(ip.String(), dnsPort)
-		if !seen[addr] {
-			seen[addr] = true
-			servers = append(servers, addr)
-		}
+	for _, ip := range clusterdns.ParseNameservers(r) {
+		servers = append(servers, net.JoinHostPort(ip.String(), dnsPort))
 	}
 	return servers
 }
@@ -131,11 +116,18 @@ func (c *clusterResolver) dialContext(ctx context.Context, network, addr string)
 		return c.dialer.DialContext(ctx, network, addr)
 	}
 	addrs, err := c.lookup(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s via cluster nameservers %v: %w", host, c.nameservers, err)
+	if err == nil && len(addrs) == 0 {
+		err = errors.New("no addresses")
 	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("resolve %s via cluster nameservers %v: no addresses", host, c.nameservers)
+	if err != nil {
+		cached, ok := c.lastGood.Load(host)
+		if !ok {
+			return nil, fmt.Errorf("resolve %s via cluster nameservers %v: %w", host, c.nameservers, err)
+		}
+		addrs = cached.([]net.IPAddr)
+		log.Printf("notifier: resolve %s via cluster nameservers %v failed (%v); using last known %v", host, c.nameservers, err, addrs)
+	} else {
+		c.lastGood.Store(host, addrs)
 	}
 	sort.SliceStable(addrs, func(i, j int) bool {
 		return addrs[i].IP.To4() != nil && addrs[j].IP.To4() == nil
