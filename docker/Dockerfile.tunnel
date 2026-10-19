@@ -8,7 +8,7 @@
 # Build:
 #   docker build -f docker/Dockerfile.tunnel \
 #       --build-arg PROVIDER=expressvpn \
-#       -t laurentpellegrino/tundler-expressvpn:latest .
+#       -t ghcr.io/laurentpellegrino/tundler-expressvpn:latest .
 #
 # See cmd/tundler-tunnel/README.md for the full design.
 
@@ -27,7 +27,7 @@ ARG BASE_IMAGE=ubuntu:24.04
 # provider's go:embed'd data (e.g. protonvpn's servers.json) out of
 # every OTHER provider's image.
 # ----------------------------------------------------------------------
-FROM golang:1.25 AS builder
+FROM golang:1.26 AS builder
 WORKDIR /build
 ARG PROVIDER
 RUN if [ -z "${PROVIDER}" ]; then \
