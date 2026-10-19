@@ -44,7 +44,7 @@ jobs:
       RELEASE_TAG: ipvanish-configs
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
