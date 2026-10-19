@@ -219,8 +219,11 @@ failures on `/status` — a projected Secret updates in place, so fixing
 it heals the pod with zero restarts and zero logins. `/status` reports
 `account_id` + `account_source` (`dir`|`env`|`legacy`).
 
-When the fleet-slot env is present, location picks prefer the first
-country of an epoch-shuffled shared ordering (walked from this pod's
-offset) that the provider actually offers; every rotation advances the
-walk one position. Any miss falls back to the uniform-random pick —
+When the fleet-slot env is present, location picks prefer a country
+from an epoch-shuffled shared ordering: the provider's block start
+(`TUNDLER_FLEET_SLOT_BASE / TUNDLER_FLEET_SLOTS` of the ring) fixes
+where the provider begins, and pod ordinal *n* takes the *n*-th country
+the provider offers from there, so siblings get distinct countries
+until the catalog runs out; every rotation advances a pod one offered
+country. Any miss falls back to the uniform-random pick —
 `preferred_country` is empty on `/status` when the fallback won.
