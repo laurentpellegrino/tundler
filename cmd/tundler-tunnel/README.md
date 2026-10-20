@@ -216,8 +216,8 @@ response-header IP without locking.
 | `TUNDLER_FLEET_SLOTS`             | —       | fleet-wide pod total; with SLOT_BASE enables the soft region spread |
 | `TUNDLER_FLEET_REPLICAS`          | 1       | this provider's pod count: the stride each rotation advances along the offered list |
 | `TUNDLER_COUNTRY_DWELL`           | 4       | rotations spent in one country before the walk advances (`0` = every rotation) |
-| `TUNDLER_EXIT_MEMORY`             | 24h     | exit IPs remembered; a rotation landing on one cools its location and country (`0` disables) |
-| `TUNDLER_BLOCKED_COOLDOWN`        | 6h      | how long an exhausted location and country stay skipped (`0` disables) |
+| `TUNDLER_EXIT_MEMORY`             | 1h      | exit prefixes (/24, IPv6 /48) remembered; a rotation landing in one cools its location and country and retries elsewhere (`0` disables) |
+| `TUNDLER_BLOCKED_COOLDOWN`        | 1h      | how long a spent location and country stay skipped (`0` disables) |
 
 ## Accounts & region preference
 
@@ -245,10 +245,13 @@ when the fallback won.
 A rotation does not advance the walk by itself: the pod re-picks in
 the same country (avoiding the location it just left when there is
 another) for up to `TUNDLER_COUNTRY_DWELL` rotations. The walk moves
-on earlier when a rotation lands on an exit IP this pod already used
-within `TUNDLER_EXIT_MEMORY`: that location and country are cooled for
-`TUNDLER_BLOCKED_COOLDOWN`, the preferred walk skips cooled entries by
-moving further along the pod's own positions, the random fallback
-excludes cooled locations, and a fully cooled catalog ignores the
-cool-down. `POST /rotate` with `{"reason":"..."}` (or `?reason=`) is
+on earlier when a rotation lands in an exit prefix (/24, IPv6 /48)
+this pod already used within `TUNDLER_EXIT_MEMORY` — upstream quotas
+are per prefix, so a second address from the same /24 is throttled
+within minutes: that location and country are cooled for
+`TUNDLER_BLOCKED_COOLDOWN`, the rotation disconnects and retries in
+the next country while it has attempts left (the last attempt keeps
+what it got), the preferred walk skips cooled entries by moving
+further along the pod's own positions, the random fallback excludes
+cooled locations, and a fully cooled catalog ignores the cool-down. `POST /rotate` with `{"reason":"..."}` (or `?reason=`) is
 logged only.
