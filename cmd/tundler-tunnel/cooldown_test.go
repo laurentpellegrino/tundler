@@ -99,8 +99,20 @@ func TestExitMemoryRepeatAndExpiry(t *testing.T) {
 	if !m.remember("1.1.1.1") {
 		t.Fatal("second sight within ttl is a repeat")
 	}
+	if !m.remember("1.1.1.200") {
+		t.Fatal("another address in the same /24 is a repeat")
+	}
+	if m.remember("1.1.2.1") {
+		t.Fatal("a different /24 is not a repeat")
+	}
 	if m.remember("") {
 		t.Fatal("empty exit is never a repeat")
+	}
+	if m.remember("2001:db8:1::1") || !m.remember("2001:db8:1:ffff::9") || m.remember("2001:db8:2::1") {
+		t.Fatal("IPv6 exits are remembered by /48")
+	}
+	if m.remember("not-an-ip") || !m.remember("not-an-ip") {
+		t.Fatal("unparseable exits fall back to exact-match memory")
 	}
 	now = now.Add(time.Hour)
 	if m.remember("1.1.1.1") {
@@ -108,6 +120,9 @@ func TestExitMemoryRepeatAndExpiry(t *testing.T) {
 	}
 	if m.size() != 1 {
 		t.Fatalf("size = %d, want 1", m.size())
+	}
+	if exitKey("1.2.3.4") != "1.2.3.0/24" || exitKey("::ffff:1.2.3.4") != "1.2.3.0/24" || exitKey("2001:db8:1:2::3") != "2001:db8:1::/48" {
+		t.Fatalf("exitKey: %s %s %s", exitKey("1.2.3.4"), exitKey("::ffff:1.2.3.4"), exitKey("2001:db8:1:2::3"))
 	}
 	var none *exitMemory
 	if none.remember("1.1.1.1") || newExitMemory(0).remember("x") || newExitMemory(0).remember("x") {
@@ -200,10 +215,12 @@ func TestConnectWithRetryRepeatExitIsDetected(t *testing.T) {
 	exits = newExitMemory(time.Hour)
 	pref = nil
 
-	sp := newScriptedProvider([]string{"USA"}, []bool{true, true}, []string{"2.2.2.2", "2.2.2.2"})
+	// Second rotation lands in the /24 of the first; the retry must go
+	// somewhere else (Canada, the only other location) and succeed.
+	sp := newScriptedProvider([]string{"USA", "Canada"}, []bool{true, true, true}, []string{"2.2.2.2", "2.2.2.9", "3.3.3.3"})
 	st := NewStateTracker("scripted")
 	ns := &noSleep{}
-	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", []string{"Canada"}, 3, ns.sleep, ""); err != nil {
 		t.Fatalf("first rotation: %v", err)
 	}
 	if blocked.cooledLocation("USA") {
@@ -213,10 +230,37 @@ func TestConnectWithRetryRepeatExitIsDetected(t *testing.T) {
 		t.Fatalf("second rotation: %v", err)
 	}
 	if !blocked.cooledLocation("USA") || !blocked.cooledCountry("US") {
-		t.Fatal("second rotation on the same exit must cool USA")
+		t.Fatal("a rotation into the same /24 must cool USA")
 	}
-	if st.Get() != StateReady {
-		t.Fatalf("tunnel must be kept on a repeat exit, state = %s", st.Get())
+	if sp.attemptCount() != 3 || sp.callsByLocation["Canada"] != 1 {
+		t.Fatalf("burnt prefix must be retried elsewhere: attempts=%d calls=%v", sp.attemptCount(), sp.callsByLocation)
+	}
+	snap := st.Snapshot()
+	if st.Get() != StateReady || snap.CurrentExitIP != "3.3.3.3" || snap.CurrentLocation != "Canada" {
+		t.Fatalf("retry must leave the pod Ready on the fresh exit: state=%s snapshot=%+v", st.Get(), snap)
+	}
+}
+
+func TestConnectWithRetryKeepsBurntExitOnLastAttempt(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	pref = nil
+
+	sp := newScriptedProvider([]string{"USA"}, []bool{true, true}, []string{"2.2.2.2", "2.2.2.9"})
+	st := NewStateTracker("scripted")
+	ns := &noSleep{}
+	for i := 0; i < 2; i++ {
+		if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 1, ns.sleep, ""); err != nil {
+			t.Fatalf("rotation %d: %v", i+1, err)
+		}
+	}
+	if !blocked.cooledLocation("USA") {
+		t.Fatal("the repeat still cools USA")
+	}
+	if snap := st.Snapshot(); st.Get() != StateReady || snap.CurrentExitIP != "2.2.2.9" {
+		t.Fatalf("with no attempt left the burnt exit is kept: state=%s snapshot=%+v", st.Get(), snap)
 	}
 }
 

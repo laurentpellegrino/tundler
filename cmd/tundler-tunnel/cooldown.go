@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -16,17 +17,21 @@ import (
 // and could re-pick the same location (random fallback, small
 // catalogs, watchdog reconnects) or the same country minutes later.
 //
-// A /rotate carrying `reason=blocked` now puts the current location
-// AND its country on a cool-down list. Picks skip cooled entries for
-// TUNDLER_BLOCKED_COOLDOWN (default 6h) — long enough to outlive the
-// crawler's own pause and the next few rotations, short enough that a
-// provider with a tiny catalog gets its countries back the same day.
-// Siblings keep their own lists: no coordination, same as the region
-// preference. When everything on offer is cooled the cool-down is
-// ignored rather than leaving the pod without a location.
+// A rotation that lands on a burnt prefix (see exitMemory) puts the
+// location AND its country on a cool-down list. Picks skip cooled
+// entries for TUNDLER_BLOCKED_COOLDOWN (default 1h): on the ExpressVPN
+// fleet a throttled /24 served at full rate again after a 30-40 min
+// gap, while shorter gaps were still throttled, so an hour outlives
+// the quota window without hiding a pod's whole residue class behind
+// cool-downs (each class holds ~13 countries and a small country is
+// left after one exit; at 6h the class ran dry and the walk fell back
+// to the whole list, colliding with siblings). Siblings keep their own
+// lists: no coordination, same as the region preference. When
+// everything on offer is cooled the cool-down is ignored rather than
+// leaving the pod without a location.
 const (
 	envBlockedCooldown     = "TUNDLER_BLOCKED_COOLDOWN"
-	defaultBlockedCooldown = 6 * time.Hour
+	defaultBlockedCooldown = time.Hour
 )
 
 type locationCooldown struct {
@@ -145,22 +150,47 @@ func (c *locationCooldown) purgeLocked() {
 
 // Exit memory.
 //
-// Pool size is what decides whether a country is worth staying in, and
-// the pod can measure it: a rotation that lands on an exit IP this pod
-// already used within TUNDLER_EXIT_MEMORY (default 24h) means the
-// provider has run out of fresh addresses there. That repeat — not the
-// crawler's 429s, which hit a single throttled IP in a big pool just as
-// well — is the signal that cools a country and moves the walk on.
+// The upstream the crawler hits meters by prefix, not by address: on
+// 2026-10-20 the first ExpressVPN exit in a /24 crawled at full rate
+// for a median 14 min, every later exit from the same /24 was back at
+// the 429 floor within a median 2 min (199 rotations, 38 prefixes).
+// So a rotation that lands in a prefix this pod already used within
+// TUNDLER_EXIT_MEMORY (default 1h, about twice the observed refill
+// gap) buys nothing: that repeat — not the crawler's 429s on a single
+// throttled address — is the signal that cools the location and
+// country and moves the walk on. Keys are the /24 of an IPv4 exit and
+// the /48 of an IPv6 one.
 const (
 	envExitMemory     = "TUNDLER_EXIT_MEMORY"
-	defaultExitMemory = 24 * time.Hour
+	defaultExitMemory = time.Hour
 )
 
 type exitMemory struct {
 	mu   sync.Mutex
 	ttl  time.Duration
 	now  func() time.Time
-	seen map[string]time.Time // exit IP → last seen
+	seen map[string]time.Time // exit prefix → last seen
+}
+
+// exitKey reduces an exit address to the prefix the upstream meters:
+// /24 for IPv4, /48 for IPv6. Anything unparseable is kept verbatim so
+// a provider CLI reporting something odd still gets exact-match
+// memory.
+func exitKey(ip string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return strings.TrimSpace(ip)
+	}
+	bits := 48
+	if addr.Unmap().Is4() {
+		addr = addr.Unmap()
+		bits = 24
+	}
+	prefix, err := addr.Prefix(bits)
+	if err != nil {
+		return addr.String()
+	}
+	return prefix.String()
 }
 
 func newExitMemory(ttl time.Duration) *exitMemory {
@@ -180,13 +210,14 @@ func newExitMemoryFromEnv() *exitMemory {
 	return newExitMemory(ttl)
 }
 
-// remember records ip as used now and reports whether this pod had
-// already used it within ttl. "" is never a repeat. A ttl of 0 disables
-// the memory (never a repeat).
+// remember records ip's prefix as used now and reports whether this
+// pod had already used that prefix within ttl. "" is never a repeat.
+// A ttl of 0 disables the memory (never a repeat).
 func (m *exitMemory) remember(ip string) bool {
-	if m == nil || m.ttl <= 0 || ip == "" {
+	if m == nil || m.ttl <= 0 || strings.TrimSpace(ip) == "" {
 		return false
 	}
+	key := exitKey(ip)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
@@ -195,12 +226,13 @@ func (m *exitMemory) remember(ip string) bool {
 			delete(m.seen, k)
 		}
 	}
-	_, repeat := m.seen[ip]
-	m.seen[ip] = now
+	_, repeat := m.seen[key]
+	m.seen[key] = now
 	return repeat
 }
 
-// size reports how many distinct exits are remembered, for /status.
+// size reports how many distinct exit prefixes are remembered, for
+// /status.
 func (m *exitMemory) size() int {
 	if m == nil {
 		return 0

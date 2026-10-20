@@ -151,17 +151,15 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	return location, nil
 }
 
-// noteRotationExit records the exit a rotation landed on. A repeat —
-// an exit this pod already used within the exit memory — means the
-// provider has no fresh address left for us in that country: the
-// location and country are cooled and the region walk moves on at the
-// next rotation (the crawler asks for one as soon as the reused exit
-// is throttled). The tunnel is kept: a throttled exit still serves at
-// the crawler's floor rate, and tearing it down would only add a
-// connect cycle.
-func noteRotationExit(location, country, exitIP string) {
+// noteRotationExit records the exit a rotation landed on and reports
+// whether it is a repeat: a prefix this pod already used within the
+// exit memory, whose upstream quota is therefore still spent. On a
+// repeat the location and country are cooled and the region walk
+// moves on, so the caller's retry (or the next rotation) picks a
+// different country.
+func noteRotationExit(location, country, exitIP string) bool {
 	if !exits.remember(exitIP) {
-		return
+		return false
 	}
 	if country == "" {
 		country = currentCountry(location)
@@ -170,8 +168,9 @@ func noteRotationExit(location, country, exitIP string) {
 	if pref != nil {
 		pref.leave()
 	}
-	log.Printf("tundler-tunnel: exit %s already used by this pod within %s — pool for location=%s country=%s looks exhausted; cooled for %s, region walk moves on at the next rotation",
-		exitIP, exits.ttl, location, country, blocked.ttl)
+	log.Printf("tundler-tunnel: exit %s shares prefix %s with an exit this pod used within %s — quota for location=%s country=%s looks spent; cooled for %s, region walk moves on",
+		exitIP, exitKey(exitIP), exits.ttl, location, country, blocked.ttl)
+	return true
 }
 
 // exitIPOrProbe prefers the provider CLI's self-reported IP, falling back to
@@ -401,12 +400,23 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				continue
 			}
 			exitIP := exitIPOrProbe(status.IP, observed)
+			if noteRotationExit(location, preferredCountry, exitIP) && attempt < maxAttempts {
+				// A burnt prefix would sit at the crawler's 429 floor
+				// for two minutes before it asks for another rotation;
+				// one more connect cycle now is cheaper. The walk has
+				// already moved on, so the next pick is a different
+				// country.
+				_ = prov.Disconnect(ctx)
+				recentlyFailed = append(recentlyFailed, location)
+				log.Printf("tundler-tunnel: rotation attempt %d/%d landed on a burnt prefix (location=%s exit_ip=%s); retrying elsewhere",
+					attempt, maxAttempts, location, exitIP)
+				continue
+			}
 			state.RecordTunnelUp(location, exitIP)
 			state.RecordCountry(preferredCountry, currentCountry(location))
 			state.Set(StateReady)
 			log.Printf("tundler-tunnel: rotation attempt %d/%d succeeded location=%s exit_ip=%s",
 				attempt, maxAttempts, location, exitIP)
-			noteRotationExit(location, preferredCountry, exitIP)
 			return nil
 		}
 		recentlyFailed = append(recentlyFailed, location)
