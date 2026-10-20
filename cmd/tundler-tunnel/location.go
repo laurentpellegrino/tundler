@@ -14,6 +14,10 @@ import (
 // through six call signatures buys nothing for a per-process singleton.
 var pref *locationPreference
 
+// blocked is the blocked-exit memory fed by POST /rotate?reason=blocked
+// (see cooldown.go), set once in main() like pref. nil = no memory.
+var blocked *locationCooldown
+
 // currentCountry best-effort maps the connected location to an ISO code
 // for /status; "" when the vocabulary is unmappable (city names, auto).
 func currentCountry(location string) string {
@@ -69,6 +73,13 @@ func pickPreferredLocation(pref *locationPreference, locations, excluded []strin
 	if pref != nil {
 		if loc, country, ok := pref.pick(locations, excluded); ok {
 			return loc, country, nil
+		}
+	}
+	// The random fallback skips cooling locations too; when that leaves
+	// nothing the cool-down is ignored rather than failing the connect.
+	if cooled := blocked.cooledLocations(); len(cooled) > 0 {
+		if loc, err := pickLocation(locations, append(append([]string{}, excluded...), cooled...)); err == nil {
+			return loc, "", nil
 		}
 	}
 	loc, err := pickLocation(locations, excluded)

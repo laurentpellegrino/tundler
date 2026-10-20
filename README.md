@@ -125,11 +125,21 @@ consecutive countries from the ring-ordered list of countries the
 provider actually offers (ordinal 0 the first, ordinal 1 the next, …),
 so siblings land on distinct countries with **zero coordination** (no
 peer traffic, no extra RBAC) for as long as the catalog has one to
-spare. Each rotation advances a pod one country. It is a preference,
+spare. Each rotation advances a pod by `TUNDLER_FLEET_REPLICAS` (the
+provider's pod count) along that list, so a pod only ever visits its
+own positions and siblings with different rotation histories never
+meet (without the replicas env the stride is one). It is a preference,
 never a guarantee: any miss falls back to the classic uniform-random
 pick, and providers with unmappable location vocabularies (city names,
 `auto`) simply ignore it. `/status` exposes `fleet_slot`,
 `preferred_country` and `current_country`. Absent env = feature off.
+
+A `POST /rotate` carrying `{"reason":"blocked"}` (or `?reason=blocked`)
+tells the pod the crawler found the exit rejected at its rate floor:
+the current location and its country are cooled for
+`TUNDLER_BLOCKED_COOLDOWN` (default 6h) and skipped by every pick,
+preferred or random, until then. A pod whose whole catalog is cooling
+ignores the cool-down rather than staying down.
 
 ## Build & run
 
@@ -187,6 +197,8 @@ curl http://localhost:4242/status
 | `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
 | `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
 | `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | enable the soft region-spread preference |
+| `TUNDLER_FLEET_REPLICAS` | this provider's pod count: rotation stride of the region walk (default 1) |
+| `TUNDLER_BLOCKED_COOLDOWN` | how long a location and country stay skipped after `/rotate` with `reason=blocked` (default `6h`, `0` disables) |
 | `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
 | `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
 

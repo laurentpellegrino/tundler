@@ -155,3 +155,157 @@ func TestNewLocationPreferenceFromEnv(t *testing.T) {
 		t.Fatal("out-of-range slot must disable the preference")
 	}
 }
+
+// newStridedPref models pod `ordinal` of a provider with `replicas`
+// pods whose block spans the whole fleet.
+func newStridedPref(ordinal, replicas int) *locationPreference {
+	return &locationPreference{base: 0, ordinal: ordinal, slot: ordinal, slots: replicas, replicas: replicas, now: fixedNow}
+}
+
+// bigCatalog is 30 mappable countries in alpha-2 vocabulary.
+var bigCatalog = []string{
+	"AR", "AT", "AU", "BE", "BG", "BR", "CA", "CH", "CL", "CZ",
+	"DE", "DK", "EE", "ES", "FI", "FR", "GB", "GR", "HR", "HU",
+	"IE", "IT", "JP", "LT", "LU", "LV", "MX", "NL", "NO", "PL",
+}
+
+func TestStridedWalkNeverCollidesAcrossRotationHistories(t *testing.T) {
+	// 8 pods, 30 countries, stride 8: whatever each pod's rotation
+	// count, no two siblings share a country — the failure seen on
+	// 2026-10-20 with stride 1 (5 of 8 ExpressVPN pods in Belgium).
+	const pods = 8
+	for trial := 0; trial < 200; trial++ {
+		seen := map[string]int{}
+		for ordinal := 0; ordinal < pods; ordinal++ {
+			p := newStridedPref(ordinal, pods)
+			for s := 0; s < (trial*7+ordinal*3)%40; s++ {
+				p.advance()
+			}
+			_, cc, ok := p.pick(bigCatalog, nil)
+			if !ok {
+				t.Fatalf("ordinal %d: no pick", ordinal)
+			}
+			if other, dup := seen[cc]; dup {
+				t.Fatalf("trial %d: ordinals %d and %d both on %s", trial, other, ordinal, cc)
+			}
+			seen[cc] = ordinal
+		}
+	}
+}
+
+func TestStrideOneReproducesCollision(t *testing.T) {
+	// Sanity check that the test above is meaningful: with stride 1,
+	// pod 0 after one rotation sits where pod 1 started.
+	p0 := &locationPreference{ordinal: 0, slots: 8, replicas: 1, now: fixedNow}
+	p1 := &locationPreference{ordinal: 1, slot: 1, slots: 8, replicas: 1, now: fixedNow}
+	p0.advance()
+	_, a, _ := p0.pick(bigCatalog, nil)
+	_, b, _ := p1.pick(bigCatalog, nil)
+	if a != b {
+		t.Fatalf("stride 1 should collide here: %s vs %s", a, b)
+	}
+}
+
+func TestStridedWalkCoversItsClass(t *testing.T) {
+	// 30 countries / 8 pods → span 24, 3 positions per pod; a pod
+	// cycles through exactly its 3 countries.
+	p := newStridedPref(2, 8)
+	seen := map[string]bool{}
+	for s := 0; s < 9; s++ {
+		_, cc, _ := p.pick(bigCatalog, nil)
+		seen[cc] = true
+		p.advance()
+	}
+	if len(seen) != 3 {
+		t.Fatalf("pod cycled %d countries (%v), want 3", len(seen), seen)
+	}
+}
+
+func TestStridedWalkFewerCountriesThanPods(t *testing.T) {
+	// 7 pods over 5 countries: sharing is unavoidable, but every pod
+	// still gets a pick and the walk still moves.
+	catalog := []string{"DE", "SE", "JP", "BR", "CA"}
+	for ordinal := 0; ordinal < 7; ordinal++ {
+		p := newStridedPref(ordinal, 7)
+		_, before, ok := p.pick(catalog, nil)
+		p.advance()
+		_, after, ok2 := p.pick(catalog, nil)
+		if !ok || !ok2 || before == after {
+			t.Fatalf("ordinal %d: %q → %q (%v/%v)", ordinal, before, after, ok, ok2)
+		}
+	}
+}
+
+func TestCooledCountrySkipsWithinOwnClass(t *testing.T) {
+	const pods = 8
+	p := newStridedPref(3, pods)
+	c, _ := newTestCooldown(time.Hour)
+	p.cooldown = c
+	_, first, _ := p.pick(bigCatalog, nil)
+	c.mark("", first)
+	_, second, _ := p.pick(bigCatalog, nil)
+	if second == first {
+		t.Fatal("a cooled country must be skipped")
+	}
+	// The replacement is a country the pod would reach by advancing,
+	// i.e. still inside its own residue class — never a sibling's.
+	q := newStridedPref(3, pods)
+	q.advance()
+	_, next, _ := q.pick(bigCatalog, nil)
+	if second != next {
+		t.Fatalf("skip went to %s, want the class's next position %s", second, next)
+	}
+	// Siblings are unaffected by this pod's cool-down.
+	for ordinal := 0; ordinal < pods; ordinal++ {
+		if ordinal == 3 {
+			continue
+		}
+		if _, cc, _ := newStridedPref(ordinal, pods).pick(bigCatalog, nil); cc == second {
+			t.Fatalf("sibling %d also on %s", ordinal, cc)
+		}
+	}
+}
+
+func TestCooledLocationSkipsWithinCountryThenCountry(t *testing.T) {
+	p := newStridedPref(0, 1)
+	c, _ := newTestCooldown(time.Hour)
+	p.cooldown = c
+	catalog := []string{"de-berlin", "de-frankfurt", "se-stockholm"}
+	loc, cc, _ := p.pick(catalog, nil)
+	if cc != "DE" && cc != "SE" {
+		t.Fatalf("unexpected pick %s", cc)
+	}
+	c.mark(loc, "")
+	for i := 0; i < 20; i++ {
+		again, _, _ := p.pick(catalog, nil)
+		if again == loc {
+			t.Fatalf("cooled location %s picked again", loc)
+		}
+	}
+	// Every location cooled: the cool-down is ignored, a pick remains.
+	for _, l := range catalog {
+		c.mark(l, "")
+	}
+	if _, _, ok := p.pick(catalog, nil); !ok {
+		t.Fatal("all-cooled catalog must still yield a preferred pick")
+	}
+}
+
+func TestNewLocationPreferenceReplicasEnv(t *testing.T) {
+	t.Setenv("POD_NAME", "tundler-tunnel-x-2")
+	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "10")
+	t.Setenv("TUNDLER_FLEET_SLOTS", "20")
+	t.Setenv(envFleetReplicas, "")
+	if p := newLocationPreferenceFromEnv(); p == nil || p.replicas != 1 {
+		t.Fatalf("no replicas env → stride 1, got %+v", p)
+	}
+	t.Setenv(envFleetReplicas, "8")
+	if p := newLocationPreferenceFromEnv(); p == nil || p.replicas != 8 {
+		t.Fatalf("replicas env → stride 8, got %+v", p)
+	}
+	// An ordinal outside the replica count means the env is stale: stride 1.
+	t.Setenv(envFleetReplicas, "2")
+	if p := newLocationPreferenceFromEnv(); p == nil || p.replicas != 1 {
+		t.Fatalf("stale replicas env → stride 1, got %+v", p)
+	}
+}

@@ -173,7 +173,7 @@ by the recent rotation.
 | GET    | `/livez`  | `200` (always)                                                          |
 | GET    | `/readyz` | `200` iff `state == Ready`, else `503`                                  |
 | GET    | `/status` | JSON snapshot (state, current_location, current_exit_ip, last_rotation) |
-| POST   | `/rotate` | `202` accepted, `200` debounced/idempotent, `409` problem-details       |
+| POST   | `/rotate` | `202` accepted, `200` debounced/idempotent, `409` problem-details; optional `{"reason":"blocked"}` body cools the current location |
 
 ## CONNECT proxy (`:8485`)
 
@@ -214,6 +214,8 @@ response-header IP without locking.
 | `TUNDLER_ACCOUNT_<FIELD>`         | —       | local-dev single-account fallback (e.g. `TUNDLER_ACCOUNT_USERNAME`) |
 | `TUNDLER_FLEET_SLOT_BASE`         | —       | first fleet-global region-preference slot of this StatefulSet |
 | `TUNDLER_FLEET_SLOTS`             | —       | fleet-wide pod total; with SLOT_BASE enables the soft region spread |
+| `TUNDLER_FLEET_REPLICAS`          | 1       | this provider's pod count: the stride each rotation advances along the offered list |
+| `TUNDLER_BLOCKED_COOLDOWN`        | 6h      | memory of locations/countries reported blocked via `/rotate` (`0` disables) |
 
 ## Accounts & region preference
 
@@ -231,6 +233,16 @@ from an epoch-shuffled shared ordering: the provider's block start
 (`TUNDLER_FLEET_SLOT_BASE / TUNDLER_FLEET_SLOTS` of the ring) fixes
 where the provider begins, and pod ordinal *n* takes the *n*-th country
 the provider offers from there, so siblings get distinct countries
-until the catalog runs out; every rotation advances a pod one offered
-country. Any miss falls back to the uniform-random pick —
-`preferred_country` is empty on `/status` when the fallback won.
+until the catalog runs out; every rotation advances a pod by
+`TUNDLER_FLEET_REPLICAS` offered countries (the list is truncated to a
+multiple of that stride), so a pod stays on its own positions whatever
+its rotation count and never meets a sibling. Any miss falls back to
+the uniform-random pick — `preferred_country` is empty on `/status`
+when the fallback won.
+
+`POST /rotate` with `{"reason":"blocked"}` (or `?reason=blocked`) also
+cools the current location and country for `TUNDLER_BLOCKED_COOLDOWN`:
+the preferred walk skips cooled entries by moving further along the
+pod's own positions, the random fallback excludes cooled locations, and
+a fully cooled catalog ignores the cool-down. Any other reason is
+accepted and ignored.
