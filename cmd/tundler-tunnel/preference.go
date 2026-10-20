@@ -50,6 +50,7 @@ import (
 const (
 	envFleetSlotBase = "TUNDLER_FLEET_SLOT_BASE"
 	envFleetSlots    = "TUNDLER_FLEET_SLOTS"
+	envFleetReplicas = "TUNDLER_FLEET_REPLICAS"
 )
 
 type locationPreference struct {
@@ -57,6 +58,11 @@ type locationPreference struct {
 	ordinal int // this pod's StatefulSet ordinal (rank within the block)
 	slot    int // base + ordinal: this pod's fleet-global slot, in [0, slots)
 	slots   int // fleet-wide pod total
+	// replicas is this provider's pod count: the stride of the walk
+	// over the offered list (1 when the renderer did not provide it).
+	replicas int
+	// cooldown is the blocked-exit memory consulted by pick (nil = none).
+	cooldown *locationCooldown
 
 	// steps counts completed rotations: each rotation advances the walk
 	// one position along the country ring so a pod explores different
@@ -91,7 +97,17 @@ func newLocationPreferenceFromEnv() *locationPreference {
 			slot, base, ordinal, total)
 		return nil
 	}
-	return &locationPreference{base: base, ordinal: ordinal, slot: slot, slots: total, now: time.Now}
+	replicas := 1
+	if raw := strings.TrimSpace(os.Getenv(envFleetReplicas)); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 || ordinal >= n {
+			log.Printf("tundler-tunnel: invalid %s=%q for ordinal %d — walking the ring with stride 1",
+				envFleetReplicas, raw, ordinal)
+		} else {
+			replicas = n
+		}
+	}
+	return &locationPreference{base: base, ordinal: ordinal, slot: slot, slots: total, replicas: replicas, now: time.Now}
 }
 
 // pick returns (location, countryAlpha2, true) when a preferred country
@@ -139,9 +155,60 @@ func (p *locationPreference) pick(locations, excluded []string) (string, string,
 	if len(offered) == 0 {
 		return "", "", false
 	}
-	cc := offered[(p.ordinal+int(p.steps.Load()))%len(offered)]
-	candidates := byCountry[cc]
+	cc, candidates := p.choose(offered, byCountry)
 	return candidates[rand.IntN(len(candidates))], cc, true
+}
+
+// choose walks this pod's residue class of the offered list from its
+// current position until it finds a country that is not cooling (and
+// still has a location that is not cooling). Falls back to walking the
+// whole list, then to ignoring the cool-down entirely.
+func (p *locationPreference) choose(offered []string, byCountry map[string][]string) (string, []string) {
+	stride := p.replicas
+	if stride < 1 {
+		stride = 1
+	}
+	span := len(offered)
+	if span >= stride {
+		span -= span % stride
+	} else {
+		stride = 1 // fewer countries than pods: sharing is unavoidable
+	}
+	steps := int(p.steps.Load())
+	at := func(k int) int { return (p.ordinal + (steps+k)*stride) % span }
+	first := at(0)
+	for k := 0; k*stride < span; k++ {
+		cc := offered[at(k)]
+		if candidates := p.warm(cc, byCountry[cc]); len(candidates) > 0 {
+			return cc, candidates
+		}
+	}
+	for i := 1; i < len(offered); i++ {
+		cc := offered[(first+i)%len(offered)]
+		if candidates := p.warm(cc, byCountry[cc]); len(candidates) > 0 {
+			return cc, candidates
+		}
+	}
+	cc := offered[first]
+	return cc, byCountry[cc]
+}
+
+// warm returns the locations of cc that are not cooling, or nil when
+// the country itself is cooling.
+func (p *locationPreference) warm(cc string, locations []string) []string {
+	if p.cooldown == nil {
+		return locations
+	}
+	if p.cooldown.cooledCountry(cc) {
+		return nil
+	}
+	out := make([]string, 0, len(locations))
+	for _, loc := range locations {
+		if !p.cooldown.cooledLocation(loc) {
+			out = append(out, loc)
+		}
+	}
+	return out
 }
 
 // advance moves the walk one country forward. Called by the rotation

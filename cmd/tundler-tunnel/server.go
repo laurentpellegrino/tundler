@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -155,13 +157,24 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 			return
 		}
 		snap := state.Snapshot()
+		// reason=blocked (JSON body {"reason":"blocked"} or query
+		// parameter) means the caller saw the exit rejected at its rate
+		// floor: remember the location and country so the next picks —
+		// this rotation's and the following ones — go elsewhere. Recorded
+		// before the state switch so a debounced or already-running
+		// rotation still learns from it.
+		if rotateReason(r) == rotateReasonBlocked && snap.CurrentLocation != "" {
+			blocked.mark(snap.CurrentLocation, snap.CurrentCountry)
+			log.Printf("tundler-tunnel: /rotate reason=blocked — cooling location=%s country=%s (exit_ip=%s)",
+				snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
+		}
 		switch snap.State {
 		case StateReady:
 			if since, recent := timeSinceLastRotation(snap); recent {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				_ = json.NewEncoder(w).Encode(map[string]string{
-					"state":   string(StateReady),
+					"state": string(StateReady),
 					"message": fmt.Sprintf("rotation debounced (last completed %s ago, min %s)",
 						since.Round(time.Second), minTimeBetweenRotations),
 				})
@@ -200,6 +213,30 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 			})
 		}
 	}
+}
+
+// rotateReasonBlocked is the only reason /rotate acts on today; any
+// other value is accepted and ignored so older or newer callers never
+// get a 400 for a hint.
+const rotateReasonBlocked = "blocked"
+
+// rotateReason reads the optional reason from the JSON body
+// ({"reason": "..."}) or the `reason` query parameter. Malformed or
+// empty bodies yield "".
+func rotateReason(r *http.Request) string {
+	if q := strings.TrimSpace(r.URL.Query().Get("reason")); q != "" {
+		return strings.ToLower(q)
+	}
+	if r.Body == nil {
+		return ""
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(body.Reason))
 }
 
 // problemDetails is the RFC 9457 "Problem Details for HTTP APIs" shape.
