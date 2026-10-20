@@ -51,6 +51,9 @@ const (
 	envFleetSlotBase = "TUNDLER_FLEET_SLOT_BASE"
 	envFleetSlots    = "TUNDLER_FLEET_SLOTS"
 	envFleetReplicas = "TUNDLER_FLEET_REPLICAS"
+	envCountryDwell  = "TUNDLER_COUNTRY_DWELL"
+
+	defaultCountryDwell = 4
 )
 
 type locationPreference struct {
@@ -63,6 +66,14 @@ type locationPreference struct {
 	replicas int
 	// cooldown is the blocked-exit memory consulted by pick (nil = none).
 	cooldown *locationCooldown
+	// dwell counts rotations spent at the current position; dwellCap is
+	// how many a pod spends in one country before moving on regardless
+	// of pool evidence (0 = advance on every rotation).
+	dwell    atomic.Int64
+	dwellCap int
+	// avoid is the location just rotated away from: a re-pick in the
+	// same country prefers another location when the country has one.
+	avoid atomic.Value // string
 
 	// steps counts completed rotations: each rotation advances the walk
 	// one position along the country ring so a pod explores different
@@ -107,7 +118,8 @@ func newLocationPreferenceFromEnv() *locationPreference {
 			replicas = n
 		}
 	}
-	return &locationPreference{base: base, ordinal: ordinal, slot: slot, slots: total, replicas: replicas, now: time.Now}
+	return &locationPreference{base: base, ordinal: ordinal, slot: slot, slots: total, replicas: replicas,
+		dwellCap: getEnvInt(envCountryDwell, defaultCountryDwell), now: time.Now}
 }
 
 // pick returns (location, countryAlpha2, true) when a preferred country
@@ -156,6 +168,17 @@ func (p *locationPreference) pick(locations, excluded []string) (string, string,
 		return "", "", false
 	}
 	cc, candidates := p.choose(offered, byCountry)
+	if avoid, _ := p.avoid.Load().(string); avoid != "" && len(candidates) > 1 {
+		fresh := make([]string, 0, len(candidates))
+		for _, loc := range candidates {
+			if loc != avoid {
+				fresh = append(fresh, loc)
+			}
+		}
+		if len(fresh) > 0 {
+			candidates = fresh
+		}
+	}
 	return candidates[rand.IntN(len(candidates))], cc, true
 }
 
@@ -211,8 +234,32 @@ func (p *locationPreference) warm(cc string, locations []string) []string {
 	return out
 }
 
-// advance moves the walk one country forward. Called by the rotation
-// path only (see steps field doc).
+// advance moves the walk one position forward and resets the dwell.
 func (p *locationPreference) advance() {
 	p.steps.Add(1)
+	p.dwell.Store(0)
+}
+
+// rotated is called once per rotation (never for watchdog reconnects):
+// it counts the dwell and advances the walk once the cap is reached.
+// Reports whether the walk moved. leaving is the location being rotated
+// away from, avoided by the re-pick when the country offers another.
+func (p *locationPreference) rotated(leaving string) bool {
+	p.avoid.Store(leaving)
+	if p.dwellCap <= 0 || p.dwell.Add(1) >= int64(p.dwellCap) {
+		p.advance()
+		return true
+	}
+	return false
+}
+
+// leave moves the walk on because the current country's pool is
+// exhausted (a rotation repeated an exit this pod already used).
+func (p *locationPreference) leave() {
+	p.advance()
+}
+
+// settled clears the avoided location once a tunnel is up.
+func (p *locationPreference) settled() {
+	p.avoid.Store("")
 }

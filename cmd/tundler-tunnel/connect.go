@@ -140,12 +140,38 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 		return location, fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
 	}
 	exitIP := exitIPOrProbe(status.IP, observed)
+	// Boot and watchdog reconnects only record the exit: a reconnect
+	// to the same server legitimately repeats it, so no pool verdict.
+	exits.remember(exitIP)
 	state.RecordTunnelUp(location, exitIP)
 	state.RecordCountry(preferredCountry, currentCountry(location))
 	state.Set(StateReady)
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
 		providerName, location, exitIP)
 	return location, nil
+}
+
+// noteRotationExit records the exit a rotation landed on. A repeat —
+// an exit this pod already used within the exit memory — means the
+// provider has no fresh address left for us in that country: the
+// location and country are cooled and the region walk moves on at the
+// next rotation (the crawler asks for one as soon as the reused exit
+// is throttled). The tunnel is kept: a throttled exit still serves at
+// the crawler's floor rate, and tearing it down would only add a
+// connect cycle.
+func noteRotationExit(location, country, exitIP string) {
+	if !exits.remember(exitIP) {
+		return
+	}
+	if country == "" {
+		country = currentCountry(location)
+	}
+	blocked.mark(location, country)
+	if pref != nil {
+		pref.leave()
+	}
+	log.Printf("tundler-tunnel: exit %s already used by this pod within %s — pool for location=%s country=%s looks exhausted; cooled for %s, region walk moves on at the next rotation",
+		exitIP, exits.ttl, location, country, blocked.ttl)
 }
 
 // exitIPOrProbe prefers the provider CLI's self-reported IP, falling back to
@@ -380,6 +406,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			state.Set(StateReady)
 			log.Printf("tundler-tunnel: rotation attempt %d/%d succeeded location=%s exit_ip=%s",
 				attempt, maxAttempts, location, exitIP)
+			noteRotationExit(location, preferredCountry, exitIP)
 			return nil
 		}
 		recentlyFailed = append(recentlyFailed, location)
