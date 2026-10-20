@@ -123,6 +123,43 @@ func getCredentials() (string, string, error) {
 
 func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
 
+// backgroundEnableAttempts bounds ensureBackground: three tries, a few
+// seconds apart, cover the daemon's slow start without stalling boot.
+const backgroundEnableAttempts = 3
+
+// ensureBackground puts the daemon in background mode, retrying when
+// piactl times out against a daemon that is still starting. Without
+// background mode the daemon stays "inactive": it never loads its
+// region list (`get regions` prints only "auto") and refuses
+// `connect` ("start the PIA client to activate the daemon"). Observed
+// on 2026-10-20: a single `background enable` at boot timed out after
+// 5s, login then succeeded, and the pod sat in Connecting for 45 min
+// because nothing ever retried the enable.
+func ensureBackground(ctx context.Context) error {
+	var lastErr error
+	for attempt := 1; attempt <= backgroundEnableAttempts; attempt++ {
+		out, err := shared.RunCmd(ctx, bin, "--timeout", "20", "background", "enable")
+		if err == nil && !strings.Contains(out, "Timed out") {
+			return nil
+		}
+		lastErr = fmt.Errorf("piactl background enable attempt %d/%d: %v (%s)",
+			attempt, backgroundEnableAttempts, err, strings.TrimSpace(out))
+		shared.Debugf("PIA: %v", lastErr)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return lastErr
+}
+
+// daemonInactive reports whether piactl refused a command because the
+// daemon is not in background mode.
+func daemonInactive(out string) bool {
+	return strings.Contains(out, "activate the daemon") || strings.Contains(out, "background enable")
+}
+
 // desiredProtocol is the VPN transport tundler forces for PIA. piactl's
 // Linux desktop default is OpenVPN (userspace, TLS-wrapped, single-
 // threaded crypto — slow to handshake and low throughput); the mobile
@@ -180,7 +217,13 @@ func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	}
 
 	shared.Debugf("PIA: Connect() - initiating connection")
-	quiet(ctx, "connect")
+	if out, _ := shared.RunCmd(ctx, bin, "connect"); daemonInactive(out) {
+		shared.Debugf("PIA: Connect() - daemon inactive (%s); enabling background and retrying", strings.TrimSpace(out))
+		if err := ensureBackground(ctx); err != nil {
+			shared.Debugf("PIA: Connect() - %v", err)
+		}
+		quiet(ctx, "connect")
+	}
 
 	// Poll the in-memory state populated by piactl monitor instead of
 	// spawning piactl get repeatedly. Each iteration is a few atomic
@@ -276,13 +319,33 @@ func (p PIA) Disconnect(ctx context.Context) error {
 }
 
 func (p PIA) Locations(ctx context.Context) []string {
+	regions := readRegions(ctx)
+	// An inactive daemon lists "auto" alone: enable background mode
+	// and read again so the pick sees the real catalog.
+	if len(regions) <= 1 {
+		shared.Debugf("PIA: Locations() - %d region(s) listed; enabling background and re-reading", len(regions))
+		if err := ensureBackground(ctx); err == nil {
+			regions = readRegions(ctx)
+		}
+	}
+	return regions
+}
+
+// readRegions parses `piactl get regions`. piactl's own IPC timeout
+// message ("Timed out after N sec") is not a region.
+func readRegions(ctx context.Context) []string {
 	out, _ := shared.RunCmd(ctx, bin, "get", "regions")
+	return parseRegions(out)
+}
+
+func parseRegions(out string) []string {
 	var regions []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			regions = append(regions, line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "Timed out") {
+			continue
 		}
+		regions = append(regions, line)
 	}
 	return regions
 }
@@ -321,12 +384,14 @@ func (p PIA) Login(ctx context.Context) error {
 		return fmt.Errorf("pia api rate-limited, cooldown %s remaining", remaining.Round(time.Second))
 	}
 
-	shared.Debugf("PIA: Login() - enabling background")
-	quiet(ctx, "background", "enable")
-
 	// A wedged daemon at boot makes the login CLI time out; restart it
 	// (login-free) so the login attempt runs against a live daemon.
 	ensureDaemonResponsive(ctx)
+
+	shared.Debugf("PIA: Login() - enabling background")
+	if err := ensureBackground(ctx); err != nil {
+		return fmt.Errorf("pia daemon not in background mode: %w", err)
+	}
 
 	// Force WireGuard on the fresh, still-disconnected daemon BEFORE the
 	// first Connect — the desktop default is slow OpenVPN. Safe here
