@@ -134,12 +134,17 @@ pick, and providers with unmappable location vocabularies (city names,
 `auto`) simply ignore it. `/status` exposes `fleet_slot`,
 `preferred_country` and `current_country`. Absent env = feature off.
 
-A `POST /rotate` carrying `{"reason":"blocked"}` (or `?reason=blocked`)
-tells the pod the crawler found the exit rejected at its rate floor:
-the current location and its country are cooled for
-`TUNDLER_BLOCKED_COOLDOWN` (default 6h) and skipped by every pick,
-preferred or random, until then. A pod whose whole catalog is cooling
-ignores the cool-down rather than staying down.
+A rotation re-picks in the same country (another location when the
+country has one) for up to `TUNDLER_COUNTRY_DWELL` rotations (default
+4), so a big pool keeps yielding fresh exits. A rotation that lands on
+an exit IP this pod already used within `TUNDLER_EXIT_MEMORY` (default
+24h) is the pool-exhausted signal: the location and its country are
+cooled for `TUNDLER_BLOCKED_COOLDOWN` (default 6h), skipped by every
+pick, preferred or random, and the walk moves on at the next rotation.
+A pod whose whole catalog is cooling ignores the cool-down rather than
+staying down. `POST /rotate` accepts `{"reason":"blocked"}` (or
+`?reason=blocked`) from the crawler; it is logged, a throttled IP alone
+says nothing about the pool behind it.
 
 ## Build & run
 
@@ -198,7 +203,9 @@ curl http://localhost:4242/status
 | `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
 | `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | enable the soft region-spread preference |
 | `TUNDLER_FLEET_REPLICAS` | this provider's pod count: rotation stride of the region walk (default 1) |
-| `TUNDLER_BLOCKED_COOLDOWN` | how long a location and country stay skipped after `/rotate` with `reason=blocked` (default `6h`, `0` disables) |
+| `TUNDLER_COUNTRY_DWELL` | rotations a pod spends in one country before the region walk moves on (default 4, `0` = every rotation) |
+| `TUNDLER_EXIT_MEMORY` | how long an exit IP is remembered; a rotation landing on a remembered exit cools its location and country (default `24h`, `0` disables) |
+| `TUNDLER_BLOCKED_COOLDOWN` | how long an exhausted location and country stay skipped (default `6h`, `0` disables) |
 | `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
 | `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
 

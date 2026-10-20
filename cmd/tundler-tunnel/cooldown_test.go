@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,7 +59,7 @@ func TestCooldownFromEnv(t *testing.T) {
 	}
 }
 
-func TestRotateHandlerBlockedReasonCoolsCurrentLocation(t *testing.T) {
+func TestRotateHandlerReasonIsLoggedNotActedOn(t *testing.T) {
 	prev := blocked
 	t.Cleanup(func() { blocked = prev })
 	blocked, _ = newTestCooldown(time.Hour)
@@ -70,35 +71,152 @@ func TestRotateHandlerBlockedReasonCoolsCurrentLocation(t *testing.T) {
 	triggered := make(chan struct{}, 1)
 	h := rotateHandler(st, func() { triggered <- struct{}{} })
 
-	// Plain call: nothing learnt.
-	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/rotate", nil))
-	<-triggered
-	if blocked.cooledLocation("Belgium") {
-		t.Fatal("a /rotate without reason must not cool the location")
-	}
-
-	// JSON body reason.
-	st.Set(StateReady)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/rotate", strings.NewReader(`{"reason":"blocked"}`))
 	req.Header.Set("Content-Type", "application/json")
 	h(rr, req)
-	if rr.Code != http.StatusAccepted && rr.Code != http.StatusOK {
-		t.Fatalf("status = %d", rr.Code)
+	<-triggered
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rr.Code)
 	}
-	if !blocked.cooledLocation("Belgium") || !blocked.cooledCountry("BE") {
-		t.Fatal("reason=blocked must cool the current location and country")
+	// A throttled IP says nothing about the pool: the handler must not
+	// cool anything, the verdict comes from the exit the rotation lands on.
+	if blocked.cooledLocation("Belgium") || blocked.cooledCountry("BE") {
+		t.Fatal("reason=blocked must not cool the location or country")
 	}
+	if got := rotateReason(httptest.NewRequest(http.MethodPost, "/rotate?reason=Blocked", nil)); got != "blocked" {
+		t.Fatalf("query reason = %q", got)
+	}
+}
 
-	// Query parameter works too and an unknown reason is ignored.
-	blocked, _ = newTestCooldown(time.Hour)
-	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/rotate?reason=curious", nil))
-	if blocked.cooledLocation("Belgium") {
-		t.Fatal("unknown reason must be ignored")
+func TestExitMemoryRepeatAndExpiry(t *testing.T) {
+	now := time.Unix(1_770_000_000, 0)
+	m := newExitMemory(time.Hour)
+	m.now = func() time.Time { return now }
+	if m.remember("1.1.1.1") {
+		t.Fatal("first sight is not a repeat")
 	}
-	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/rotate?reason=Blocked", nil))
-	if !blocked.cooledLocation("Belgium") {
-		t.Fatal("query reason must cool the location")
+	if !m.remember("1.1.1.1") {
+		t.Fatal("second sight within ttl is a repeat")
+	}
+	if m.remember("") {
+		t.Fatal("empty exit is never a repeat")
+	}
+	now = now.Add(time.Hour)
+	if m.remember("1.1.1.1") {
+		t.Fatal("sight after ttl is not a repeat")
+	}
+	if m.size() != 1 {
+		t.Fatalf("size = %d, want 1", m.size())
+	}
+	var none *exitMemory
+	if none.remember("1.1.1.1") || newExitMemory(0).remember("x") || newExitMemory(0).remember("x") {
+		t.Fatal("nil or disabled memory never reports a repeat")
+	}
+}
+
+func TestDwellAdvancesOnlyAtCap(t *testing.T) {
+	p := newStridedPref(1, 4)
+	p.dwellCap = 3
+	_, start, _ := p.pick(bigCatalog, nil)
+	if p.rotated("x") || p.rotated("x") {
+		t.Fatal("walk must not move before the cap")
+	}
+	if _, cc, _ := p.pick(bigCatalog, nil); cc != start {
+		t.Fatalf("re-pick before the cap left %s for %s", start, cc)
+	}
+	if !p.rotated("x") {
+		t.Fatal("third rotation reaches the cap")
+	}
+	if _, cc, _ := p.pick(bigCatalog, nil); cc == start {
+		t.Fatal("walk must move at the cap")
+	}
+	// leave() moves on regardless of the dwell count.
+	_, here, _ := p.pick(bigCatalog, nil)
+	p.rotated("x")
+	p.leave()
+	if _, cc, _ := p.pick(bigCatalog, nil); cc == here {
+		t.Fatal("leave() must move the walk")
+	}
+	// dwellCap 0 keeps the pre-dwell behaviour: every rotation advances.
+	q := newStridedPref(1, 4)
+	if !q.rotated("x") {
+		t.Fatal("dwellCap 0 advances on every rotation")
+	}
+}
+
+func TestRotationAvoidsTheLocationItLeaves(t *testing.T) {
+	p := newStridedPref(0, 1)
+	p.dwellCap = 10
+	catalog := []string{"de-berlin", "de-frankfurt"}
+	loc, _, _ := p.pick(catalog, nil)
+	p.rotated(loc)
+	for i := 0; i < 20; i++ {
+		if again, _, _ := p.pick(catalog, nil); again == loc {
+			t.Fatalf("re-pick returned the location just left (%s)", loc)
+		}
+	}
+	p.settled()
+	// A single-location country keeps its only location.
+	q := newStridedPref(0, 1)
+	q.dwellCap = 10
+	q.rotated("belgium")
+	if again, _, ok := q.pick([]string{"belgium"}, nil); !ok || again != "belgium" {
+		t.Fatalf("single location must still be picked, got %q", again)
+	}
+}
+
+func TestRepeatExitCoolsCountryAndMovesTheWalk(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	pref = newStridedPref(0, 1)
+	pref.dwellCap = 10
+
+	noteRotationExit("belgium", "BE", "5.5.5.5")
+	if blocked.cooledCountry("BE") || pref.steps.Load() != 0 {
+		t.Fatal("a fresh exit must not cool or move anything")
+	}
+	noteRotationExit("belgium", "BE", "5.5.5.5")
+	if !blocked.cooledLocation("belgium") || !blocked.cooledCountry("BE") {
+		t.Fatal("a repeated exit must cool the location and country")
+	}
+	if pref.steps.Load() != 1 {
+		t.Fatalf("a repeated exit must move the walk, steps = %d", pref.steps.Load())
+	}
+	// Country derived from the location when the pick was the random fallback.
+	noteRotationExit("Germany", "", "6.6.6.6")
+	noteRotationExit("Germany", "", "6.6.6.6")
+	if !blocked.cooledCountry("DE") {
+		t.Fatal("country must be derived from the location on the fallback path")
+	}
+}
+
+func TestConnectWithRetryRepeatExitIsDetected(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	pref = nil
+
+	sp := newScriptedProvider([]string{"USA"}, []bool{true, true}, []string{"2.2.2.2", "2.2.2.2"})
+	st := NewStateTracker("scripted")
+	ns := &noSleep{}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("first rotation: %v", err)
+	}
+	if blocked.cooledLocation("USA") {
+		t.Fatal("first exit is fresh")
+	}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("second rotation: %v", err)
+	}
+	if !blocked.cooledLocation("USA") || !blocked.cooledCountry("US") {
+		t.Fatal("second rotation on the same exit must cool USA")
+	}
+	if st.Get() != StateReady {
+		t.Fatalf("tunnel must be kept on a repeat exit, state = %s", st.Get())
 	}
 }
 
