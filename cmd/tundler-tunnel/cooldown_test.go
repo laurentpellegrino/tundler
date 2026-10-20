@@ -229,15 +229,28 @@ func TestConnectWithRetryRepeatExitIsDetected(t *testing.T) {
 	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
 		t.Fatalf("second rotation: %v", err)
 	}
-	if !blocked.cooledLocation("USA") || !blocked.cooledCountry("US") {
-		t.Fatal("a rotation into the same /24 must cool USA")
-	}
-	if sp.attemptCount() != 3 || sp.callsByLocation["Canada"] != 1 {
-		t.Fatalf("burnt prefix must be retried elsewhere: attempts=%d calls=%v", sp.attemptCount(), sp.callsByLocation)
-	}
+	// The pick is random between the two locations: whichever got the
+	// burnt exit must be cooled, the other one must hold the tunnel.
 	snap := st.Snapshot()
-	if st.Get() != StateReady || snap.CurrentExitIP != "3.3.3.3" || snap.CurrentLocation != "Canada" {
+	if st.Get() != StateReady || snap.CurrentExitIP != "3.3.3.3" {
 		t.Fatalf("retry must leave the pod Ready on the fresh exit: state=%s snapshot=%+v", st.Get(), snap)
+	}
+	fresh := snap.CurrentLocation
+	burnt := "Canada"
+	if fresh == "Canada" {
+		burnt = "USA"
+	}
+	if !blocked.cooledLocation(burnt) || !blocked.cooledCountry(currentCountry(burnt)) {
+		t.Fatalf("a rotation into the same /24 must cool %s", burnt)
+	}
+	if blocked.cooledLocation(fresh) {
+		t.Fatalf("%s served a fresh prefix and must not be cooled", fresh)
+	}
+	// Three connects in all: the first rotation (USA), the burnt
+	// attempt, the retry — USA twice and Canada once whichever way
+	// the second rotation started.
+	if sp.attemptCount() != 3 || sp.callsByLocation["USA"] != 2 || sp.callsByLocation["Canada"] != 1 {
+		t.Fatalf("burnt prefix must be retried elsewhere: attempts=%d calls=%v", sp.attemptCount(), sp.callsByLocation)
 	}
 }
 
