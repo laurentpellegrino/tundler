@@ -222,13 +222,16 @@ var nameIndex = func() map[string]string {
 	return idx
 }()
 
-// normalizeName lowercases, converts underscores to spaces, strips
-// apostrophes and periods, and collapses whitespace — the minimal
-// canonical form that makes "United_States", "united states" and
-// "Lao_Peoples_Democratic_Republic" all comparable.
+// normalizeName lowercases, converts underscores and hyphens to
+// spaces, strips apostrophes and periods, and collapses whitespace —
+// the minimal canonical form that makes "United_States", "united
+// states", "czech-republic" and "Lao_Peoples_Democratic_Republic" all
+// comparable. The index is built through the same function, so a
+// hyphenated canonical name would still resolve.
 func normalizeName(name string) string {
 	name = strings.ToLower(name)
 	name = strings.ReplaceAll(name, "_", " ")
+	name = strings.ReplaceAll(name, "-", " ")
 	name = strings.ReplaceAll(name, "'", "")
 	name = strings.ReplaceAll(name, "’", "")
 	name = strings.ReplaceAll(name, ".", "")
@@ -246,8 +249,8 @@ func CountryName(alpha2 string) (string, bool) {
 	return n, ok
 }
 
-// Alpha2FromName resolves a country name (any case, underscores for
-// spaces, apostrophes optional) to its alpha-2 code. ok=false when the
+// Alpha2FromName resolves a country name (any case, underscores or
+// hyphens for spaces, apostrophes optional) to its alpha-2 code. ok=false when the
 // name is unknown.
 func Alpha2FromName(name string) (string, bool) {
 	code, ok := nameIndex[normalizeName(name)]
