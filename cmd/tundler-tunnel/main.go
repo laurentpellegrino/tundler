@@ -264,12 +264,15 @@ func main() {
 	// Fleet region-spread preference (soft): set the package-level pref
 	// BEFORE any goroutine can connect, so every pick goes through it.
 	blocked = newLocationCooldownFromEnv()
-	log.Printf("tundler-tunnel: blocked-exit cool-down %s (%s)", blocked.ttl, envBlockedCooldown)
+	exits = newExitMemoryFromEnv()
+	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s)",
+		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory)
 	pref = newLocationPreferenceFromEnv()
 	if pref != nil {
 		pref.cooldown = blocked
 		state.SetFleetSlot(pref.slot)
-		log.Printf("tundler-tunnel: region preference enabled (fleet_slot=%d/%d, stride=%d)", pref.slot, pref.slots, pref.replicas)
+		log.Printf("tundler-tunnel: region preference enabled (fleet_slot=%d/%d, stride=%d, dwell=%d rotations)",
+			pref.slot, pref.slots, pref.replicas, pref.dwellCap)
 	} else {
 		log.Printf("tundler-tunnel: region preference disabled (no %s/%s)", envFleetSlotBase, envFleetSlots)
 	}

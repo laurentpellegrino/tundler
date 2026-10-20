@@ -142,3 +142,70 @@ func (c *locationCooldown) purgeLocked() {
 		}
 	}
 }
+
+// Exit memory.
+//
+// Pool size is what decides whether a country is worth staying in, and
+// the pod can measure it: a rotation that lands on an exit IP this pod
+// already used within TUNDLER_EXIT_MEMORY (default 24h) means the
+// provider has run out of fresh addresses there. That repeat — not the
+// crawler's 429s, which hit a single throttled IP in a big pool just as
+// well — is the signal that cools a country and moves the walk on.
+const (
+	envExitMemory     = "TUNDLER_EXIT_MEMORY"
+	defaultExitMemory = 24 * time.Hour
+)
+
+type exitMemory struct {
+	mu   sync.Mutex
+	ttl  time.Duration
+	now  func() time.Time
+	seen map[string]time.Time // exit IP → last seen
+}
+
+func newExitMemory(ttl time.Duration) *exitMemory {
+	return &exitMemory{ttl: ttl, now: time.Now, seen: map[string]time.Time{}}
+}
+
+func newExitMemoryFromEnv() *exitMemory {
+	ttl := defaultExitMemory
+	if raw := strings.TrimSpace(os.Getenv(envExitMemory)); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed < 0 {
+			log.Printf("tundler-tunnel: invalid %s=%q — using %s", envExitMemory, raw, ttl)
+		} else {
+			ttl = parsed
+		}
+	}
+	return newExitMemory(ttl)
+}
+
+// remember records ip as used now and reports whether this pod had
+// already used it within ttl. "" is never a repeat. A ttl of 0 disables
+// the memory (never a repeat).
+func (m *exitMemory) remember(ip string) bool {
+	if m == nil || m.ttl <= 0 || ip == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	for k, at := range m.seen {
+		if now.Sub(at) >= m.ttl {
+			delete(m.seen, k)
+		}
+	}
+	_, repeat := m.seen[ip]
+	m.seen[ip] = now
+	return repeat
+}
+
+// size reports how many distinct exits are remembered, for /status.
+func (m *exitMemory) size() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.seen)
+}

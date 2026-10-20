@@ -18,6 +18,10 @@ var pref *locationPreference
 // (see cooldown.go), set once in main() like pref. nil = no memory.
 var blocked *locationCooldown
 
+// exits remembers the exit IPs this pod used (see cooldown.go): a
+// rotation landing on a remembered exit is the pool-exhausted signal.
+var exits *exitMemory
+
 // currentCountry best-effort maps the connected location to an ISO code
 // for /status; "" when the vocabulary is unmappable (city names, auto).
 func currentCountry(location string) string {

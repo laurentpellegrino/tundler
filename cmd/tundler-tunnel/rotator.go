@@ -125,12 +125,14 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 	// location. The connectWithRetry helper tracks recentlyFailed within
 	// this rotation so the same broken location isn't retried twice.
 	state.Set(StateRotating)
-	// Advance the region-preference walk one country per ROTATION (not
-	// per watchdog reconnect — a drop is not a rotation) so the pod
-	// explores the ring over its lifetime instead of pinning one
-	// country forever.
+	// Count this ROTATION against the region-preference dwell (not a
+	// watchdog reconnect — a drop is not a rotation): the walk re-picks
+	// in the same country while rotations yield fresh exits and moves
+	// on after the dwell cap or an exhausted pool (see preference.go).
 	if pref != nil {
-		pref.advance()
+		if pref.rotated(state.Snapshot().CurrentLocation) {
+			log.Printf("tundler-tunnel: dwell cap reached — region walk moves to its next country")
+		}
 	}
 	if err := prov.Disconnect(ctx); err != nil {
 		// Disconnect failures are surprisingly common when the network
@@ -139,7 +141,11 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 		log.Printf("tundler-tunnel: rotation Disconnect failed (continuing to Connect): %v", err)
 	}
 
-	if err := connectWithRetry(ctx, prov, state, providerName, excluded, maxAttempts, sleep, baselineEgressIP); err != nil {
+	err := connectWithRetry(ctx, prov, state, providerName, excluded, maxAttempts, sleep, baselineEgressIP)
+	if pref != nil {
+		pref.settled()
+	}
+	if err != nil {
 		log.Printf("tundler-tunnel: rotation failed after retries: %v", err)
 		state.RecordRotation(previousIP, "", "failed", time.Since(started))
 		state.Set(StateFailed)

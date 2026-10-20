@@ -159,14 +159,14 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		snap := state.Snapshot()
 		// reason=blocked (JSON body {"reason":"blocked"} or query
 		// parameter) means the caller saw the exit rejected at its rate
-		// floor: remember the location and country so the next picks —
-		// this rotation's and the following ones — go elsewhere. Recorded
-		// before the state switch so a debounced or already-running
-		// rotation still learns from it.
-		if rotateReason(r) == rotateReasonBlocked && snap.CurrentLocation != "" {
-			blocked.mark(snap.CurrentLocation, snap.CurrentCountry)
-			log.Printf("tundler-tunnel: /rotate reason=blocked — cooling location=%s country=%s (exit_ip=%s)",
-				snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
+		// floor. Logged for the record only: a throttled IP says nothing
+		// about the pool behind it, so the rotation re-picks in the same
+		// country and the pool verdict comes from the exit it lands on
+		// (noteRotationExit). Cooling on this signal alone was tried on
+		// 2026-10-20 and had pods hop countries every ten minutes.
+		if reason := rotateReason(r); reason != "" {
+			log.Printf("tundler-tunnel: /rotate reason=%s (location=%s country=%s exit_ip=%s)",
+				reason, snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
 		}
 		switch snap.State {
 		case StateReady:
@@ -214,11 +214,6 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		}
 	}
 }
-
-// rotateReasonBlocked is the only reason /rotate acts on today; any
-// other value is accepted and ignored so older or newer callers never
-// get a 400 for a hint.
-const rotateReasonBlocked = "blocked"
 
 // rotateReason reads the optional reason from the JSON body
 // ({"reason": "..."}) or the `reason` query parameter. Malformed or
