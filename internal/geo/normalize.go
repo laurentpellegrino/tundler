@@ -11,15 +11,20 @@ import "strings"
 //  2. two-letter prefix followed by '-' or '_'
 //     → PIA "de-berlin", "uk-london", "us_chicago"
 //  3. full-string country-name lookup (case-insensitive, underscores
-//     as spaces, apostrophes ignored)
-//     → NordVPN "United_States", and the country-name catalogs
-//     (mullvad, protonvpn, surfshark, cyberghost, ovpn, ipvanish,
-//     fastvpn, veepn)
+//     and hyphens as spaces, apostrophes ignored)
+//     → NordVPN "United_States", ExpressVPN "czech-republic", and the
+//     country-name catalogs (mullvad, protonvpn, surfshark, cyberghost,
+//     ovpn, ipvanish, fastvpn, veepn)
+//  4. hyphenated "country-city[-n]" slug: the longest hyphen-separated
+//     prefix that is a country name
+//     → ExpressVPN "usa-new-york", "germany-frankfurt-1",
+//     "south-korea-2", "india-(via-uk)"
 //
 // Anything else returns ok=false: the location is simply never
 // PREFERRED by the region-spread walk but remains fully connectable
 // (Windscribe city names and the "auto" pseudo-location of
-// warp/psiphon land here). Best-effort by design — a wrong "not
+// warp/psiphon land here). Rule 4 is restricted to space-free slugs
+// so a Windscribe "Jersey City" never becomes JE. Best-effort by design — a wrong "not
 // mapped" costs nothing, so there are no error paths.
 //
 // If a future provider's vocabulary defeats this heuristic, add an
@@ -61,6 +66,17 @@ func GuessAlpha2(location string) (string, bool) {
 	// Rule 3: the whole string is a country name.
 	if code, ok := Alpha2FromName(loc); ok {
 		return code, true
+	}
+
+	// Rule 4: "country-city[-n]" slug — longest country-name prefix on
+	// hyphen boundaries. Rule 3 already tried the full string.
+	if strings.Contains(loc, "-") && !strings.ContainsAny(loc, " \t") {
+		fields := strings.Fields(normalizeName(loc))
+		for n := len(fields) - 1; n >= 1; n-- {
+			if code, ok := nameIndex[strings.Join(fields[:n], " ")]; ok {
+				return code, true
+			}
+		}
 	}
 	return "", false
 }

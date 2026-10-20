@@ -49,11 +49,37 @@ func TestGuessAlpha2(t *testing.T) {
 		{"United Kingdom", "GB", true},
 		{"Russian Federation", "RU", true},
 
+		// Rule 3 with hyphens (ExpressVPN multi-word countries).
+		{"czech-republic", "CZ", true},
+		{"bosnia-and-herzegovina", "BA", true},
+		{"united-arab-emirates", "AE", true},
+		{"isle-of-man", "IM", true},
+
+		// Rule 4 — "country-city[-n]" slugs (ExpressVPN).
+		{"usa-new-york", "US", true},
+		{"usa-st.-louis", "US", true},
+		{"usa-charleston-west-virginia", "US", true},
+		{"germany-frankfurt-1", "DE", true},
+		{"france-paris-2", "FR", true},
+		{"netherlands-the-hague", "NL", true},
+		{"canada-toronto-2", "CA", true},
+		{"australia-woolloomooloo", "AU", true},
+		{"japan-shibuya", "JP", true},
+		{"hong-kong-1", "HK", true},
+		{"south-korea-2", "KR", true},
+		{"singapore-marina-bay", "SG", true},
+		{"spain-barcelona-2", "ES", true},
+		{"taiwan-3", "TW", true},
+		{"sweden-2", "SE", true},
+		{"india-(via-uk)", "IN", true},
+		{"gaming-europe", "", false}, // no country prefix
+
 		// Unmappable — never preferred, still connectable.
-		{"Toronto", "", false},   // Windscribe city
-		{"Vancouver", "", false}, // Windscribe city
-		{"auto", "", false},      // warp/psiphon pseudo-location
-		{"[smart]", "", false},   // expressvpn placeholder
+		{"Toronto", "", false},     // Windscribe city
+		{"Vancouver", "", false},   // Windscribe city
+		{"Jersey City", "", false}, // spaces: rule 4 must not make it JE
+		{"auto", "", false},        // warp/psiphon pseudo-location
+		{"[smart]", "", false},     // expressvpn placeholder
 	}
 	for _, c := range cases {
 		got, ok := GuessAlpha2(c.in)
