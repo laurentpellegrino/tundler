@@ -189,9 +189,11 @@ var codeAliases = map[string]string{
 // from the canonical name belong here.
 var nameAliases = map[string]string{
 	"bosnia":                          "BA",
+	"brasil":                          "BR",
 	"brunei darussalam":               "BN",
 	"burma":                           "MM",
 	"cote divoire":                    "CI", // apostrophes stripped by normalizeName
+	"cotedivoire":                     "CI", // HMA's "Coted`Ivoire" token
 	"czechia":                         "CZ",
 	"great britain":                   "GB",
 	"korea":                           "KR",
