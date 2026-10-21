@@ -41,7 +41,7 @@ integration shapes:
 | Shape | Providers | How it connects |
 |-------|-----------|-----------------|
 | **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
-| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential |
+| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `hidemyass`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
 
@@ -97,6 +97,7 @@ Field names per provider (also the OpenBao property names):
 | expressvpn | `activation_code` |
 | nordvpn | `token` |
 | pia, ipvanish, ovpn, purevpn, fastvpn, veepn, tunnelbear | `username`, `password` |
+| hidemyass | `username`, `password` (the HMA account login; profiles come from the `hidemyass-configs` release asset, see `docker/providers/hidemyass/install.sh`) |
 | protonvpn | `username`, `password` (the OpenVPN pair, not the Proton login) |
 | windscribe | `username`, `password` (the OpenVPN credential, not the account login) |
 | surfshark | `username`, `password` (OpenVPN) or `private_key` (WireGuard, one key pinned per pod) |
