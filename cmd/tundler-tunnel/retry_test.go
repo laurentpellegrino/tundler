@@ -258,3 +258,35 @@ func TestRetryBackoff_Schedule(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectionsTotal_CountsEveryConnectAttempt: the connection budget on
+// the crawler side charges connections_total deltas to the VPN account, so
+// the counter must count attempts (failed ones included), not rotations.
+func TestConnectionsTotal_CountsEveryConnectAttempt(t *testing.T) {
+	sp := newScriptedProvider(
+		[]string{"USA", "UK", "Germany"},
+		[]bool{false, false, true},
+		[]string{"", "", "3.3.3.3"},
+	)
+	st := NewStateTracker("scripted")
+	st.RecordTunnelUp("USA", "1.1.1.1")
+	st.Set(StateReady)
+	if got := st.Snapshot().ConnectionsTotal; got != 0 {
+		t.Fatalf("connections_total before any attempt = %d, want 0", got)
+	}
+
+	ns := &noSleep{}
+	rotateIfReadyWithDeps(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, nil, "")
+
+	snap := st.Snapshot()
+	if snap.ConnectionsTotal != 3 {
+		t.Errorf("connections_total=%d, want 3 (two failed attempts + one success)", snap.ConnectionsTotal)
+	}
+	if snap.RotationCountTotal != 1 {
+		t.Errorf("rotation_count_total=%d, want 1", snap.RotationCountTotal)
+	}
+	st.RecordConnectAttempt()
+	if got := st.Snapshot().ConnectionsTotal; got != 4 {
+		t.Errorf("connections_total after a login attempt = %d, want 4 (monotonic)", got)
+	}
+}

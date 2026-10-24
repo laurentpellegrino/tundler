@@ -41,8 +41,14 @@ type StateTracker struct {
 	currentExitIP         string
 	tunnelConnectedAt     time.Time
 	rotationCountTotal    int
-	lastRotation          *RotationRecord
-	tunnelUpListener      TunnelUpListener
+	// connectionsTotal counts every provider connect or login attempt this
+	// process made: boot login, every rotation attempt (failed ones too),
+	// watchdog reconnects. The VPN provider meters these per account; the
+	// crawler's connection budget reads the counter from /status and charges
+	// the delta to the account.
+	connectionsTotal int
+	lastRotation     *RotationRecord
+	tunnelUpListener TunnelUpListener
 	// lastReadyAt is the wall-clock time of the most recent transition
 	// into StateReady. Used by /status for tunnel_age_seconds — the
 	// wedge-guard goroutine owns the "stuck out of Ready" detection
@@ -230,6 +236,16 @@ func (s *StateTracker) RecordRotation(previousExitIP, newExitIP, outcome string,
 	s.mu.Unlock()
 }
 
+// RecordConnectAttempt bumps connections_total. Called right before every
+// provider.Connect() and provider.Login() the process makes, success or
+// not, so the counter is the account's connection load as the provider
+// sees it, not the number of rotations that happened to succeed.
+func (s *StateTracker) RecordConnectAttempt() {
+	s.mu.Lock()
+	s.connectionsTotal++
+	s.mu.Unlock()
+}
+
 // RecordNextRotation stamps the wall-clock time the rotator's timer is
 // next set to fire. Called by the rotator goroutine when it arms the
 // initial timer and after each Reset, so /status can report
@@ -256,6 +272,7 @@ func (s *StateTracker) Snapshot() Snapshot {
 		CurrentLocation:              s.currentLocation,
 		CurrentExitIP:                s.currentExitIP,
 		RotationCountTotal:           s.rotationCountTotal,
+		ConnectionsTotal:             s.connectionsTotal,
 		LastRotation:                 s.lastRotation,
 		BootLoginJitterActualSeconds: int(s.bootLoginJitterActual.Round(time.Second).Seconds()),
 		AuthFailuresTotal:            s.authFailuresTotal,
@@ -311,14 +328,17 @@ type Snapshot struct {
 	// PreferredCountry is the preference walk's ISO pick for the current
 	// tunnel ("" / absent when the random fallback won); CurrentCountry
 	// is the best-effort ISO mapping of CurrentLocation.
-	FleetSlot                    *int            `json:"fleet_slot,omitempty"`
-	PreferredCountry             string          `json:"preferred_country,omitempty"`
-	CurrentCountry               string          `json:"current_country,omitempty"`
-	CurrentLocation              string          `json:"current_location,omitempty"`
-	CurrentExitIP                string          `json:"current_exit_ip,omitempty"`
-	TunnelAgeSeconds             int             `json:"tunnel_age_seconds"`
-	NextRotationInSeconds        int             `json:"next_rotation_in_seconds"`
-	RotationCountTotal           int             `json:"rotation_count_total"`
+	FleetSlot             *int   `json:"fleet_slot,omitempty"`
+	PreferredCountry      string `json:"preferred_country,omitempty"`
+	CurrentCountry        string `json:"current_country,omitempty"`
+	CurrentLocation       string `json:"current_location,omitempty"`
+	CurrentExitIP         string `json:"current_exit_ip,omitempty"`
+	TunnelAgeSeconds      int    `json:"tunnel_age_seconds"`
+	NextRotationInSeconds int    `json:"next_rotation_in_seconds"`
+	RotationCountTotal    int    `json:"rotation_count_total"`
+	// ConnectionsTotal is every connect/login attempt since boot, the unit a
+	// VPN provider meters per account (see RecordConnectAttempt).
+	ConnectionsTotal             int             `json:"connections_total"`
 	LoggedInAt                   string          `json:"logged_in_at,omitempty"`
 	BootLoginJitterActualSeconds int             `json:"boot_login_jitter_actual_seconds"`
 	LastRotation                 *RotationRecord `json:"last_rotation,omitempty"`

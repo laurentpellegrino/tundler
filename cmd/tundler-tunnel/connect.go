@@ -124,6 +124,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 			providerName, len(available), len(excluded), err)
 	}
 	log.Printf("tundler-tunnel: provider=%s connecting to location=%s", providerName, location)
+	state.RecordConnectAttempt()
 	status := prov.Connect(ctx, location)
 	if !status.Connected {
 		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
@@ -209,6 +210,7 @@ func exitIPOrProbe(reported, observed string) string {
 func loginInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, backoff func(attempt int) time.Duration) error {
 	for attempt := 1; ; attempt++ {
 		state.Set(StateLoggingIn)
+		state.RecordConnectAttempt()
 		err := prov.Login(ctx)
 		if err == nil {
 			if attempt > 1 {
@@ -382,6 +384,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			return fmt.Errorf("attempt %d/%d: %w", attempt, maxAttempts, err)
 		}
 		log.Printf("tundler-tunnel: rotation attempt %d/%d to location=%s", attempt, maxAttempts, location)
+		state.RecordConnectAttempt()
 		status := prov.Connect(ctx, location)
 		if status.Connected {
 			observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
