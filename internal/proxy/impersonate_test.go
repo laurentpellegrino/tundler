@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -111,5 +112,31 @@ func TestProfileByName_NonBrowserPresets(t *testing.T) {
 		if ua := UserAgentFor(got); ua != "" {
 			t.Fatalf("non-browser preset %q must keep the client's User-Agent, got %q", name, ua)
 		}
+	}
+}
+
+func TestOpenSSL3Spec_AppliesAndMatchesCapture(t *testing.T) {
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+	uconn := utls.UClient(c, &utls.Config{ServerName: "example.com"}, utls.HelloCustom)
+	if err := uconn.ApplyPreset(openSSL3Spec()); err != nil {
+		t.Fatalf("ApplyPreset: %v", err)
+	}
+	if err := uconn.BuildHandshakeState(); err != nil {
+		t.Fatalf("BuildHandshakeState: %v", err)
+	}
+	// JA4 t13d3112h2: 31 cipher suites, 12 extensions, ALPN h2 first.
+	if n := len(uconn.HandshakeState.Hello.CipherSuites); n != 31 {
+		t.Fatalf("cipher suites = %d, want 31", n)
+	}
+	if n := len(uconn.Extensions); n != 12 {
+		t.Fatalf("extensions = %d, want 12", n)
+	}
+	if got := uconn.HandshakeState.Hello.AlpnProtocols; len(got) != 2 || got[0] != "h2" {
+		t.Fatalf("alpn = %v, want [h2 http/1.1]", got)
+	}
+	if id, ok := ProfileByName("OpenSSL3"); !ok || id != HelloOpenSSL3 || UserAgentFor(id) != "" {
+		t.Fatalf("ProfileByName(openssl3) = %v, %v", id, ok)
 	}
 }

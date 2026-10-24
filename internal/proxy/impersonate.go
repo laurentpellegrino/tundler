@@ -84,6 +84,9 @@ func ProfileByName(name string) (utls.ClientHelloID, bool) {
 	case strings.EqualFold(name, "okhttp"):
 		// Android OkHttp: the other widely shared non-browser hello.
 		return utls.HelloAndroid_11_OkHttp, true
+	case strings.EqualFold(name, "openssl3"):
+		// curl / python / php / wget on an OpenSSL-3 distro; see hello_openssl.go.
+		return HelloOpenSSL3, true
 	}
 	for _, p := range browserProfiles {
 		if strings.EqualFold(p.Str(), name) {
@@ -120,7 +123,16 @@ func PickProfile(key string) utls.ClientHelloID {
 // (browsers offer h2,http/1.1) so the caller can honour the negotiated
 // protocol. The caller owns closing it.
 func HandshakeAs(ctx context.Context, raw net.Conn, cfg *utls.Config, hello utls.ClientHelloID) (*utls.UConn, error) {
-	uconn := utls.UClient(raw, cfg, hello)
+	var uconn *utls.UConn
+	if build, ok := customSpecs[hello.Str()]; ok {
+		uconn = utls.UClient(raw, cfg, utls.HelloCustom)
+		if err := uconn.ApplyPreset(build()); err != nil {
+			_ = uconn.Close()
+			return nil, err
+		}
+	} else {
+		uconn = utls.UClient(raw, cfg, hello)
+	}
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		_ = uconn.Close()
 		return nil, err
