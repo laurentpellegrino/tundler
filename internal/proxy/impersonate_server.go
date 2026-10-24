@@ -60,13 +60,19 @@ type ImpersonateServer struct {
 // pod's browser profile; dial routes upstream (nil = direct net dial, which in
 // the tunnel pod egresses via the VPN default route).
 func NewImpersonateServer(addr, podName string, dial dialFunc) *ImpersonateServer {
+	return NewImpersonateServerAs(addr, PickProfile(podName), dial)
+}
+
+// NewImpersonateServerAs is NewImpersonateServer with the preset chosen by
+// the caller (an operator override, see ProfileByName) instead of derived
+// from the pod name.
+func NewImpersonateServerAs(addr string, hello utls.ClientHelloID, dial dialFunc) *ImpersonateServer {
 	if dial == nil {
 		var d net.Dialer
 		dial = func(ctx context.Context, target string) (net.Conn, error) {
 			return d.DialContext(ctx, "tcp", target)
 		}
 	}
-	hello := PickProfile(podName)
 	return &ImpersonateServer{
 		addr:      addr,
 		transport: NewImpersonatingTransport(dial, hello),

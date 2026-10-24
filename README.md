@@ -32,7 +32,10 @@ Each pod is a single container running `systemd` → `tundler-tunnel`, which:
    that matches that preset (a client cannot know the pod's browser, and a
    UA that contradicts the hello is itself a bot signal); without the hint
    the client's UA is kept. `/status` reports the pair as
-   `impersonate_profile` / `impersonate_user_agent`.
+   `impersonate_profile` / `impersonate_user_agent`. The preset is picked
+   per pod from its name; `TUNDLER_IMPERSONATE_PROFILE` pins one instead
+   (`Chrome-133`, `Firefox-120`, `Safari-16-0`, or `golang` for the stock
+   Go hello, which has no browser UA so the client's is kept).
 4. Serves an **HTTP control API on `:4242`** (`/livez`, `/readyz`, `/status`,
    `/rotate`) used by k8s probes and by clients triggering a rotation.
 5. **Rotates** to a fresh exit on a time window (or on demand), draining

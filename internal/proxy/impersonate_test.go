@@ -66,6 +66,27 @@ func TestEveryProfileHasAMatchingUserAgent(t *testing.T) {
 	}
 }
 
+// An operator override must reach every rotation preset by its printed name
+// (case-insensitively, since env values get typed by hand), plus the stock
+// Go hello, and must refuse anything else rather than silently falling back.
+func TestProfileByName(t *testing.T) {
+	for _, p := range browserProfiles {
+		got, ok := ProfileByName(strings.ToLower(p.Str()))
+		if !ok || got.Str() != p.Str() {
+			t.Fatalf("ProfileByName(%q) = %v,%v", p.Str(), got.Str(), ok)
+		}
+	}
+	if got, ok := ProfileByName("golang"); !ok || got != utls.HelloGolang {
+		t.Fatalf("ProfileByName(golang) = %v,%v", got.Str(), ok)
+	}
+	if _, ok := ProfileByName("netscape-4"); ok {
+		t.Fatalf("unknown preset must not resolve")
+	}
+	if UserAgentFor(utls.HelloGolang) != "" {
+		t.Fatalf("golang has no browser UA: the client's UA must be kept")
+	}
+}
+
 func TestProfilesAreRealPresets(t *testing.T) {
 	if ProfileCount() < 3 {
 		t.Fatalf("want >=3 rotation profiles, got %d", ProfileCount())

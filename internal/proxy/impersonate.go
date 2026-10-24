@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"strings"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -51,6 +52,26 @@ var profileUserAgents = map[string]string{
 	utls.HelloChrome_131.Str():  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 	utls.HelloFirefox_120.Str(): "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
 	utls.HelloSafari_16_0.Str(): "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+}
+
+// ProfileByName resolves an operator-chosen preset: the rotation presets by
+// their Str() form (e.g. "Chrome-133", case-insensitive) plus "golang", the
+// stock Go hello. "golang" is NOT a disguise — it is the fingerprint every
+// Go program shares, which some edges accept precisely because so many
+// legitimate tools carry it, and the one to pair with a bot User-Agent when
+// an edge grants crawlers a budget only if the hello does not claim to be a
+// browser. Used for TUNDLER_IMPERSONATE_PROFILE overrides and A/B runs; a
+// pod without the override keeps PickProfile's stable, fleet-spread choice.
+func ProfileByName(name string) (utls.ClientHelloID, bool) {
+	if strings.EqualFold(name, "golang") {
+		return utls.HelloGolang, true
+	}
+	for _, p := range browserProfiles {
+		if strings.EqualFold(p.Str(), name) {
+			return p, true
+		}
+	}
+	return utls.ClientHelloID{}, false
 }
 
 // UserAgentFor returns the User-Agent string that matches a preset's browser,
