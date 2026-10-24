@@ -34,10 +34,18 @@ import (
 // Keep these at the NEWEST presets the pinned uTLS release ships: a browser
 // version that real users stopped running long ago, arriving at crawl volume,
 // is itself a signal. Refresh with every uTLS bump (2026-10-24: Edge_106 was
-// dropped for a second, newer Chrome preset — uTLS has no fresher Edge).
+// dropped — uTLS has no fresher Edge).
+//
+// Chrome_131 is deliberately absent: on 2026-10-24 the crawl target's edge answered
+// 406 to EVERY request from a Chrome_131 pod carrying the matching
+// Chrome/131 User-Agent (three pods, three exits), while the same hello
+// under a bot UA, and Chrome_133 / Firefox_120 / Safari_16 under their own
+// UAs, all got 200. Whether the edge knows that preset as a scraper staple
+// or scores the UA/hello pair as inconsistent, the pair is burnt. Any new
+// preset goes through that same single-pod check (fetch via :8486 with
+// X-Tundler-User-Agent: profile) before it joins the rotation.
 var browserProfiles = []utls.ClientHelloID{
 	utls.HelloChrome_133,
-	utls.HelloChrome_131,
 	utls.HelloFirefox_120,
 	utls.HelloSafari_16_0,
 }
@@ -49,7 +57,6 @@ var browserProfiles = []utls.ClientHelloID{
 // preset's Str() so a preset missing here fails loudly in tests.
 var profileUserAgents = map[string]string{
 	utls.HelloChrome_133.Str():  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-	utls.HelloChrome_131.Str():  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 	utls.HelloFirefox_120.Str(): "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
 	utls.HelloSafari_16_0.Str(): "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
 }
