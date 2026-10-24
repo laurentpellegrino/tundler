@@ -62,16 +62,28 @@ var profileUserAgents = map[string]string{
 }
 
 // ProfileByName resolves an operator-chosen preset: the rotation presets by
-// their Str() form (e.g. "Chrome-133", case-insensitive) plus "golang", the
-// stock Go hello. "golang" is NOT a disguise — it is the fingerprint every
+// their Str() form (e.g. "Chrome-133", case-insensitive) plus the non-browser
+// hellos "golang" (stock Go), "randomized" (uTLS randomized, ALPN h2) and
+// "okhttp" (Android OkHttp). 2026-10-24 on the crawl target: real-browser hellos get a
+// browser's per-IP budget (~1 rps) whatever the UA, a non-browser hello with
+// a browser UA gets ~27 rps per dedicated exit, and ONE non-browser hello
+// shared by the whole fleet was 406-blocklisted within hours. "golang" is "golang" is NOT a disguise — it is the fingerprint every
 // Go program shares, which some edges accept precisely because so many
 // legitimate tools carry it, and the one to pair with a bot User-Agent when
 // an edge grants crawlers a budget only if the hello does not claim to be a
 // browser. Used for TUNDLER_IMPERSONATE_PROFILE overrides and A/B runs; a
 // pod without the override keeps PickProfile's stable, fleet-spread choice.
 func ProfileByName(name string) (utls.ClientHelloID, bool) {
-	if strings.EqualFold(name, "golang") {
+	switch {
+	case strings.EqualFold(name, "golang"):
 		return utls.HelloGolang, true
+	case strings.EqualFold(name, "randomized"):
+		// A fresh, valid non-browser hello per connection: nothing stable
+		// for an edge to learn. Keeps the client's User-Agent.
+		return utls.HelloRandomizedALPN, true
+	case strings.EqualFold(name, "okhttp"):
+		// Android OkHttp: the other widely shared non-browser hello.
+		return utls.HelloAndroid_11_OkHttp, true
 	}
 	for _, p := range browserProfiles {
 		if strings.EqualFold(p.Str(), name) {
