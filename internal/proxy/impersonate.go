@@ -29,11 +29,34 @@ import (
 // them means no single signature covers the fleet. Ordered deterministically;
 // selection is by a stable key (see PickProfile), never random, so a slot
 // keeps its identity across reconnects.
+//
+// Keep these at the NEWEST presets the pinned uTLS release ships: a browser
+// version that real users stopped running long ago, arriving at crawl volume,
+// is itself a signal. Refresh with every uTLS bump (2026-10-24: Edge_106 was
+// dropped for a second, newer Chrome preset — uTLS has no fresher Edge).
 var browserProfiles = []utls.ClientHelloID{
-	utls.HelloChrome_120,
+	utls.HelloChrome_133,
+	utls.HelloChrome_131,
 	utls.HelloFirefox_120,
 	utls.HelloSafari_16_0,
-	utls.HelloEdge_106,
+}
+
+// profileUserAgents pairs each preset with the User-Agent the same browser
+// sends, so a client that asks for it (see UserAgentHintHeader) presents a
+// consistent identity: a Chrome ClientHello under a Bingbot or Firefox UA is
+// exactly the kind of contradiction bot scoring keys on. Keyed by the
+// preset's Str() so a preset missing here fails loudly in tests.
+var profileUserAgents = map[string]string{
+	utls.HelloChrome_133.Str():  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+	utls.HelloChrome_131.Str():  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	utls.HelloFirefox_120.Str(): "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+	utls.HelloSafari_16_0.Str(): "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+}
+
+// UserAgentFor returns the User-Agent string that matches a preset's browser,
+// or "" for a preset outside the rotation set.
+func UserAgentFor(hello utls.ClientHelloID) string {
+	return profileUserAgents[hello.Str()]
 }
 
 // ProfileCount is the number of distinct browser fingerprints in rotation.
