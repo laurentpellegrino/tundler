@@ -77,6 +77,23 @@ func NewImpersonateServer(addr, podName string, dial dialFunc) *ImpersonateServe
 // Profile reports the browser preset this pod presents (for logging/metrics).
 func (s *ImpersonateServer) Profile() string { return s.hello.Str() }
 
+// UserAgent reports the User-Agent that matches this pod's preset — what the
+// upstream sees when the client sends the UserAgentHintHeader (or no UA).
+func (s *ImpersonateServer) UserAgent() string { return UserAgentFor(s.hello) }
+
+// UserAgentHintHeader lets the client delegate the User-Agent to this proxy:
+// with value UserAgentHintProfile the outgoing request carries the UA that
+// matches this pod's TLS preset (see profileUserAgents), replacing whatever
+// UA the client sent. Any other value, or no header, keeps the client's UA —
+// a client that could not know the pod's browser (the preset is picked here,
+// from the pod name) would otherwise send a UA that contradicts the hello.
+// A request with NO User-Agent gets the profile's UA too: Go would send none
+// and a browser never does. The header itself never reaches the upstream.
+const (
+	UserAgentHintHeader  = "X-Tundler-User-Agent"
+	UserAgentHintProfile = "profile"
+)
+
 // Serve runs until ctx is cancelled.
 func (s *ImpersonateServer) Serve(ctx context.Context) error {
 	srv := &http.Server{
@@ -127,6 +144,13 @@ func (s *ImpersonateServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	copyHeaders(outReq.Header, r.Header)
 	outReq.Header.Del(TargetHostHeader) // ours, not the upstream's
+	hint := r.Header.Get(UserAgentHintHeader)
+	outReq.Header.Del(UserAgentHintHeader)
+	if hint == UserAgentHintProfile || outReq.Header.Get("User-Agent") == "" {
+		if ua := s.UserAgent(); ua != "" {
+			outReq.Header.Set("User-Agent", ua)
+		}
+	}
 	outReq.Host = host
 
 	resp, err := s.transport.RoundTrip(outReq)

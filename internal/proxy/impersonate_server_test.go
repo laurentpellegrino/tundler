@@ -93,6 +93,68 @@ func TestImpersonateServer_FetchesUpstreamOverHTTPS(t *testing.T) {
 	}
 }
 
+// The User-Agent the edge sees must match the hello it sees. With the hint
+// the pod's own browser UA replaces the client's; without it the client's UA
+// passes through untouched (a client that knows what it is doing keeps
+// control); with no UA at all the profile's is used, since Go would send
+// none and no browser ever does. The hint header itself never goes upstream.
+func TestImpersonateServer_UserAgentHint(t *testing.T) {
+	var seenUA, seenHint string
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenUA = r.Header.Get("User-Agent")
+		seenHint = r.Header.Get(UserAgentHintHeader)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	defer backend.Close()
+	bu, _ := url.Parse(backend.URL)
+	srv, addr := startFetchServer(t, bu.Host)
+	want := srv.UserAgent()
+	if want == "" || !strings.Contains(want, "Mozilla/5.0") {
+		t.Fatalf("server UA = %q, want a browser UA for preset %s", want, srv.Profile())
+	}
+	client := &http.Client{}
+	do := func(ua, hint string) {
+		req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/", nil)
+		req.Header.Set(TargetHostHeader, "example.com")
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		} else {
+			req.Header["User-Agent"] = nil // suppress Go's default UA entirely
+		}
+		if hint != "" {
+			req.Header.Set(UserAgentHintHeader, hint)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp.Body.Close()
+		if seenHint != "" {
+			t.Fatalf("%s leaked upstream: %q", UserAgentHintHeader, seenHint)
+		}
+	}
+	const bingbot = "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"
+
+	do(bingbot, UserAgentHintProfile)
+	if seenUA != want {
+		t.Fatalf("with hint: upstream UA = %q, want profile UA %q", seenUA, want)
+	}
+	do(bingbot, "")
+	if seenUA != bingbot {
+		t.Fatalf("without hint: upstream UA = %q, want client UA kept", seenUA)
+	}
+	do(bingbot, "keep")
+	if seenUA != bingbot {
+		t.Fatalf("unknown hint value: upstream UA = %q, want client UA kept", seenUA)
+	}
+	do("", "")
+	if seenUA != want {
+		t.Fatalf("no client UA: upstream UA = %q, want profile UA %q", seenUA, want)
+	}
+}
+
 // A missing/hostile target header must be rejected, not pasted into the URL.
 func TestImpersonateServer_RejectsBadTargetHeader(t *testing.T) {
 	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"strings"
 	"testing"
 
 	utls "github.com/refraction-networking/utls"
@@ -35,6 +36,33 @@ func TestPickProfileSpreadsAcrossRealFleet(t *testing.T) {
 	}
 	if len(used) != ProfileCount() {
 		t.Fatalf("real fleet used %d/%d profiles — rotation narrower than the pool", len(used), ProfileCount())
+	}
+}
+
+// A preset without a paired User-Agent would make the UA hint silently keep
+// the client's (contradicting) UA. Each UA must also name the preset's own
+// browser: a Firefox hello under a Chrome UA is the mismatch this exists to
+// remove.
+func TestEveryProfileHasAMatchingUserAgent(t *testing.T) {
+	families := map[string]string{"Chrome": "Chrome/", "Firefox": "Firefox/", "Safari": "Version/", "Edge": "Edg/"}
+	for _, p := range browserProfiles {
+		ua := UserAgentFor(p)
+		if ua == "" {
+			t.Fatalf("preset %s has no User-Agent", p.Str())
+		}
+		marker, ok := families[p.Client]
+		if !ok {
+			t.Fatalf("preset %s: unknown browser family %q", p.Str(), p.Client)
+		}
+		if !strings.Contains(ua, marker) {
+			t.Fatalf("preset %s: UA %q does not name its browser (want %q)", p.Str(), ua, marker)
+		}
+		if p.Client == "Chrome" && !strings.Contains(ua, "Chrome/"+p.Version+".") {
+			t.Fatalf("preset %s: UA %q names a different Chrome version", p.Str(), ua)
+		}
+	}
+	if UserAgentFor(utls.HelloGolang) != "" {
+		t.Fatalf("a preset outside the rotation must have no UA")
 	}
 }
 
