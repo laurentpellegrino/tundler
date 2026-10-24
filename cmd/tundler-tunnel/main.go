@@ -38,9 +38,14 @@ const (
 	// RECYCLE_AFTER_ROTATIONS, the pod gracefully drains and exits its
 	// container so kubelet recreates it on the latest image + freshest env.
 	// 0 = disabled (the default; set via env in the fleet).
-	envRecycleAfterSec       = "RECYCLE_AFTER_SECONDS"
-	envRecycleAfterRot       = "RECYCLE_AFTER_ROTATIONS"
-	envPodName               = "POD_NAME"               // downward API; → x-tundler-tunnel-id
+	envRecycleAfterSec = "RECYCLE_AFTER_SECONDS"
+	envRecycleAfterRot = "RECYCLE_AFTER_ROTATIONS"
+	envPodName         = "POD_NAME" // downward API; → x-tundler-tunnel-id
+	// Optional: pin the :8486 browser preset instead of deriving it from
+	// POD_NAME ("Chrome-133", "Firefox-120", "Safari-16-0", "golang", …;
+	// see proxy.ProfileByName). For A/B runs and edges that budget bots
+	// by a non-browser hello. Unset = stable per-pod pick from the pool.
+	envImpersonateProfile    = "TUNDLER_IMPERSONATE_PROFILE"
 	envNodeIP                = "TUNDLER_TUNNEL_NODE_IP" // from caller; → x-tundler-node-ip
 	defaultBootJitterSec     = 60
 	defaultWatchdogIntervSec = 30
@@ -221,8 +226,17 @@ func main() {
 		var d net.Dialer
 		return d.DialContext(dctx, "tcp", target)
 	}
-	impSrv := proxy.NewImpersonateServer(
-		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), podName, impDial)
+	impHello := proxy.PickProfile(podName)
+	if name := os.Getenv(envImpersonateProfile); name != "" {
+		h, ok := proxy.ProfileByName(name)
+		if !ok {
+			log.Fatalf("tundler-tunnel: %s=%q is not a known preset", envImpersonateProfile, name)
+		}
+		impHello = h
+		log.Printf("tundler-tunnel: impersonate preset pinned by %s: %s", envImpersonateProfile, h.Str())
+	}
+	impSrv := proxy.NewImpersonateServerAs(
+		fmt.Sprintf("0.0.0.0:%d", impersonateListenPort), impHello, impDial)
 	go func() {
 		if err := impSrv.Serve(ctx); err != nil {
 			log.Printf("tundler-tunnel: impersonate proxy: %v", err)
