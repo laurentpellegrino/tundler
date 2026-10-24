@@ -97,3 +97,19 @@ func TestProfilesAreRealPresets(t *testing.T) {
 		}
 	}
 }
+
+func TestProfileByName_NonBrowserPresets(t *testing.T) {
+	for name, want := range map[string]utls.ClientHelloID{
+		"golang":     utls.HelloGolang,
+		"RANDOMIZED": utls.HelloRandomizedALPN,
+		"okhttp":     utls.HelloAndroid_11_OkHttp,
+	} {
+		got, ok := ProfileByName(name)
+		if !ok || got != want {
+			t.Fatalf("ProfileByName(%q) = %v, %v; want %v", name, got, ok, want)
+		}
+		if ua := UserAgentFor(got); ua != "" {
+			t.Fatalf("non-browser preset %q must keep the client's User-Agent, got %q", name, ua)
+		}
+	}
+}
