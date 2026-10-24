@@ -1,42 +1,15 @@
-// Package hidemyass is an OpenVPN-direct provider for HMA (HideMyAss!)
-// VPN.
-//
-// Why OpenVPN-direct (not an official client): HMA discontinued its
-// Linux client in February 2023 and never shipped a headless CLI, so
-// the only Linux path is OpenVPN against HMA's per-location .ovpn
-// profiles. Same model as ipvanish / cyberghost / purevpn.
-//
-// Config source: HMA's public config mirror
-// (vpn.hidemyass.com/vpn-config/) no longer resolves, so the profiles
-// are NOT fetched from HMA at build time. They ship as a `configs.zip`
-// asset on the `hidemyass-configs` GitHub release of this repo,
-// uploaded by the account holder from the HMA dashboard / support
-// (docker/providers/hidemyass/install.sh bakes it into the image).
-// The loader accepts both layouts HMA has used:
-//
-//	Country[.Region].City[_LOCnSm][-VirtualXX].UDP.ovpn  (flat, proto suffix)
-//	UDP/Country[.Region].City.ovpn, TCP/…                (proto directory)
-//
-// Auth model: one OpenVPN username + password (the HMA account login)
-// shared by every pod, plus the client certificate/key HMA inlines in
-// every profile. HMA caps concurrent sessions per account (5 on the
-// classic plan, 10 on newer ones), so max_tunnels must stay under that.
-//
-// Location vocabulary: Locations() returns canonical country names
-// ("United States", "United Kingdom") resolved through internal/geo
-// from HMA's CamelCase country tokens ("USA", "UnitedKingdom"), so
-// the region-spread walk and EXCLUDED_LOCATIONS see the same names
-// every other country-catalog provider exposes.
+// Package hidemyass uses HMA's native account and SurfEasy device APIs and
+// discovers OpenVPN endpoints at runtime, without a bundled profile archive.
 package hidemyass
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/fs"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -48,516 +21,391 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/shared"
 )
 
-const (
-	name             = "hidemyass"
-	defaultConfigDir = "/etc/hidemyass/openvpn"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
-)
+const name = "hidemyass"
 
 type HideMyAss struct{}
-
-type hmaServer struct {
-	Country string // canonical name when geo knows it, else HMA's token spaced out
-	CC      string // alpha-2, "" when geo can't resolve the country token
-	Region  string // US state / AU state when present, else ""
-	City    string
-	Proto   string // "udp" or "tcp"
-	Virtual bool   // "-VirtualUSA" style profiles exit elsewhere than they claim
-	Path    string // path relative to configDir()
+type activeConnection struct {
+	VIP      string
+	Tunnel   *openVPNTunnel
+	Location string
+	Country  string
+	Server   vpnServer
 }
 
-var (
-	serverCache    []hmaServer
-	serverCacheMu  sync.RWMutex
-	activeServer   *hmaServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
-
-	// _LOC1S12 — HMA's datacenter/server ordinal suffix on a city.
-	locSuffixRe = regexp.MustCompile(`_LOC\d+S\d+$`)
-	// -VirtualUSA / -VirtualUK — a profile whose exit is virtually
-	// located elsewhere than the city it is filed under.
-	virtualRe = regexp.MustCompile(`-?Virtual[A-Za-z]+$`)
-	// Lower-to-upper boundary inside a CamelCase token: LosAngeles →
-	// Los Angeles, UnitedArabEmirates → United Arab Emirates. "USA"
-	// and "WashingtonDC" keep their capitals together.
-	camelRe = regexp.MustCompile(`([a-z])([A-Z])`)
-	// Lower-case particles HMA glues onto the preceding word:
-	// "Antiguaand Barbuda", "Republicofthe Congo", "Saint Kittsand
-	// Nevis". Only split when another word follows (the trailing
-	// space), so "Poland" / "Thailand" standing alone are untouched.
-	particleRe = regexp.MustCompile(`([a-z])(and|of)(the)? `)
-
-	// Bare "auth-user-pass" (no file argument) — HMA ships it in
-	// every profile; rewritten to point at our credentials file.
-	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
-	// ns-cert-type was REMOVED in OpenVPN 2.5: a profile carrying it
-	// makes the daemon refuse to start. remote-cert-tls is the
-	// drop-in replacement (same server-cert EKU check).
-	nsCertTypeRe = regexp.MustCompile(`(?m)^ns-cert-type\s+server\s*$`)
-	// Directives OpenVPN 2.6 / OpenSSL 3 reject or that only add log
-	// noise — same list ipvanish strips, for the same reasons.
-	deprecatedDirectivesRe = regexp.MustCompile(`(?m)^(keysize|comp-lzo|cipher|tls-cipher|data-ciphers|data-ciphers-fallback)\b.*$`)
-)
+var hmaState struct {
+	conns     map[*tunnelConn]bool
+	op        sync.Mutex
+	mu        sync.RWMutex
+	device    savedDevice
+	backend   *backendClient
+	countries []locationCountry
+	loggedIn  bool
+	active    *activeConnection
+	cleanup   *activeConnection
+}
 
 func init() {
 	provider.Registry[name] = HideMyAss{}
+	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
+		accounts.FieldUsername: "HIDEMYASS_USERNAME", accounts.FieldPassword: "HIDEMYASS_PASSWORD",
+	}))
 }
 
-func configDir() string {
-	if dir := os.Getenv("HIDEMYASS_CONFIG_DIR"); dir != "" {
-		return dir
-	}
-	return defaultConfigDir
-}
-
-func getCredentials() (string, string, error) {
-	acct, err := accounts.Current(name)
+func credentialsFromAccount() (string, string, error) {
+	account, err := accounts.Current(name)
 	if err != nil {
 		return "", "", err
 	}
-	user, err := acct.Require(accounts.FieldUsername)
+	user, err := account.Require(accounts.FieldUsername)
 	if err != nil {
 		return "", "", err
 	}
-	pass, err := acct.Require(accounts.FieldPassword)
+	password, err := account.Require(accounts.FieldPassword)
 	if err != nil {
 		return "", "", err
 	}
-	return user, pass, nil
+	return user, password, nil
 }
 
-// spaceCamel turns HMA's CamelCase tokens into spaced names:
-// "SaintPetersburg" → "Saint Petersburg", "USA" → "USA",
-// "AntiguaandBarbuda" → "Antigua and Barbuda".
-func spaceCamel(s string) string {
-	s = camelRe.ReplaceAllString(s, "$1 $2")
-	s = particleRe.ReplaceAllString(s, "$1 $2 $3 ")
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// parsePath turns a profile path (relative to the config dir) into an
-// hmaServer, or reports false when it doesn't follow HMA's naming.
-// The protocol comes from the ".UDP"/".TCP" filename suffix or, in
-// the directory layout, from the parent directory name; profiles
-// that state neither default to UDP (HMA's own default).
-func parsePath(rel string) (hmaServer, bool) {
-	base := filepath.Base(rel)
-	if !strings.HasSuffix(base, ".ovpn") {
-		return hmaServer{}, false
-	}
-	stem := strings.TrimSuffix(base, ".ovpn")
-
-	proto := ""
-	if dir := strings.ToLower(filepath.Base(filepath.Dir(rel))); dir == "udp" || dir == "tcp" {
-		proto = dir
-	}
-	for _, p := range []string{".UDP", ".TCP", ".udp", ".tcp"} {
-		if strings.HasSuffix(stem, p) {
-			proto = strings.ToLower(strings.TrimPrefix(p, "."))
-			stem = strings.TrimSuffix(stem, p)
-			break
+func login(ctx context.Context) (result error) {
+	defer func() {
+		if result != nil {
+			hmaState.mu.Lock()
+			hmaState.loggedIn = false
+			hmaState.mu.Unlock()
 		}
+	}()
+	if err := ensurePrivateDirectory(stateDir()); err != nil {
+		return err
 	}
-	if proto == "" {
-		proto = "udp"
-	}
-
-	segs := strings.Split(stem, ".")
-	if len(segs) == 0 || segs[0] == "" {
-		return hmaServer{}, false
-	}
-
-	countryTok := strings.ReplaceAll(segs[0], "`", "'")
-	region, city := "", ""
-	switch {
-	case len(segs) == 1:
-		// "Luxembourg_LOC1S1" — city-less country profile.
-		countryTok = locSuffixRe.ReplaceAllString(countryTok, "")
-	case len(segs) == 2:
-		city = segs[1]
-	default:
-		// Country.Region.City — anything past the region belongs to
-		// the city ("USA.Missouri.St.Louis_LOC1S1").
-		region = spaceCamel(segs[1])
-		city = strings.Join(segs[2:], ".")
-	}
-
-	virtual := false
-	if city != "" {
-		city, virtual = stripCity(city)
-	}
-	country, cc := resolveCountry(countryTok)
-	if country == "" {
-		return hmaServer{}, false
-	}
-	return hmaServer{
-		Country: country,
-		CC:      cc,
-		Region:  region,
-		City:    city,
-		Proto:   proto,
-		Virtual: virtual,
-		Path:    rel,
-	}, true
-}
-
-// stripCity removes the _LOCnSm ordinal and the -VirtualXX marker and
-// spaces out the CamelCase city name.
-func stripCity(city string) (string, bool) {
-	city = locSuffixRe.ReplaceAllString(city, "")
-	virtual := false
-	if virtualRe.MatchString(city) {
-		virtual = true
-		city = virtualRe.ReplaceAllString(city, "")
-	}
-	city = strings.Trim(spaceCamel(city), " -")
-	return city, virtual
-}
-
-// resolveCountry maps HMA's country token to the canonical geo name
-// and alpha-2 code. Tokens geo doesn't know keep their spaced-out
-// spelling with an empty code — still connectable, never preferred by
-// the region walk.
-func resolveCountry(tok string) (string, string) {
-	spaced := spaceCamel(tok)
-	if spaced == "" {
-		return "", ""
-	}
-	if cc, ok := geo.Alpha2FromName(spaced); ok {
-		if canonical, ok := geo.CountryName(cc); ok {
-			return canonical, cc
-		}
-		return spaced, cc
-	}
-	return spaced, ""
-}
-
-func loadServers() ([]hmaServer, error) {
-	serverCacheMu.RLock()
-	if len(serverCache) > 0 {
-		cached := append([]hmaServer(nil), serverCache...)
-		serverCacheMu.RUnlock()
-		return cached, nil
-	}
-	serverCacheMu.RUnlock()
-
-	serverCacheMu.Lock()
-	defer serverCacheMu.Unlock()
-	if len(serverCache) > 0 {
-		return append([]hmaServer(nil), serverCache...), nil
-	}
-
-	servers, err := scanConfigDir(configDir())
+	user, password, err := credentialsFromAccount()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	serverCache = servers
-	shared.Debugf("HideMyAss: loaded %d OpenVPN profiles", len(servers))
-	return append([]hmaServer(nil), servers...), nil
-}
-
-// scanConfigDir walks dir (recursively, so a UDP/ + TCP/ layout works)
-// and parses every .ovpn profile except our own rewritten active one.
-func scanConfigDir(dir string) ([]hmaServer, error) {
-	var servers []hmaServer
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	hash := accountHash(user, password)
+	fingerprint := deviceFingerprint(user)
+	saved, found := loadDevice(stateDir(), hash, fingerprint)
+	backend := newBackendClient()
+	var countries []locationCountry
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 || !found || !saved.Session.valid(time.Now()) {
+			account, err := newAccountClient(fingerprint)
+			if err != nil {
+				return err
+			}
+			session, err := account.login(ctx, user, password)
+			if err != nil {
+				return err
+			}
+			licenses, err := account.licenses(ctx, session)
+			if err != nil {
+				return err
+			}
+			license, err := selectLicense(licenses, time.Now())
+			if err != nil {
+				return err
+			}
+			device, err := backend.associate(ctx, license, fingerprint)
+			if err != nil {
+				return err
+			}
+			// Renewing tokens for the same fingerprint reuses its credentials and slot.
+			if saved.Credentials.DeviceUDID != device.UDID {
+				saved.Credentials = vpnCredentials{}
+			}
+			saved.Session = device
+			saved.AccountHash = hash
+			saved.Fingerprint = fingerprint
+		}
+		if saved.Credentials.DevicePassword == "" || saved.Credentials.OpenVPNCA == "" {
+			saved.Credentials, err = backend.credentials(ctx, saved.Session)
+			if err != nil && !(attempt == 0 && errors.Is(err, errSessionExpired)) {
+				return err
+			}
+		}
+		if attempt == 0 && errors.Is(err, errSessionExpired) {
+			continue
+		}
+		countries, err = backend.locations(ctx, saved.Session)
 		if err != nil {
+			if attempt == 0 && errors.Is(err, errSessionExpired) {
+				continue
+			}
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".ovpn") || d.Name() == activeConfigName {
-			return nil
-		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-		srv, ok := parsePath(rel)
-		if !ok {
-			shared.Debugf("HideMyAss: skipping unparseable %s", rel)
-			return nil
-		}
-		servers = append(servers, srv)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", dir, err)
+		break
 	}
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("no HMA OpenVPN profiles found in %s", dir)
+	if err := saveDevice(stateDir(), saved); err != nil {
+		return err
 	}
-	sort.Slice(servers, func(i, j int) bool { return servers[i].Path < servers[j].Path })
-	return servers, nil
-}
-
-// findServers matches a Locations() entry (country name), an alpha-2
-// code or a city, case-insensitively. When a location has both UDP
-// and TCP profiles only the UDP ones are offered — HMA's default and
-// the cheaper transport under our MTU clamp.
-func findServers(servers []hmaServer, location string) []hmaServer {
-	var matches []hmaServer
-	want := strings.ToLower(strings.TrimSpace(location))
-	for _, s := range servers {
-		if want == "" ||
-			strings.ToLower(s.Country) == want ||
-			(s.CC != "" && strings.ToLower(s.CC) == want) ||
-			strings.ToLower(s.City) == want {
-			matches = append(matches, s)
-		}
-	}
-	var udp []hmaServer
-	for _, s := range matches {
-		if s.Proto == "udp" {
-			udp = append(udp, s)
-		}
-	}
-	if len(udp) > 0 {
-		return udp
-	}
-	return matches
-}
-
-func pickRandomServer(servers []hmaServer) *hmaServer {
-	if len(servers) == 0 {
-		return nil
-	}
-	s := servers[rand.Intn(len(servers))]
-	return &s
-}
-
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
-}
-
-// rewriteProfile adapts an HMA profile to OpenVPN 2.6:
-//   - auth-user-pass → our credentials file
-//   - ns-cert-type server → remote-cert-tls server (removed directive)
-//   - legacy cipher/compression directives stripped, then a
-//     data-ciphers list that still admits AES-CBC appended: HMA's
-//     profiles name no cipher, and its older edges negotiate CBC
-//     only — without the fallback OpenVPN 2.6's GCM-only default
-//     fails the data-channel negotiation after a successful TLS
-//     handshake.
-func rewriteProfile(raw, credentialsFile string) string {
-	out := authUserPassRe.ReplaceAllString(raw, "auth-user-pass "+credentialsFile)
-	out = nsCertTypeRe.ReplaceAllString(out, "remote-cert-tls server")
-	out = deprecatedDirectivesRe.ReplaceAllString(out, "")
-	if !strings.HasSuffix(out, "\n") {
-		out += "\n"
-	}
-	out += "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC:AES-128-CBC\n"
-	out += "data-ciphers-fallback AES-256-CBC\n"
-	return out
-}
-
-func writeActiveConfig(server *hmaServer, credentialsFile string) (string, error) {
-	src := filepath.Join(configDir(), server.Path)
-	raw, err := os.ReadFile(src)
-	if err != nil {
-		return "", fmt.Errorf("failed to read %s: %w", src, err)
-	}
-	dst := filepath.Join(configDir(), activeConfigName)
-	if err := os.WriteFile(dst, []byte(rewriteProfile(string(raw), credentialsFile)), 0600); err != nil {
-		return "", fmt.Errorf("failed to write active config: %w", err)
-	}
-	return dst, nil
-}
-
-// isOpenVPNConnected reports whether the redirect-gateway push has
-// taken effect — a route lookup for a public address resolves via
-// tun0 in the MAIN namespace. See ipvanish.go for why the looser
-// "any tun0 route" check fires too early for the exit-IP contract.
-func isOpenVPNConnected() bool {
-	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
-	if err != nil {
-		return false
-	}
-	return strings.Contains(out, " dev tun0 ")
-}
-
-// ActiveLocation returns the verbatim Locations() entry passed to
-// Connect so a block/allow list round-trips; per-server detail is on
-// Status.Region.
-func (h HideMyAss) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
-	activeMu.RLock()
-	defer activeMu.RUnlock()
-	return activeLocation
-}
-
-func (h HideMyAss) Connect(ctx context.Context, location string) provider.Status {
-	user, pass, err := getCredentials()
-	if err != nil {
-		shared.Debugf("HideMyAss: %v", err)
-		return provider.Status{Connected: false, Provider: name}
-	}
-
-	servers, err := loadServers()
-	if err != nil {
-		shared.Debugf("HideMyAss: failed to load servers: %v", err)
-		return provider.Status{Connected: false, Provider: name}
-	}
-
-	matches := findServers(servers, location)
-	if len(matches) == 0 {
-		shared.Debugf("HideMyAss: no servers found for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	server := pickRandomServer(matches)
-	credFile, err := writeCredentials(user, pass)
-	if err != nil {
-		shared.Debugf("HideMyAss: failed to write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-	if _, err := writeActiveConfig(server, credFile); err != nil {
-		shared.Debugf("HideMyAss: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	// Main namespace (RunCmd, not a netns variant) so tun0 becomes the
-	// default route the in-process CONNECT proxy dials through; MTU
-	// clamp below the pod MTU so the TLS handshake's UDP packets are
-	// not dropped on the path — both as in ipvanish.go.
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir(),
-		"--config", activeConfigName,
-		"--tun-mtu", "1320",
-		"--mssfix", "1280",
-		"--daemon"); err != nil {
-		shared.Debugf("HideMyAss: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			activeMu.Lock()
-			activeLocation = location
-			activeMu.Unlock()
-			return h.Status(ctx)
-		}
-	}
-
-	shared.Debugf("HideMyAss: connection timeout for %s", server.Path)
-	return provider.Status{Connected: false, Provider: name, Location: location}
-}
-
-func (h HideMyAss) Connected(ctx context.Context) bool {
-	return isOpenVPNConnected()
-}
-
-func (h HideMyAss) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 20; j++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	hmaState.mu.Lock()
+	hmaState.device = saved
+	hmaState.backend = backend
+	hmaState.countries = countries
+	hmaState.loggedIn = true
+	hmaState.mu.Unlock()
 	return nil
 }
 
-func (h HideMyAss) Locations(ctx context.Context) []string {
-	servers, err := loadServers()
-	if err != nil {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var locations []string
-	for _, s := range servers {
-		if s.Country == "" || seen[s.Country] {
+func (HideMyAss) Login(ctx context.Context) error {
+	hmaState.op.Lock()
+	defer hmaState.op.Unlock()
+	return login(ctx)
+}
+
+// Only a server's explicit authentication rejection triggers credential
+// reissuance. Network or certificate errors must not repeatedly rotate devices.
+func refreshDeviceCredentials(ctx context.Context) (savedDevice, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		hmaState.mu.RLock()
+		saved, backend := hmaState.device, hmaState.backend
+		hmaState.mu.RUnlock()
+		creds, err := backend.credentials(ctx, saved.Session)
+		if attempt == 0 && errors.Is(err, errSessionExpired) {
+			if err := login(ctx); err != nil {
+				return savedDevice{}, err
+			}
 			continue
 		}
-		seen[s.Country] = true
-		locations = append(locations, s.Country)
+		if err != nil {
+			return savedDevice{}, err
+		}
+		saved.Credentials = creds
+		if err := saveDevice(stateDir(), saved); err != nil {
+			return savedDevice{}, err
+		}
+		hmaState.mu.Lock()
+		hmaState.device = saved
+		hmaState.mu.Unlock()
+		return saved, nil
+	}
+	return savedDevice{}, errSessionExpired
+}
+
+func (HideMyAss) LoggedIn(context.Context) bool {
+	hmaState.mu.RLock()
+	defer hmaState.mu.RUnlock()
+	return hmaState.loggedIn && hmaState.device.Session.valid(time.Now())
+}
+
+func (HideMyAss) Logout(context.Context) error {
+	hmaState.op.Lock()
+	defer hmaState.op.Unlock()
+	if err := os.Remove(filepath.Join(stateDir(), "device.json")); err != nil && !os.IsNotExist(err) {
+		return errors.New("remove HMA device session")
+	}
+	hmaState.mu.Lock()
+	hmaState.loggedIn = false
+	hmaState.device = savedDevice{}
+	hmaState.mu.Unlock()
+	return nil
+}
+
+func countryName(c locationCountry) string {
+	if canonical, ok := geo.CountryName(strings.ToUpper(c.CC)); ok {
+		return canonical
+	}
+	return c.Country
+}
+
+func (HideMyAss) Locations(context.Context) []string {
+	hmaState.mu.RLock()
+	defer hmaState.mu.RUnlock()
+	seen := map[string]bool{}
+	var locations []string
+	for _, c := range hmaState.countries {
+		country := countryName(c)
+		if supportedLocation(c) && country != "" && !seen[country] {
+			seen[country] = true
+			locations = append(locations, country)
+		}
 	}
 	sort.Strings(locations)
 	return locations
 }
 
-func (h HideMyAss) LoggedIn(ctx context.Context) bool { return loggedIn }
+func locationKeys(countries []locationCountry, want string) []struct{ Key, Country string } {
+	want = strings.TrimSpace(want)
+	var keys []struct{ Key, Country string }
+	for _, c := range countries {
+		if !supportedLocation(c) {
+			continue
+		}
+		country := countryName(c)
+		countryMatch := want == "" || strings.EqualFold(want, country) || strings.EqualFold(want, c.Country) || strings.EqualFold(want, c.CC) || strings.EqualFold(want, c.Key)
+		for _, city := range c.Cities {
+			if !strings.EqualFold(city.State, "active") || city.Key == "" {
+				continue
+			}
+			if countryMatch || strings.EqualFold(want, city.City) || strings.EqualFold(want, city.Key) {
+				keys = append(keys, struct{ Key, Country string }{city.Key, country})
+			}
+		}
+		if countryMatch && len(c.Cities) == 0 {
+			keys = append(keys, struct{ Key, Country string }{c.Key, country})
+		}
+	}
+	return keys
+}
 
-func (h HideMyAss) Login(ctx context.Context) error {
-	if _, _, err := getCredentials(); err != nil {
-		return err
+func (h HideMyAss) Connect(ctx context.Context, location string) provider.Status {
+	hmaState.op.Lock()
+	defer hmaState.op.Unlock()
+	failed := provider.Status{Provider: name, Location: location}
+	if err := disconnect(ctx); err != nil {
+		shared.Debugf("HideMyAss: disconnect: %v", err)
+		return failed
 	}
-	if _, err := loadServers(); err != nil {
-		return err
+	if !h.LoggedIn(ctx) {
+		if err := login(ctx); err != nil {
+			shared.Debugf("HideMyAss: login: %v", err)
+			return failed
+		}
 	}
-	loggedIn = true
+	hmaState.mu.RLock()
+	keys := locationKeys(hmaState.countries, location)
+	backend := hmaState.backend
+	saved := hmaState.device
+	hmaState.mu.RUnlock()
+	if len(keys) == 0 {
+		shared.Debugf("HideMyAss: no active location matches %q", location)
+		return failed
+	}
+	choice := keys[rand.Intn(len(keys))]
+	servers, err := backend.servers(ctx, saved.Session, choice.Key)
+	if errors.Is(err, errSessionExpired) {
+		if err = login(ctx); err == nil {
+			hmaState.mu.RLock()
+			saved, backend = hmaState.device, hmaState.backend
+			hmaState.mu.RUnlock()
+			servers, err = backend.servers(ctx, saved.Session, choice.Key)
+		}
+	}
+	if err != nil {
+		shared.Debugf("HideMyAss: server discovery: %v", err)
+		return failed
+	}
+
+	// Try a bounded set of candidates under the caller's cancellation deadline.
+	rand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
+	refreshedCredentials := false
+	for i, server := range servers {
+		if i >= 3 || ctx.Err() != nil {
+			break
+		}
+		tunnel, err := startTunnel(ctx, stateDir(), server, saved.Credentials)
+		if errors.Is(err, errTransportAuthentication) && !refreshedCredentials {
+			refreshedCredentials = true
+			if saved, err = refreshDeviceCredentials(ctx); err == nil {
+				tunnel, err = startTunnel(ctx, stateDir(), server, saved.Credentials)
+			} else {
+				shared.Debugf("HideMyAss: refresh device credentials: %v", err)
+				return failed
+			}
+		}
+		if err != nil {
+			shared.Debugf("HideMyAss: OpenVPN connection: %v", err)
+			continue
+		}
+
+		activeLocation := location
+		if activeLocation == "" {
+			activeLocation = choice.Country
+		}
+		candidate := &activeConnection{Location: activeLocation, Country: choice.Country, Server: server, VIP: tunnel.address(), Tunnel: tunnel}
+		hmaState.mu.Lock()
+		hmaState.cleanup = candidate
+		hmaState.mu.Unlock()
+		if err := policyRule(ctx, candidate.VIP, true); err != nil {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+			_ = disconnect(cleanup)
+			cancel()
+			shared.Debugf("HideMyAss: %v", err)
+			return failed
+		}
+		hmaState.mu.Lock()
+		hmaState.active, hmaState.cleanup = candidate, nil
+		hmaState.mu.Unlock()
+		return h.Status(ctx)
+	}
+	return failed
+}
+
+func disconnect(ctx context.Context) error {
+	hmaState.mu.Lock()
+	active := hmaState.active
+	if active == nil {
+		active = hmaState.cleanup
+	}
+	hmaState.active = nil
+	hmaState.cleanup = active
+	conns := make([]*tunnelConn, 0, len(hmaState.conns))
+	for conn := range hmaState.conns {
+		conns = append(conns, conn)
+	}
+	hmaState.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	if active != nil {
+		if err := active.Tunnel.stop(ctx); err != nil {
+			return err
+		}
+		if active.VIP != "" {
+			if err := policyRule(ctx, active.VIP, false); err != nil {
+				return err
+			}
+		}
+	}
+	hmaState.mu.Lock()
+	hmaState.cleanup = nil
+	hmaState.mu.Unlock()
 	return nil
 }
 
-func (h HideMyAss) Logout(ctx context.Context) error {
-	loggedIn = false
-	return nil
+func (HideMyAss) Disconnect(ctx context.Context) error {
+	hmaState.op.Lock()
+	defer hmaState.op.Unlock()
+	return disconnect(ctx)
+}
+
+func (HideMyAss) Connected(ctx context.Context) bool {
+	hmaState.mu.RLock()
+	active := hmaState.active
+	hmaState.mu.RUnlock()
+	return active != nil && active.VIP != "" && active.Tunnel != nil && active.VIP == active.Tunnel.address()
+}
+
+func (h HideMyAss) ActiveLocation(ctx context.Context) string {
+	if !h.Connected(ctx) {
+		return ""
+	}
+	hmaState.mu.RLock()
+	defer hmaState.mu.RUnlock()
+	if hmaState.active == nil {
+		return ""
+	}
+	return hmaState.active.Location
 }
 
 func (h HideMyAss) Status(ctx context.Context) provider.Status {
-	if !h.Connected(ctx) {
-		return provider.Status{Connected: false, Provider: name}
+	hmaState.mu.RLock()
+	active := hmaState.active
+	hmaState.mu.RUnlock()
+	if active == nil || active.VIP == "" || active.Tunnel == nil || active.VIP != active.Tunnel.address() {
+		return provider.Status{Provider: name}
 	}
-	status := provider.Status{
-		Connected: true,
-		Location:  h.ActiveLocation(ctx),
-		Region:    activeRegion(),
-		Provider:  name,
+	region := active.Country
+	if active.Server.Geo.City != "" {
+		region += " - " + active.Server.Geo.City
 	}
-	if ip := publicIP(ctx); ip != "" {
-		status.IP = ip
-	}
-	return status
+	return provider.Status{Provider: name, Connected: true, Location: active.Location, Region: region, IP: probePublicIP(ctx, func(ctx context.Context, _, addr string) (net.Conn, error) { return dialTunnel(ctx, addr) })}
 }
 
-func publicIP(ctx context.Context) string {
-	const host = "icanhazip.com"
-	resolveIP := ""
-	if out, err := shared.RunCmd(ctx, "getent", "ahostsv4", host); err == nil {
-		resolveIP = shared.FirstIPv4(out)
-	}
-	args := []string{"-s", "--max-time", "5"}
-	if resolveIP != "" {
-		args = append(args, "--resolve", host+":443:"+resolveIP)
-	}
-	args = append(args, "https://"+host)
-	out, err := shared.RunCmd(ctx, "curl", args...)
+func (HideMyAss) Version(ctx context.Context) (string, error) {
+	out, err := shared.RunCmdSilent(ctx, "openvpn", "--version")
 	if err != nil {
-		return ""
+		return "", errors.New("OpenVPN is unavailable")
 	}
-	return strings.TrimSpace(out)
-}
-
-func activeRegion() string {
-	if activeServer == nil {
-		return ""
-	}
-	parts := []string{activeServer.Country}
-	if activeServer.Region != "" {
-		parts = append(parts, activeServer.Region)
-	}
-	if activeServer.City != "" {
-		parts = append(parts, activeServer.City)
-	}
-	return strings.Join(parts, " - ")
-}
-
-func (h HideMyAss) Version(ctx context.Context) (string, error) {
-	out, err := shared.RunCmd(ctx, "openvpn", "--version")
-	if err != nil {
-		return "", err
-	}
-	if v := shared.ExtractVersion(out); v != "" {
-		return v, nil
-	}
-	return strings.TrimSpace(strings.Split(out, "\n")[0]), nil
+	return fmt.Sprintf("native HMA (%s)", strings.Split(strings.TrimSpace(out), "\n")[0]), nil
 }
