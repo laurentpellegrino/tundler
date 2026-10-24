@@ -25,7 +25,14 @@ Each pod is a single container running `systemd` → `tundler-tunnel`, which:
    node (the **exit-IP contract test**) before reporting ready.
 3. Serves an in-process **CONNECT proxy on `:8485`** — crawler traffic dialed
    through it egresses via the VPN — and a browser-impersonating forward
-   proxy on `:8486`.
+   proxy on `:8486`: `GET /<path>` with `X-Tundler-Target-Host: <host>` is
+   fetched upstream over https with a real browser ClientHello (uTLS + h2;
+   one preset per pod, picked from the pod name). Send
+   `X-Tundler-User-Agent: profile` to have the request carry the User-Agent
+   that matches that preset (a client cannot know the pod's browser, and a
+   UA that contradicts the hello is itself a bot signal); without the hint
+   the client's UA is kept. `/status` reports the pair as
+   `impersonate_profile` / `impersonate_user_agent`.
 4. Serves an **HTTP control API on `:4242`** (`/livez`, `/readyz`, `/status`,
    `/rotate`) used by k8s probes and by clients triggering a rotation.
 5. **Rotates** to a fresh exit on a time window (or on demand), draining

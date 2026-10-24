@@ -32,11 +32,11 @@ const httpListenAddr = "0.0.0.0:4242"
 // startServer wires the HTTP handlers and starts listening. Returns when
 // ctx is cancelled or the server hits an error. Server lifecycle is the
 // caller's responsibility — main passes its own context.
-func startServer(ctx context.Context, state *StateTracker, triggerRotation RotateTrigger, tunnelID, nodeIP string) error {
+func startServer(ctx context.Context, state *StateTracker, triggerRotation RotateTrigger, tunnelID, nodeIP string, imp BrowserIdentity) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", livezHandler(state))
 	mux.HandleFunc("/readyz", readyzHandler(state))
-	mux.HandleFunc("/status", statusHandler(state, tunnelID, nodeIP))
+	mux.HandleFunc("/status", statusHandler(state, tunnelID, nodeIP, imp))
 	mux.HandleFunc("/rotate", rotateHandler(state, triggerRotation))
 
 	srv := &http.Server{
@@ -98,6 +98,14 @@ func readyzHandler(state *StateTracker) http.HandlerFunc {
 	}
 }
 
+// BrowserIdentity is what the impersonate proxy presents upstream: the uTLS
+// preset name and the User-Agent paired with it. Zero value = no proxy
+// (tests, or a build without it); the fields are then omitted from /status.
+type BrowserIdentity struct {
+	Profile   string
+	UserAgent string
+}
+
 // statusHandler returns the JSON snapshot of the tracker state, plus
 // the pod's static identity fields (tunnel_id = POD_NAME via downward
 // API, node_ip = TUNDLER_TUNNEL_NODE_IP). The leak detector reads
@@ -106,17 +114,24 @@ func readyzHandler(state *StateTracker) http.HandlerFunc {
 // comparison used to ride on response_headers_to_add at the hub
 // envoy, which is gone, so we surface the identity through /status
 // instead.
-func statusHandler(state *StateTracker, tunnelID, nodeIP string) http.HandlerFunc {
+//
+// It also reports the browser identity the impersonate proxy (:8486)
+// presents upstream — the uTLS preset and its matching User-Agent — so a
+// client can see, and an operator can audit, which browser each tunnel
+// claims to be.
+func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIdentity) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		snap := state.Snapshot()
 		// Anonymous struct embeds Snapshot so existing fields keep
-		// their JSON tags; the two new fields appear at the same
+		// their JSON tags; the extra fields appear at the same
 		// nesting level.
 		resp := struct {
 			Snapshot
-			TunnelID string `json:"tunnel_id,omitempty"`
-			NodeIP   string `json:"node_ip,omitempty"`
-		}{snap, tunnelID, nodeIP}
+			TunnelID             string `json:"tunnel_id,omitempty"`
+			NodeIP               string `json:"node_ip,omitempty"`
+			ImpersonateProfile   string `json:"impersonate_profile,omitempty"`
+			ImpersonateUserAgent string `json:"impersonate_user_agent,omitempty"`
+		}{snap, tunnelID, nodeIP, imp.Profile, imp.UserAgent}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
