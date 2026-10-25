@@ -160,16 +160,30 @@ func (c *locationCooldown) purgeLocked() {
 // throttled address — is the signal that cools the location and
 // country and moves the walk on. Keys are the /24 of an IPv4 exit and
 // the /48 of an IPv6 one.
+//
+// Refused exits are a second, much longer memory. On 2026-10-24 the
+// upstream started answering 406 per exit IP, and on 2026-10-25 those
+// bans were still in force a day later: 7 of 8 ExpressVPN pods landed on
+// an already-refused exit within seconds of rotating, the same /24s
+// coming round again and again because the one-hour memory had long
+// forgotten them. The crawler reports the refusal with POST /rotate
+// reason=banned; the prefix is then kept for TUNDLER_REFUSED_MEMORY
+// (default 24h) and a rotation that lands in it is treated exactly like
+// a repeat: cool the location and country, retry elsewhere.
 const (
-	envExitMemory     = "TUNDLER_EXIT_MEMORY"
-	defaultExitMemory = time.Hour
+	envExitMemory        = "TUNDLER_EXIT_MEMORY"
+	defaultExitMemory    = time.Hour
+	envRefusedMemory     = "TUNDLER_REFUSED_MEMORY"
+	defaultRefusedMemory = 24 * time.Hour
 )
 
 type exitMemory struct {
-	mu   sync.Mutex
-	ttl  time.Duration
-	now  func() time.Time
-	seen map[string]time.Time // exit prefix → last seen
+	mu         sync.Mutex
+	ttl        time.Duration
+	refusedTTL time.Duration
+	now        func() time.Time
+	seen       map[string]time.Time // exit prefix → last seen
+	refused    map[string]time.Time // exit prefix → when the upstream refused it
 }
 
 // exitKey reduces an exit address to the prefix the upstream meters:
@@ -194,41 +208,112 @@ func exitKey(ip string) string {
 }
 
 func newExitMemory(ttl time.Duration) *exitMemory {
-	return &exitMemory{ttl: ttl, now: time.Now, seen: map[string]time.Time{}}
+	return newExitMemoryWithRefused(ttl, defaultRefusedMemory)
+}
+
+func newExitMemoryWithRefused(ttl, refusedTTL time.Duration) *exitMemory {
+	return &exitMemory{
+		ttl:        ttl,
+		refusedTTL: refusedTTL,
+		now:        time.Now,
+		seen:       map[string]time.Time{},
+		refused:    map[string]time.Time{},
+	}
 }
 
 func newExitMemoryFromEnv() *exitMemory {
-	ttl := defaultExitMemory
-	if raw := strings.TrimSpace(os.Getenv(envExitMemory)); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed < 0 {
-			log.Printf("tundler-tunnel: invalid %s=%q — using %s", envExitMemory, raw, ttl)
-		} else {
-			ttl = parsed
-		}
+	return newExitMemoryWithRefused(
+		durationFromEnv(envExitMemory, defaultExitMemory),
+		durationFromEnv(envRefusedMemory, defaultRefusedMemory))
+}
+
+// durationFromEnv reads a non-negative duration ("0" disables the
+// memory it configures). Invalid values fall back to def and are
+// logged, never fatal.
+func durationFromEnv(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
 	}
-	return newExitMemory(ttl)
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed < 0 {
+		log.Printf("tundler-tunnel: invalid %s=%q — using %s", name, raw, def)
+		return def
+	}
+	return parsed
 }
 
 // remember records ip's prefix as used now and reports whether this
-// pod had already used that prefix within ttl. "" is never a repeat.
-// A ttl of 0 disables the memory (never a repeat).
+// pod had already used that prefix within ttl, or had it refused within
+// refusedTTL. "" is never a repeat. A ttl of 0 disables the used-exit
+// memory; the refused memory keeps working on its own.
 func (m *exitMemory) remember(ip string) bool {
-	if m == nil || m.ttl <= 0 || strings.TrimSpace(ip) == "" {
+	if m == nil || strings.TrimSpace(ip) == "" {
 		return false
 	}
 	key := exitKey(ip)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
+	m.purgeLocked(now)
+	_, refused := m.refused[key]
+	if m.ttl <= 0 {
+		return refused
+	}
+	_, repeat := m.seen[key]
+	m.seen[key] = now
+	return repeat || refused
+}
+
+// refuse records that the upstream refused ip (the crawler's 406/403)
+// so the prefix is avoided for refusedTTL. Reports whether it was
+// recorded; a refusedTTL of 0 disables this memory.
+func (m *exitMemory) refuse(ip string) bool {
+	if m == nil || m.refusedTTL <= 0 || strings.TrimSpace(ip) == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refused[exitKey(ip)] = m.now()
+	return true
+}
+
+// isRefused reports whether ip's prefix is still within the refused
+// memory.
+func (m *exitMemory) isRefused(ip string) bool {
+	if m == nil || strings.TrimSpace(ip) == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.purgeLocked(m.now())
+	_, ok := m.refused[exitKey(ip)]
+	return ok
+}
+
+func (m *exitMemory) purgeLocked(now time.Time) {
 	for k, at := range m.seen {
 		if now.Sub(at) >= m.ttl {
 			delete(m.seen, k)
 		}
 	}
-	_, repeat := m.seen[key]
-	m.seen[key] = now
-	return repeat
+	for k, at := range m.refused {
+		if now.Sub(at) >= m.refusedTTL {
+			delete(m.refused, k)
+		}
+	}
+}
+
+// refusedSize reports how many distinct exit prefixes are currently
+// refused, for /status.
+func (m *exitMemory) refusedSize() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.purgeLocked(m.now())
+	return len(m.refused)
 }
 
 // size reports how many distinct exit prefixes are remembered, for

@@ -118,10 +118,13 @@ type BrowserIdentity struct {
 // It also reports the browser identity the impersonate proxy (:8486)
 // presents upstream — the uTLS preset and its matching User-Agent — so a
 // client can see, and an operator can audit, which browser each tunnel
-// claims to be.
+// claims to be, and the exit memory counts (prefixes this pod used
+// recently, prefixes the upstream refused) so a fleet-wide sweep of
+// /status shows how much of a provider's pool is burnt.
 func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIdentity) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		snap := state.Snapshot()
+		cooledLocations, cooledCountries := blocked.counts()
 		// Anonymous struct embeds Snapshot so existing fields keep
 		// their JSON tags; the extra fields appear at the same
 		// nesting level.
@@ -131,7 +134,12 @@ func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIden
 			NodeIP               string `json:"node_ip,omitempty"`
 			ImpersonateProfile   string `json:"impersonate_profile,omitempty"`
 			ImpersonateUserAgent string `json:"impersonate_user_agent,omitempty"`
-		}{snap, tunnelID, nodeIP, imp.Profile, imp.UserAgent}
+			UsedExitPrefixes     int    `json:"used_exit_prefixes"`
+			RefusedExitPrefixes  int    `json:"refused_exit_prefixes"`
+			CooledLocations      int    `json:"cooled_locations"`
+			CooledCountries      int    `json:"cooled_countries"`
+		}{snap, tunnelID, nodeIP, imp.Profile, imp.UserAgent,
+			exits.size(), exits.refusedSize(), cooledLocations, cooledCountries}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
@@ -153,6 +161,10 @@ func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIden
 // near-simultaneous burst /rotate calls from multiple slots get
 // collapsed into a single rotation.
 const minTimeBetweenRotations = 30 * time.Second
+
+// rotateReasonBanned is the crawler's reason for a 406/403 from the
+// exit: an IP-level refusal (see noteRefusedExit).
+const rotateReasonBanned = "banned"
 
 // rotateHandler implements POST /rotate. Called directly by the
 // crawler slot pinned to this pod (via per-pod DNS). Response shapes
@@ -179,9 +191,18 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		// country and the pool verdict comes from the exit it lands on
 		// (noteRotationExit). Cooling on this signal alone was tried on
 		// 2026-10-20 and had pods hop countries every ten minutes.
+		//
+		// reason=banned is different: the upstream refused the exit IP
+		// itself (406/403), deterministically and for a day or more, so
+		// the prefix goes into the refused memory and its location and
+		// country are cooled (noteRefusedExit) before the rotation
+		// re-picks.
 		if reason := rotateReason(r); reason != "" {
 			log.Printf("tundler-tunnel: /rotate reason=%s (location=%s country=%s exit_ip=%s)",
 				reason, snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
+			if reason == rotateReasonBanned {
+				noteRefusedExit(snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
+			}
 		}
 		switch snap.State {
 		case StateReady:

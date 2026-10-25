@@ -169,8 +169,32 @@ func noteRotationExit(location, country, exitIP string) bool {
 	if pref != nil {
 		pref.leave()
 	}
-	log.Printf("tundler-tunnel: exit %s shares prefix %s with an exit this pod used within %s — quota for location=%s country=%s looks spent; cooled for %s, region walk moves on",
-		exitIP, exitKey(exitIP), exits.ttl, location, country, blocked.ttl)
+	log.Printf("tundler-tunnel: exit %s shares prefix %s with an exit this pod used within %s or had refused within %s — location=%s country=%s looks spent; cooled for %s, region walk moves on",
+		exitIP, exitKey(exitIP), exits.ttl, exits.refusedTTL, location, country, blocked.ttl)
+	return true
+}
+
+// noteRefusedExit records that the upstream refused the current exit
+// (POST /rotate reason=banned from the crawler: a 406/403, deterministic
+// for the exit IP and, as of 2026-10-25, still in force a day later).
+// The prefix joins the refused memory so later rotations retry past it,
+// and the location and country are cooled like a spent pool: a refused
+// exit says the pool it came from is being refused too (7 of 8
+// ExpressVPN pods were landing on refused exits in the same few
+// countries). Reports whether anything was recorded.
+func noteRefusedExit(location, country, exitIP string) bool {
+	if !exits.refuse(exitIP) {
+		return false
+	}
+	if country == "" {
+		country = currentCountry(location)
+	}
+	blocked.mark(location, country)
+	if pref != nil {
+		pref.leave()
+	}
+	log.Printf("tundler-tunnel: exit %s refused by the upstream — prefix %s avoided for %s, location=%s country=%s cooled for %s, region walk moves on",
+		exitIP, exitKey(exitIP), exits.refusedTTL, location, country, blocked.ttl)
 	return true
 }
 

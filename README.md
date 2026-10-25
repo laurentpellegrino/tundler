@@ -155,9 +155,17 @@ signal: the location and its country are cooled for
 `TUNDLER_BLOCKED_COOLDOWN` (default 1h), skipped by every pick,
 preferred or random, the walk moves on and the rotation retries
 elsewhere while it has attempts left. A pod whose whole catalog is
-cooling ignores the cool-down rather than staying down. `POST /rotate` accepts `{"reason":"blocked"}` (or
-`?reason=blocked`) from the crawler; it is logged, a throttled IP alone
-says nothing about the pool behind it.
+cooling ignores the cool-down rather than staying down. `POST /rotate`
+accepts a reason from the crawler: `{"reason":"blocked"}` (or
+`?reason=blocked`, the exit still 429s at the crawler's rate floor) is
+logged only, a throttled IP alone says nothing about the pool behind
+it; `reason=banned` (the exit answered 406/403, an IP-level refusal
+that was still in force a day later on 2026-10-25) puts the exit's
+prefix into a separate refused memory for `TUNDLER_REFUSED_MEMORY`
+(default 24h), cools its location and country, and makes any later
+rotation that lands in that prefix retry elsewhere. `/status` reports
+`used_exit_prefixes`, `refused_exit_prefixes`, `cooled_locations` and
+`cooled_countries`.
 
 ## Build & run
 
@@ -219,6 +227,7 @@ curl http://localhost:4242/status
 | `TUNDLER_COUNTRY_DWELL` | rotations a pod spends in one country before the region walk moves on (default 4, `0` = every rotation) |
 | `TUNDLER_EXIT_MEMORY` | how long an exit prefix (/24, IPv6 /48) is remembered; a rotation landing in a remembered prefix cools its location and country and retries elsewhere (default `1h`, `0` disables) |
 | `TUNDLER_BLOCKED_COOLDOWN` | how long a spent location and country stay skipped (default `1h`, `0` disables) |
+| `TUNDLER_REFUSED_MEMORY` | how long an exit prefix the upstream refused (`POST /rotate` with `reason=banned`) is avoided by later rotations (default `24h`, `0` disables) |
 | `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
 | `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
 

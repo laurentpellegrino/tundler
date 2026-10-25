@@ -279,8 +279,8 @@ func main() {
 	// BEFORE any goroutine can connect, so every pick goes through it.
 	blocked = newLocationCooldownFromEnv()
 	exits = newExitMemoryFromEnv()
-	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s)",
-		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory)
+	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s), refused-exit memory %s (%s)",
+		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory, exits.refusedTTL, envRefusedMemory)
 	pref = newLocationPreferenceFromEnv()
 	if pref != nil {
 		pref.cooldown = blocked
