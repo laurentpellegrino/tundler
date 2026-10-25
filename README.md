@@ -54,7 +54,7 @@ integration shapes:
 | **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential |
 | **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
-| **Proxy-chain** | `tunnelbear`, `psiphon`, `proxylist` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam); `proxylist` is vendor-agnostic: any HTTP(S) CONNECT proxies you list (static ISP/residential IPs, a vendor gateway, a squid) become its locations |
+| **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
 
 Vendor clients are installed by `docker/providers/<provider>/install.sh`:
 ExpressVPN is pinned there (14.2.0), PIA resolves the newest Linux build
@@ -116,7 +116,6 @@ Field names per provider (also the OpenBao property names):
 | cyberghost | `certificate`, `key`, `username`, `password` — one device profile per Slots=1 account |
 | warp | none (anonymous/mdm registration) |
 | psiphon | none (embedded network config) |
-| proxylist | `endpoints` (one upstream per line: `[http\|https://][user:pass@]host:port [label]`, `#` comments), optional `username`, `password` defaults for endpoints without URL credentials; legacy env `PROXYLIST_ENDPOINTS`, `PROXYLIST_USERNAME`, `PROXYLIST_PASSWORD` |
 
 **Legacy env vars keep working** (deprecated, one log line at boot): the
 pre-accounts variables — `PRIVATEINTERNETACCESS_USERNAME/_PASSWORD`,
