@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: [cyberghost, expressvpn, fastvpn, hidemyass, ipvanish, mullvad, nordvpn, ovpn, pia, protonvpn, proxylist, psiphon, purevpn, surfshark, tunnelbear, veepn, warp, windscribe]
+        provider: [cyberghost, expressvpn, fastvpn, hidemyass, ipvanish, mullvad, nordvpn, ovpn, pia, protonvpn, psiphon, purevpn, surfshark, tunnelbear, veepn, warp, windscribe]
     # Resolved once at job level so the build step and its retry below cannot
     # drift apart.
     env:
