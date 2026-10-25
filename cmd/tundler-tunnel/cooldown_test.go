@@ -294,3 +294,102 @@ func TestFallbackPickSkipsCooledLocations(t *testing.T) {
 		t.Fatalf("all-cooled pick = (%q, %v)", loc, err)
 	}
 }
+
+func TestExitMemoryRefusedOutlivesTheUsedMemory(t *testing.T) {
+	now := time.Unix(1_770_000_000, 0)
+	m := newExitMemoryWithRefused(time.Hour, 24*time.Hour)
+	m.now = func() time.Time { return now }
+	if !m.refuse("5.5.5.5") || !m.isRefused("5.5.5.200") || m.isRefused("5.5.6.1") {
+		t.Fatal("a refusal covers the /24 and only the /24")
+	}
+	if !m.remember("5.5.5.9") {
+		t.Fatal("a rotation into a refused prefix is a repeat even on first use")
+	}
+	now = now.Add(2 * time.Hour)
+	if !m.remember("5.5.5.9") {
+		t.Fatal("the refusal outlives the one-hour used-exit memory")
+	}
+	if m.refusedSize() != 1 {
+		t.Fatalf("refusedSize = %d, want 1", m.refusedSize())
+	}
+	now = now.Add(23 * time.Hour)
+	if m.isRefused("5.5.5.5") || m.refusedSize() != 0 {
+		t.Fatal("a refusal expires after refusedTTL")
+	}
+	if m.remember("5.5.5.5") {
+		t.Fatal("after expiry the prefix is fresh again")
+	}
+	off := newExitMemoryWithRefused(0, 24*time.Hour)
+	if !off.refuse("6.6.6.6") || !off.remember("6.6.6.1") || off.remember("7.7.7.7") || off.remember("7.7.7.7") {
+		t.Fatal("a disabled used-exit memory still honours refusals and never repeats otherwise")
+	}
+	none := newExitMemoryWithRefused(time.Hour, 0)
+	if none.refuse("8.8.8.8") || none.isRefused("8.8.8.8") {
+		t.Fatal("refusedTTL 0 disables the refused memory")
+	}
+	var nilMem *exitMemory
+	if nilMem.refuse("1.1.1.1") || nilMem.isRefused("1.1.1.1") || nilMem.refusedSize() != 0 {
+		t.Fatal("nil memory is inert")
+	}
+}
+
+func TestRotateHandlerBannedRefusesTheExitAndCoolsItsPool(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemoryWithRefused(time.Hour, 24*time.Hour)
+	pref = nil
+
+	st := NewStateTracker("fake")
+	st.RecordTunnelUp("Belgium", "9.9.9.9")
+	st.RecordCountry("BE", "BE")
+	st.Set(StateReady)
+	triggered := make(chan struct{}, 1)
+	h := rotateHandler(st, func() { triggered <- struct{}{} })
+
+	rr := httptest.NewRecorder()
+	h(rr, httptest.NewRequest(http.MethodPost, "/rotate?reason=banned", nil))
+	<-triggered
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rr.Code)
+	}
+	if !exits.isRefused("9.9.9.42") {
+		t.Fatal("reason=banned must put the exit's /24 into the refused memory")
+	}
+	if !blocked.cooledLocation("Belgium") || !blocked.cooledCountry("BE") {
+		t.Fatal("reason=banned must cool the location and country the refused exit came from")
+	}
+	if exits.size() != 0 {
+		t.Fatalf("a refusal is not a use: used prefixes = %d, want 0", exits.size())
+	}
+}
+
+func TestConnectWithRetryAvoidsARefusedPrefix(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemoryWithRefused(0, 24*time.Hour) // used-exit memory off: only the refusal can trip the retry
+	pref = nil
+
+	// First rotation lands on 2.2.2.2 and the crawler reports it banned.
+	// The next rotation is handed 2.2.2.9 (same /24) and must retry past
+	// it onto 3.3.3.3.
+	sp := newScriptedProvider([]string{"USA", "Canada"}, []bool{true, true, true}, []string{"2.2.2.2", "2.2.2.9", "3.3.3.3"})
+	st := NewStateTracker("scripted")
+	ns := &noSleep{}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", []string{"Canada"}, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("first rotation: %v", err)
+	}
+	if !noteRefusedExit("USA", "US", "2.2.2.2") {
+		t.Fatal("refusal must be recorded")
+	}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("second rotation: %v", err)
+	}
+	if snap := st.Snapshot(); st.Get() != StateReady || snap.CurrentExitIP != "3.3.3.3" {
+		t.Fatalf("the rotation must retry past the refused prefix: state=%s snapshot=%+v", st.Get(), snap)
+	}
+	if sp.attemptCount() != 3 {
+		t.Fatalf("attempts = %d, want 3 (first rotation, refused landing, retry)", sp.attemptCount())
+	}
+}
