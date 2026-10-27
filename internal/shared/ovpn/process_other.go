@@ -1,6 +1,6 @@
 //go:build !linux
 
-package ipvanish
+package ovpn
 
 import "os/exec"
 

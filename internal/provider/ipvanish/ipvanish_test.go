@@ -1,19 +1,13 @@
 package ipvanish
 
 import (
-	"bufio"
 	"context"
-	"errors"
-	"io"
-	"net"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 func TestParseFilename(t *testing.T) {
@@ -127,14 +121,13 @@ func TestOpenVPNConfigKeepsTransportAndOwnsLifecycle(t *testing.T) {
 		"verify-x509-name nyc-c28.ipvanish.com name", "auth SHA256", "<tls-auth>",
 		"dev " + tunnelInterface, "management \"/run/ipvanish/openvpn-1/management.sock\" unix",
 		"management-query-passwords", "management-hold", "auth-nocache", "redirect-gateway def1",
-		"connect-retry-max 1", "tun-mtu 1320", "mssfix 1280", "verb 0",
+		"connect-retry-max 1", "connect-timeout 15", "tun-mtu 1320", "mssfix 1280", "verb 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("config missing %q", want)
 		}
 	}
-	// Dropped vendor directives: at most once each, and only ours.
-	for _, dropped := range []string{"dev tun\n", "verb 3", "comp-lzo", "keysize", "tls-cipher", "cipher AES-256-CBC\nkeysize"} {
+	for _, dropped := range []string{"dev tun\n", "verb 3", "comp-lzo", "keysize", "tls-cipher", "cipher AES-256-CBC\nkeysize", "socks-proxy"} {
 		if strings.Contains(got, dropped) {
 			t.Errorf("config kept %q", dropped)
 		}
@@ -157,140 +150,36 @@ func TestOpenVPNConfigKeepsTransportAndOwnsLifecycle(t *testing.T) {
 	}
 }
 
-// managementFixture runs a real owned child (a sleep standing in for
-// openvpn) plus a Unix management peer, so lifecycle and credential
-// handling are exercised without routes or a TUN interface.
-func managementFixture(t *testing.T, user, pass string, authenticate bool) (string, <-chan net.Conn) {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "ipv-mgmt-")
+func TestOpenVPNConfigWarpDialsTCP443ThroughTheProxy(t *testing.T) {
+	raw, err := openVPNConfig([]byte(vendorConfig), "/run/ipvanish/openvpn-1/management.sock", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	path := filepath.Join(dir, "m.sock")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "openvpn"), []byte("#!/bin/sh\nexec sleep 30\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	connected := make(chan net.Conn, 1)
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		t.Cleanup(func() { _ = conn.Close() })
-		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		scanner := bufio.NewScanner(conn)
-		for range 2 { // "state on", "hold release"
-			if !scanner.Scan() {
-				return
-			}
-		}
-		if !authenticate {
-			connected <- conn
-			return
-		}
-		_, _ = io.WriteString(conn, ">PASSWORD:Need 'Auth' username/password\n")
-		for _, want := range []string{"username \"Auth\" " + strconv.Quote(user), "password \"Auth\" " + strconv.Quote(pass)} {
-			if !scanner.Scan() || scanner.Text() != want {
-				t.Error("management credential exchange mismatch")
-				_ = conn.Close()
-				return
-			}
-		}
-		_, _ = io.WriteString(conn, ">STATE:1,CONNECTED,SUCCESS,10.20.30.40,192.0.2.10,1194\n")
-		connected <- conn
-	}()
-	return path, connected
-}
-
-func TestManagedOpenVPNExchangesCredentialsAndOwnsItsChild(t *testing.T) {
-	const user, pass = "synthetic-user", "synthetic \"quoted\\password"
-	socket, peer := managementFixture(t, user, pass, true)
-	t.Setenv("TUNDLER_ACCOUNT_PASSWORD", "synthetic-account-secret")
-	ctx, cancel := context.WithCancel(context.Background())
-	tunnel, err := launchOpenVPN(ctx, t.TempDir(), "client.ovpn", socket, user, pass)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = tunnel.stop(context.Background()) })
-	cancel() // the connect deadline must not become the tunnel lifetime
-	if tunnel.address() != "10.20.30.40" {
-		t.Fatal("connected virtual IP not published")
-	}
-	for _, entry := range tunnel.cmd.Env {
-		if strings.Contains(entry, "synthetic-account-secret") {
-			t.Fatal("transport inherited the account secret")
+	got := string(raw)
+	for _, want := range []string{"proto tcp-client\n", "remote nyc-c28.ipvanish.com 443\n", "socks-proxy 127.0.0.1 40000\n", "connect-timeout 25\n"} {
+		if strings.Count(got, want) != 1 {
+			t.Errorf("warp config must contain %q exactly once:\n%s", want, got)
 		}
 	}
-	conn := <-peer
-	_, _ = io.WriteString(conn, ">STATE:2,RECONNECTING,ping-restart,,,,\n")
-	deadline := time.Now().Add(time.Second)
-	for tunnel.address() != "" && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if tunnel.address() != "" {
-		t.Fatal("reconnecting transport retained a usable virtual IP")
-	}
-	_ = conn.Close()
-	select {
-	case <-tunnel.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("management loss left the owned process running")
+	for _, dropped := range []string{"proto udp", "remote nyc-c28.ipvanish.com 443\nresolv", "connect-timeout 15"} {
+		if strings.Contains(got, dropped) {
+			t.Errorf("warp config kept %q", dropped)
+		}
 	}
 }
 
-func TestManagedOpenVPNClassifiesAuthFailedWithoutLeakingThePassword(t *testing.T) {
-	const user, pass = "synthetic-user", "synthetic-password"
-	socket, peer := managementFixture(t, user, pass, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go func() {
-		conn := <-peer
-		_, _ = io.WriteString(conn, ">PASSWORD:Verification Failed: 'Auth' ['"+pass+"']\n")
-	}()
-	tunnel, err := launchOpenVPN(ctx, t.TempDir(), "client.ovpn", socket, user, pass)
-	if tunnel != nil || !errors.Is(err, errAuthFailed) {
-		t.Fatalf("AUTH_FAILED was not classified: tunnel=%v err=%v", tunnel, err)
+func TestTransportDefaultsToWarp(t *testing.T) {
+	t.Setenv(envTransport, "")
+	if transport() != transportWarp {
+		t.Fatal("default transport must be warp")
 	}
-	if strings.Contains(err.Error(), pass) {
-		t.Fatal("authentication error exposed the password")
+	t.Setenv(envTransport, "direct")
+	if transport() != transportDirect {
+		t.Fatal("direct must be honoured")
 	}
-}
-
-func TestManagedOpenVPNCancellationStopsPendingConnection(t *testing.T) {
-	socket, peer := managementFixture(t, "u", "p", false)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { <-peer; cancel() }()
-	if tunnel, err := launchOpenVPN(ctx, t.TempDir(), "client.ovpn", socket, "u", "p"); err == nil || tunnel != nil {
-		t.Fatal("cancelled connection succeeded")
-	}
-}
-
-func TestStopTerminatesOnlyTheOwnedChild(t *testing.T) {
-	unrelated := exec.Command("sleep", "30")
-	if err := unrelated.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
-	owned := exec.Command("sleep", "30")
-	if err := owned.Start(); err != nil {
-		t.Fatal(err)
-	}
-	tunnel := &openVPNTunnel{cmd: owned, done: make(chan struct{}), events: make(chan struct{}, 1)}
-	go func() { _ = owned.Wait(); close(tunnel.done) }()
-	if err := tunnel.stop(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
-		t.Fatal("stop reached an unrelated process")
+	t.Setenv(envTransport, "bogus")
+	if transport() != transportWarp {
+		t.Fatal("unknown transport must fall back to warp")
 	}
 }
 
@@ -311,8 +200,7 @@ func TestActiveLocationRoundTripAndDisconnect(t *testing.T) {
 	if err := owned.Start(); err != nil {
 		t.Fatal(err)
 	}
-	tunnel := &openVPNTunnel{cmd: owned, done: make(chan struct{}), events: make(chan struct{}, 1)}
-	go func() { _ = owned.Wait(); close(tunnel.done) }()
+	tunnel := ovpn.NewForTest(owned)
 	activeMu.Lock()
 	current = &active{tunnel: tunnel, server: &ipvanishServer{Country: "United States", City: "New York"}, location: "United States"}
 	activeMu.Unlock()
@@ -329,7 +217,7 @@ func TestActiveLocationRoundTripAndDisconnect(t *testing.T) {
 		t.Fatal("Disconnect must clear the active connection")
 	}
 	select {
-	case <-tunnel.done:
+	case <-tunnel.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("Disconnect left the owned process running")
 	}
@@ -352,43 +240,5 @@ func TestFindServersMatchesCountryCodeAndCity(t *testing.T) {
 	}
 	if n := len(findServers(servers, "")); n != 3 {
 		t.Fatalf("empty location = %d, want all", n)
-	}
-}
-
-func TestOpenVPNConfigWarpDialsTCP443ThroughTheProxy(t *testing.T) {
-	raw, err := openVPNConfig([]byte(vendorConfig), "/run/ipvanish/openvpn-1/management.sock", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := string(raw)
-	for _, want := range []string{"proto tcp-client\n", "remote nyc-c28.ipvanish.com 443\n", "socks-proxy 127.0.0.1 40000\n", "connect-timeout 25\n"} {
-		if strings.Count(got, want) != 1 {
-			t.Errorf("warp config must contain %q exactly once:\n%s", want, got)
-		}
-	}
-	for _, dropped := range []string{"proto udp", "remote nyc-c28.ipvanish.com 443\nresolv", "connect-timeout 15"} {
-		if strings.Contains(got, dropped) {
-			t.Errorf("warp config kept %q", dropped)
-		}
-	}
-	// Direct mode leaves the vendor transport alone.
-	direct, _ := openVPNConfig([]byte(vendorConfig), "/m.sock", false)
-	if strings.Contains(string(direct), "socks-proxy") || !strings.Contains(string(direct), "proto udp\n") {
-		t.Fatal("direct mode must keep the vendor UDP transport")
-	}
-}
-
-func TestTransportDefaultsToWarp(t *testing.T) {
-	t.Setenv(envTransport, "")
-	if transport() != transportWarp {
-		t.Fatal("default transport must be warp")
-	}
-	t.Setenv(envTransport, "direct")
-	if transport() != transportDirect {
-		t.Fatal("direct must be honoured")
-	}
-	t.Setenv(envTransport, "bogus")
-	if transport() != transportWarp {
-		t.Fatal("unknown transport must fall back to warp")
 	}
 }

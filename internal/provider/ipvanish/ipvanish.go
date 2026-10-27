@@ -46,6 +46,7 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 	"github.com/laurentpellegrino/tundler/internal/shared/warpproxy"
 )
 
@@ -81,7 +82,7 @@ type ipvanishServer struct {
 // active is the current connection: the owned openvpn child plus what
 // it was asked to connect to.
 type active struct {
-	tunnel   *openVPNTunnel
+	tunnel   *ovpn.Tunnel
 	server   *ipvanishServer
 	location string
 }
@@ -266,9 +267,9 @@ func isOpenVPNConnected() bool {
 }
 
 // waitForRoute waits for the pushed default route to land.
-func waitForRoute(ctx context.Context, tunnel *openVPNTunnel) bool {
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
 	deadline := time.Now().Add(routeTimeout)
-	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.address() != "" {
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
 		if isOpenVPNConnected() {
 			return true
 		}
@@ -331,7 +332,7 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 		}
 		server := &matches[idx]
 		tunnel, err := startTunnel(ctx, server, user, pass)
-		if errors.Is(err, errAuthFailed) {
+		if errors.Is(err, ovpn.ErrAuthFailed) {
 			// Account-wide: another server would be one more login
 			// against the rate rule. Report it so the runtime holds.
 			shared.Debugf("IPVanish: %s: %v", server.Hostname, err)
@@ -345,7 +346,7 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 		if !waitForRoute(ctx, tunnel) {
 			shared.Debugf("IPVanish: %s: connected but the default route never moved to %s", server.Hostname, tunnelInterface)
 			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
-			_ = tunnel.stop(stopCtx)
+			_ = tunnel.Stop(stopCtx)
 			cancel()
 			continue
 		}
@@ -361,7 +362,7 @@ func (i IPVanish) Connected(ctx context.Context) bool {
 	activeMu.RLock()
 	a := current
 	activeMu.RUnlock()
-	return a != nil && a.tunnel.address() != "" && isOpenVPNConnected()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
 }
 
 // disconnect stops the owned tunnel, if any, and forgets it.
@@ -375,7 +376,7 @@ func disconnect(ctx context.Context) {
 	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
 	defer cancel()
-	if err := a.tunnel.stop(stopCtx); err != nil {
+	if err := a.tunnel.Stop(stopCtx); err != nil {
 		shared.Debugf("IPVanish: %v", err)
 	}
 }
