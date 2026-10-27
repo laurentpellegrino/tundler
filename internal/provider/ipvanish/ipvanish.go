@@ -17,6 +17,17 @@
 // Every connect is a login, so Connect tries at most a couple of servers
 // of the requested location, never the whole pool, and never retries
 // after AUTH_FAILED.
+//
+// Outer transport (IPVANISH_TRANSPORT):
+//
+//   - warp (default): IPVanish drops datacenter source IPs at L3 (from
+//     Hetzner its servers answer neither ping nor TCP 443; from a
+//     residential line both work — verified 2026-10-27). The OpenVPN
+//     connection rides Cloudflare WARP in proxy mode (see
+//     internal/shared/warpproxy): TCP/443 to the same server through the
+//     local SOCKS5 proxy, which presents a Cloudflare source IP.
+//   - direct: the vendor config as is, UDP, no WARP. For hosts whose
+//     own source IP IPVanish accepts (residential lines).
 package ipvanish
 
 import (
@@ -35,11 +46,15 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/warpproxy"
 )
 
 const (
 	name             = "ipvanish"
 	defaultConfigDir = "/etc/ipvanish/openvpn"
+	envTransport     = "IPVANISH_TRANSPORT"
+	transportWarp    = "warp"
+	transportDirect  = "direct"
 	defaultRunDir    = "/run/ipvanish"
 	// connectTimeout bounds one openvpn attempt: management startup,
 	// TLS handshake and the CONNECTED state.
@@ -106,6 +121,21 @@ func runDir() string {
 		return dir
 	}
 	return defaultRunDir
+}
+
+// transport returns the configured outer transport: warp (default) or
+// direct. Unknown values fall back to warp with a log line.
+func transport() string {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(envTransport)))
+	switch raw {
+	case "", transportWarp:
+		return transportWarp
+	case transportDirect:
+		return transportDirect
+	default:
+		shared.Debugf("IPVanish: unknown %s=%q, using %s", envTransport, raw, transportWarp)
+		return transportWarp
+	}
 }
 
 func getCredentials() (string, string, error) {
@@ -280,6 +310,20 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	// One tunnel at a time: drop whatever we own before dialing.
 	disconnect(ctx)
 
+	if transport() == transportWarp {
+		// The SOCKS proxy must forward before openvpn dials through
+		// it, and WARP's own packets must never be routed into the
+		// tunnel openvpn is about to bring up.
+		if err := warpproxy.Up(ctx); err != nil {
+			shared.Debugf("IPVanish: WARP transport not ready: %v", err)
+			return failed
+		}
+		if err := warpproxy.PinEdge(ctx); err != nil {
+			shared.Debugf("IPVanish: %v", err)
+			return failed
+		}
+	}
+
 	rand.Shuffle(len(matches), func(a, b int) { matches[a], matches[b] = matches[b], matches[a] })
 	for idx := range matches {
 		if idx >= serversPerConnect || ctx.Err() != nil {
@@ -369,6 +413,13 @@ func (i IPVanish) Login(ctx context.Context) error {
 	}
 	if _, err := loadServers(); err != nil {
 		return err
+	}
+	if transport() == transportWarp {
+		// Bring the WARP proxy up at login so the first Connect has
+		// it ready. Non-fatal: Connect re-checks and retries.
+		if err := warpproxy.Up(ctx); err != nil {
+			shared.Debugf("IPVanish: WARP not up at login (will retry on Connect): %v", err)
+		}
 	}
 	loggedIn = true
 	return nil

@@ -127,18 +127,19 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
 # directly at connect time. The `|| true` lines are no-ops for those
 # images.
 #
-# fastvpn is the exception among the OpenVPN-direct providers: its
-# outer connection goes through Cloudflare WARP's local SOCKS5 proxy
-# (WLVPN's edge blocks datacenter IPs), so it needs warp-svc running
-# just like the standalone warp provider. The fastvpn Go provider
-# puts WARP in proxy mode and connects it at Login/Connect via
-# warp-cli, which needs the daemon.
+# fastvpn and ipvanish are the exceptions among the OpenVPN-direct
+# providers: their outer connection goes through Cloudflare WARP's
+# local SOCKS5 proxy (both edges block datacenter IPs), so they need
+# warp-svc running just like the standalone warp provider. The Go
+# providers put WARP in proxy mode and connect it at Login/Connect via
+# warp-cli (internal/shared/warpproxy), which needs the daemon.
 RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
         pia)        systemctl enable piavpn.service || true ;; \
         warp)       systemctl enable warp-svc.service || true ;; \
         fastvpn)    systemctl enable warp-svc.service || true ;; \
+        ipvanish)   systemctl enable warp-svc.service || true ;; \
         *)          : ;; \
     esac
 
