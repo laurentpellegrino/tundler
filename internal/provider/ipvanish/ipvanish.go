@@ -1,11 +1,30 @@
+// Package ipvanish is the IPVanish provider: OpenVPN-direct from the
+// vendor's official .ovpn set (baked into the image from the
+// `ipvanish-configs` GitHub release), one owned openvpn child per
+// connection supervised over a private management socket (openvpn.go).
+//
+// What makes IPVanish different from the other OpenVPN-direct providers
+// is its anti-abuse rule: too many logins in a short window suspends the
+// whole account for about 24 hours, every further login extends the
+// suspension, and a suspended account answers every connect with
+// AUTH_FAILED. The 2026-05 outage was exactly that spiral — the old
+// provider could not tell AUTH_FAILED from a dead server, reported a
+// "connection timeout", and the runtime's retry kept logging in. So this
+// provider classifies AUTH_FAILED (Status.AuthFailed) and the runtime
+// holds every connect for a long, growing backoff when it sees it; the
+// fleet keeps ipvanish on a 24 h rotation window for the same reason.
+//
+// Every connect is a login, so Connect tries at most a couple of servers
+// of the requested location, never the whole pool, and never retries
+// after AUTH_FAILED.
 package ipvanish
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -21,8 +40,16 @@ import (
 const (
 	name             = "ipvanish"
 	defaultConfigDir = "/etc/ipvanish/openvpn"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
+	defaultRunDir    = "/run/ipvanish"
+	// connectTimeout bounds one openvpn attempt: management startup,
+	// TLS handshake and the CONNECTED state.
+	connectTimeout = 35 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
+	// serversPerConnect caps how many servers of a location one Connect
+	// tries. Each try is a login against the abuse-rate rule.
+	serversPerConnect = 2
 )
 
 type IPVanish struct{}
@@ -36,47 +63,25 @@ type ipvanishServer struct {
 	Filename string
 }
 
-var (
-	serverCache    []ipvanishServer
-	serverCacheMu  sync.RWMutex
-	activeServer   *ipvanishServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+// active is the current connection: the owned openvpn child plus what
+// it was asked to connect to.
+type active struct {
+	tunnel   *openVPNTunnel
+	server   *ipvanishServer
+	location string
+}
 
+var (
 	// Filename format: ipvanish-<CC>-<City-with-hyphens>[---Virtual]-<3letter>-<a|b|c>NN(N).ovpn
 	filenameRe = regexp.MustCompile(`^ipvanish-([A-Z]{2})-(.+)-([a-z]{3})-([abc]\d+)\.ovpn$`)
 
-	// Matches a bare "auth-user-pass" directive (no file argument), which
-	// IPVanish ships in every config. We rewrite it so OpenVPN reads our
-	// credentials file instead of prompting interactively.
-	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
+	serverCache   []ipvanishServer
+	serverCacheMu sync.RWMutex
 
-	// IPVanish configs still carry directives OpenVPN 2.6 / OpenSSL 3
-	// either reject outright or that silently break the handshake:
-	//
-	//   keysize        — removed from OpenVPN 2.6, the daemon refuses
-	//                    to start with it present.
-	//   comp-lzo       — enables receive-side compression (the VORACLE
-	//                    attack vector); OpenVPN 2.6 warns but starts.
-	//   cipher AES-…   — IPVanish ships `cipher AES-256-CBC`. OpenVPN
-	//                    2.6 ignores --cipher for the data channel
-	//                    (it negotiates via --data-ciphers NCP instead)
-	//                    and only emits a DEPRECATED-OPTION warning,
-	//                    so this is purely log noise. Stripped to
-	//                    quiet the boot logs.
-	//   tls-cipher …   — THE invisible-failure directive. IPVanish
-	//                    pins the TLS control-channel cipher to three
-	//                    TLS_*_CBC_SHA suites that OpenSSL 3 disables
-	//                    at SecLevel=2 (SHA-1 MAC, no PFS, etc.).
-	//                    Result: OpenSSL has no cipher to offer, no
-	//                    TLS Client Hello is ever sent, the server
-	//                    hears silence — looks identical to an IP
-	//                    block from our side. Stripping the directive
-	//                    lets OpenSSL use its modern default cipher
-	//                    list (TLS_AES_256_GCM_SHA384 et al.) and
-	//                    the handshake actually proceeds.
-	deprecatedDirectivesRe = regexp.MustCompile(`(?m)^(keysize|comp-lzo|cipher|tls-cipher)\b.*$`)
+	activeMu sync.RWMutex
+	current  *active
+
+	loggedIn bool
 )
 
 func init() {
@@ -92,6 +97,15 @@ func configDir() string {
 		return dir
 	}
 	return defaultConfigDir
+}
+
+// runDir holds the per-connection config and management socket
+// (tmpfs in the image; Unix socket paths are limited to 107 bytes).
+func runDir() string {
+	if dir := os.Getenv("IPVANISH_RUN_DIR"); dir != "" {
+		return dir
+	}
+	return defaultRunDir
 }
 
 func getCredentials() (string, string, error) {
@@ -111,7 +125,8 @@ func getCredentials() (string, string, error) {
 }
 
 // parseFilename turns a config filename into an ipvanishServer entry, or
-// reports false when the filename doesn't match IPVanish's convention.
+// reports false when the filename doesn't match IPVanish's convention:
+// ipvanish-<CC>-<City-with-hyphens>[---Virtual]-<3letter>-<a|b|c>NN(N).ovpn
 func parseFilename(filename string) (ipvanishServer, bool) {
 	m := filenameRe.FindStringSubmatch(filename)
 	if m == nil {
@@ -206,163 +221,123 @@ func findServers(servers []ipvanishServer, location string) []ipvanishServer {
 	return matches
 }
 
-func pickRandomServer(servers []ipvanishServer) *ipvanishServer {
-	if len(servers) == 0 {
-		return nil
-	}
-	s := servers[rand.Intn(len(servers))]
-	return &s
-}
-
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
-}
-
-func writeActiveConfig(server *ipvanishServer, credentialsFile string) (string, error) {
-	src := filepath.Join(configDir(), server.Filename)
-	raw, err := os.ReadFile(src)
-	if err != nil {
-		return "", fmt.Errorf("failed to read %s: %w", src, err)
-	}
-	rewritten := authUserPassRe.ReplaceAllString(string(raw), "auth-user-pass "+credentialsFile)
-	rewritten = deprecatedDirectivesRe.ReplaceAllString(rewritten, "")
-
-	dst := filepath.Join(configDir(), activeConfigName)
-	if err := os.WriteFile(dst, []byte(rewritten), 0600); err != nil {
-		return "", fmt.Errorf("failed to write active config: %w", err)
-	}
-	return dst, nil
-}
-
-// isOpenVPNConnected returns true once the tunnel's redirect-gateway
-// push has actually taken effect — i.e. a route LOOKUP for an
-// arbitrary public address resolves via tun0, not via eth0. The
-// looser "any route on tun0 exists" check returns true too early:
-// openvpn installs the per-pod link-local route (e.g. 10.x.0.0/24
-// dev tun0) BEFORE the redirect-gateway default-eclipsing routes are
-// pushed, so the exit-IP contract probe in cmd/tundler-tunnel/egress.go
-// would fire while the main-ns default route is still via eth0 and
-// flag a leak that doesn't actually exist (CrashLooping the pod).
-//
-// `ip route get 8.8.8.8` returns the route the kernel would pick for
-// that dst RIGHT NOW; checking for " dev tun0 " confirms the tunnel
-// is genuinely the path packets take. Same fix as cyberghost.go /
-// protonvpn.go / surfshark.go's OpenVPN branch. Looks in MAIN
-// namespace (not vpnns) because openvpn is launched via RunCmd
-// (main-ns default) — see the comment at the openvpn spawn site.
-// Silent variant so the connect-poll loop doesn't swamp journald
-// while the tunnel is still coming up.
+// isOpenVPNConnected reports whether the tunnel is the path packets
+// take RIGHT NOW: a route lookup for a public address resolves via the
+// tunnel interface. The looser "the interface exists" check is true too
+// early (openvpn adds the link-local route before the redirect-gateway
+// routes), which would trip the exit-IP contract probe on a leak that
+// does not exist. Main namespace: openvpn runs there, see openvpn.go.
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+// waitForRoute waits for the pushed default route to land.
+func waitForRoute(ctx context.Context, tunnel *openVPNTunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // ActiveLocation returns whatever was passed to Connect — i.e. an entry from
 // Locations(). Reporting the verbatim pool string lets a config block/allow
 // list round-trip. Granular per-server detail is exposed via Status.Region.
 func (i IPVanish) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (i IPVanish) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
 	user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("IPVanish: %v", err)
-		return provider.Status{Connected: false, Provider: name}
+		return failed
 	}
-
 	servers, err := loadServers()
 	if err != nil {
 		shared.Debugf("IPVanish: failed to load servers: %v", err)
-		return provider.Status{Connected: false, Provider: name}
+		return failed
 	}
-
 	matches := findServers(servers, location)
 	if len(matches) == 0 {
 		shared.Debugf("IPVanish: no servers found for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
 
-	server := pickRandomServer(matches)
-	credFile, err := writeCredentials(user, pass)
-	if err != nil {
-		shared.Debugf("IPVanish: failed to write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-	if _, err := writeActiveConfig(server, credFile); err != nil {
-		shared.Debugf("IPVanish: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
 
-	// --cd so the config's relative `ca ca.ipvanish.com.crt` resolves.
-	// --tun-mtu / --mssfix clamp packet size below the k8s pod MTU
-	// (typically 1370 on Talos/Cilium); without these, OpenVPN's
-	// default 1500-byte MTU produces oversized UDP packets that get
-	// dropped on the path, causing the TLS handshake to never
-	// complete and the connect to time out.
-	//
-	// RunCmd (the default — main ns, NOT a NetNS variant) so openvpn — and the tun0 it creates
-	// — land in the pod's MAIN network namespace. The in-process
-	// CONNECT proxy in tundler-tunnel dials upstream with a plain
-	// net.DialTimeout (no fwmark), so the only way proxy traffic
-	// flows through the VPN is if tun0 is the main-ns default route.
-	// `shared.RunCmd` wraps under `ip netns exec vpnns` because the
-	// systemd unit sets TUNDLER_NETNS=vpnns — that would put tun0 in
-	// vpnns, where the proxy can't reach it, and the proxy would
-	// then leak crawler traffic out the pod's node IP.
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir(),
-		"--config", activeConfigName,
-		"--tun-mtu", "1320",
-		"--mssfix", "1280",
-		"--daemon"); err != nil {
-		shared.Debugf("IPVanish: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			activeMu.Lock()
-			activeLocation = location
-			activeMu.Unlock()
-			return i.Status(ctx)
+	rand.Shuffle(len(matches), func(a, b int) { matches[a], matches[b] = matches[b], matches[a] })
+	for idx := range matches {
+		if idx >= serversPerConnect || ctx.Err() != nil {
+			break
 		}
+		server := &matches[idx]
+		tunnel, err := startTunnel(ctx, server, user, pass)
+		if errors.Is(err, errAuthFailed) {
+			// Account-wide: another server would be one more login
+			// against the rate rule. Report it so the runtime holds.
+			shared.Debugf("IPVanish: %s: %v", server.Hostname, err)
+			failed.AuthFailed = true
+			return failed
+		}
+		if err != nil {
+			shared.Debugf("IPVanish: %s: %v", server.Hostname, err)
+			continue
+		}
+		if !waitForRoute(ctx, tunnel) {
+			shared.Debugf("IPVanish: %s: connected but the default route never moved to %s", server.Hostname, tunnelInterface)
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+			_ = tunnel.stop(stopCtx)
+			cancel()
+			continue
+		}
+		activeMu.Lock()
+		current = &active{tunnel: tunnel, server: server, location: location}
+		activeMu.Unlock()
+		return i.Status(ctx)
 	}
-
-	shared.Debugf("IPVanish: connection timeout for %s", server.Hostname)
-	return provider.Status{Connected: false, Provider: name, Location: location}
+	return failed
 }
 
 func (i IPVanish) Connected(ctx context.Context) bool {
-	return isOpenVPNConnected()
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.address() != "" && isOpenVPNConnected()
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.stop(stopCtx); err != nil {
+		shared.Debugf("IPVanish: %v", err)
+	}
 }
 
 func (i IPVanish) Disconnect(ctx context.Context) error {
-	// Direct (no netns wrap) — matches the namespace openvpn was
-	// started in. pkill itself is netns-agnostic (it walks the
-	// host pidns), but keeping all openvpn-lifecycle commands on
-	// the Direct path makes the symmetry obvious.
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 20; j++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
 
@@ -386,6 +361,8 @@ func (i IPVanish) Locations(ctx context.Context) []string {
 
 func (i IPVanish) LoggedIn(ctx context.Context) bool { return loggedIn }
 
+// Login only checks that credentials and configs are present: IPVanish
+// has no session, every connect authenticates on its own.
 func (i IPVanish) Login(ctx context.Context) error {
 	if _, _, err := getCredentials(); err != nil {
 		return err
@@ -437,13 +414,15 @@ func publicIP(ctx context.Context) string {
 }
 
 func activeRegion() string {
-	if activeServer == nil {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if current == nil || current.server == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
+	if current.server.City != "" {
+		return current.server.Country + " - " + current.server.City
 	}
-	return activeServer.Country
+	return current.server.Country
 }
 
 func (i IPVanish) Version(ctx context.Context) (string, error) {

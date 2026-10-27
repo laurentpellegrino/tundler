@@ -51,7 +51,7 @@ integration shapes:
 | Shape | Providers | How it connects |
 |-------|-----------|-----------------|
 | **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
-| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs) |
+| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs; `ipvanish` owns its openvpn child over a management socket, passes the password through it and reports `AUTH_FAILED` as an auth failure so the runtime holds instead of re-logging in, because IPVanish suspends accounts that log in too often) |
 | **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
@@ -230,6 +230,7 @@ curl http://localhost:4242/status
 | `POD_NAME` / `POD_NAMESPACE` | downward-API identity; the pod's ordinal (from `POD_NAME`) selects its account |
 | `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
 | `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
+| `TUNDLER_AUTH_FAILURE_BACKOFF_SECONDS` | hold on every connect after the provider rejects the credentials (`Status.AuthFailed`, e.g. OpenVPN `AUTH_FAILED`); doubles per consecutive rejection up to 24 h, cleared by the next successful connect (default 3600) |
 | `TUNDLER_FLEET_LAYOUT` | fleet topology file for the soft region-spread preference (default `/etc/tundler/fleet/vpn-providers.yaml`, re-read at every pick) |
 | `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | static fallback for the region-spread preference when no topology file is mounted |
 | `TUNDLER_FLEET_REPLICAS` | with the static fallback: this provider's pod count, the rotation stride of the region walk (default 1) |
