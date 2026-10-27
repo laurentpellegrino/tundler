@@ -65,6 +65,7 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/warpproxy"
 )
 
 const (
@@ -75,20 +76,7 @@ const (
 
 	transportWarp   = "warp"
 	transportDirect = "direct"
-
-	warpCli = "warp-cli"
-	// warpProxyPort is where warp-svc listens in proxy mode (its
-	// default); openvpn's outer TCP connection is dialed through it.
-	warpProxyPort = "40000"
-	// warpEdgeRange is Cloudflare's WARP anycast block: the MASQUE
-	// endpoints (162.159.198.x) and DoH resolvers (162.159.36.1,
-	// 162.159.46.1). Pinned via the original eth0 gateway so WARP's
-	// own transport never routes into openvpn's tun0.
-	warpEdgeRange = "162.159.0.0/16"
-	warpTrace     = "https://www.cloudflare.com/cdn-cgi/trace"
 )
-
-var warpFlags = []string{"--accept-tos"}
 
 type FastVPN struct{}
 
@@ -178,102 +166,6 @@ func getCredentials() (string, string, error) {
 		return "", "", err
 	}
 	return user, pass, nil
-}
-
-// ----------------------------------------------------------------------
-// WARP transport (proxy mode)
-// ----------------------------------------------------------------------
-
-func warpRun(ctx context.Context, args ...string) (string, error) {
-	return shared.RunCmd(ctx, warpCli, append(append([]string(nil), warpFlags...), args...)...)
-}
-
-// warpOn probes Cloudflare's trace endpoint THROUGH the SOCKS proxy —
-// the authoritative "proxy is actually forwarding" signal (warp-cli
-// status flips to Connected a moment before traffic flows, and a
-// direct probe would only describe the host's own path).
-func warpOn(ctx context.Context) bool {
-	out, err := shared.RunCmd(ctx, "curl", "-s", "--max-time", "5",
-		"--socks5-hostname", "127.0.0.1:"+warpProxyPort, warpTrace)
-	if err != nil {
-		return false
-	}
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.TrimSpace(ln) == "warp=on" {
-			return true
-		}
-	}
-	return false
-}
-
-// warpUp ensures the WARP SOCKS proxy is up. Idempotent: registers
-// only if no live registration, switches to proxy mode, connects and
-// polls until the proxy forwards. The registration is never deleted
-// on rotation — WARP is pure transport here, not the rotating exit
-// identity (FastVPN provides that).
-func warpUp(ctx context.Context) error {
-	if warpOn(ctx) {
-		return nil
-	}
-	reg, _ := warpRun(ctx, "registration", "show")
-	low := strings.ToLower(reg)
-	if !strings.Contains(low, "device id") && !strings.Contains(low, "account") {
-		if _, err := warpRun(ctx, "registration", "new"); err != nil {
-			return fmt.Errorf("warp registration new: %w", err)
-		}
-	}
-	if _, err := warpRun(ctx, "mode", "proxy"); err != nil {
-		return fmt.Errorf("warp mode proxy: %w", err)
-	}
-	_, _ = warpRun(ctx, "proxy", "port", warpProxyPort)
-	if _, err := warpRun(ctx, "connect"); err != nil {
-		return fmt.Errorf("warp connect: %w", err)
-	}
-	for i := 0; i < 60; i++ {
-		if warpOn(ctx) {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return fmt.Errorf("warp proxy did not reach warp=on within 30s")
-}
-
-// origDefaultGateway returns the eth0 next-hop from the main table's
-// default route. openvpn's `redirect-gateway def1` adds 0.0.0.0/1 and
-// 128.0.0.0/1 on top of it rather than replacing it, so this stays
-// "via <gw> dev eth0" with the tunnel up.
-func origDefaultGateway(ctx context.Context) (string, error) {
-	out, err := shared.RunCmd(ctx, "ip", "route", "show", "default", "dev", "eth0")
-	if err != nil || strings.TrimSpace(out) == "" {
-		// Fall back to the unscoped default.
-		out, err = shared.RunCmd(ctx, "ip", "route", "show", "default")
-		if err != nil {
-			return "", err
-		}
-	}
-	// Parse "default via 10.0.x.2 dev eth0 ..."
-	fields := strings.Fields(out)
-	for i, f := range fields {
-		if f == "via" && i+1 < len(fields) {
-			return fields[i+1], nil
-		}
-	}
-	return "", fmt.Errorf("no `via` gateway in default route: %q", out)
-}
-
-// pinWarpEdge routes Cloudflare's WARP block via the original
-// gateway. /16 is more specific than openvpn's 0.0.0.0/1 and
-// 128.0.0.0/1, so the order relative to openvpn's start doesn't
-// matter. Idempotent (route replace).
-func pinWarpEdge(ctx context.Context) error {
-	gw, err := origDefaultGateway(ctx)
-	if err != nil {
-		return fmt.Errorf("find original gateway: %w", err)
-	}
-	if _, err := shared.RunCmd(ctx, "ip", "route", "replace", warpEdgeRange, "via", gw, "dev", "eth0"); err != nil {
-		return fmt.Errorf("pin warp edge %s: %w", warpEdgeRange, err)
-	}
-	return nil
 }
 
 // ----------------------------------------------------------------------
@@ -394,7 +286,7 @@ func writeActiveConfig(server *fastvpnServer, credentialsFile string) (string, e
 	}
 	rewritten := authUserPassRe.ReplaceAllString(string(raw), "auth-user-pass "+credentialsFile)
 	if transport() == transportWarp {
-		rewritten = strings.TrimRight(rewritten, "\n") + "\nsocks-proxy 127.0.0.1 " + warpProxyPort + "\n"
+		rewritten = strings.TrimRight(rewritten, "\n") + "\nsocks-proxy " + warpproxy.Addr + "\n"
 	}
 	dst := filepath.Join(configDir(), activeConfigName)
 	if err := os.WriteFile(dst, []byte(rewritten), 0600); err != nil {
@@ -469,11 +361,11 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 		// The SOCKS proxy must forward before openvpn dials through
 		// it, and WARP's own packets must never be routed into the
 		// tunnel openvpn is about to bring up.
-		if err := warpUp(ctx); err != nil {
+		if err := warpproxy.Up(ctx); err != nil {
 			shared.Debugf("FastVPN: WARP transport not ready: %v", err)
 			return provider.Status{Connected: false, Provider: name}
 		}
-		if err := pinWarpEdge(ctx); err != nil {
+		if err := warpproxy.PinEdge(ctx); err != nil {
 			shared.Debugf("FastVPN: %v", err)
 			return provider.Status{Connected: false, Provider: name}
 		}
@@ -576,8 +468,8 @@ func (f FastVPN) Login(ctx context.Context) error {
 	if transport() == transportWarp {
 		// Bring the WARP proxy up at login so the first Connect() has
 		// it ready. Non-fatal if it isn't up yet — Connect() re-checks
-		// and retries warpUp.
-		if err := warpUp(ctx); err != nil {
+		// and retries warpproxy.Up.
+		if err := warpproxy.Up(ctx); err != nil {
 			shared.Debugf("FastVPN: WARP not up at login (will retry on Connect): %v", err)
 		}
 	}
