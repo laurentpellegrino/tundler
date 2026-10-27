@@ -129,22 +129,30 @@ then switch each provider's manifest to the accounts directory.
 
 ## Region spread (soft)
 
-When the deployment renderer injects `TUNDLER_FLEET_SLOT_BASE` +
-`TUNDLER_FLEET_SLOTS`, every pod computes the same epoch-seeded country
-ordering. The provider's block start (`base / slots` of the way around
+When the pod can see the fleet topology — the deployment's
+`vpn-providers.yaml` mounted at `/etc/tundler/fleet/vpn-providers.yaml`
+(`TUNDLER_FLEET_LAYOUT` overrides the path), or failing that the static
+`TUNDLER_FLEET_SLOT_BASE` + `TUNDLER_FLEET_SLOTS` env — every pod
+computes the same epoch-seeded country ordering. From the file, each
+provider's block is `max_tunnels` consecutive slots, providers in sorted
+name order; the file is re-read at every pick, so a topology edit (a
+provider enabled or resized) lands at each pod's next rotation without a
+pod roll. The provider's block start (`base / slots` of the way around
 that ring) picks where the provider begins, and its pods take
 consecutive countries from the ring-ordered list of countries the
 provider actually offers (ordinal 0 the first, ordinal 1 the next, …),
 so siblings land on distinct countries with **zero coordination** (no
 peer traffic, no extra RBAC) for as long as the catalog has one to
-spare. Each rotation advances a pod by `TUNDLER_FLEET_REPLICAS` (the
-provider's pod count) along that list, so a pod only ever visits its
-own positions and siblings with different rotation histories never
-meet (without the replicas env the stride is one). It is a preference,
+spare. Each rotation advances a pod by the provider's pod count
+(`max_tunnels` from the file, `TUNDLER_FLEET_REPLICAS` with the static
+env) along that list, so a pod only ever visits its own positions and
+siblings with different rotation histories never meet (without a pod
+count the stride is one). It is a preference,
 never a guarantee: any miss falls back to the classic uniform-random
 pick, and providers with unmappable location vocabularies (city names,
 `auto`) simply ignore it. `/status` exposes `fleet_slot`,
-`preferred_country` and `current_country`. Absent env = feature off.
+`preferred_country` and `current_country`. No file and no env = feature
+off.
 
 A rotation re-picks in the same country (another location when the
 country has one) for up to `TUNDLER_COUNTRY_DWELL` rotations (default
@@ -222,8 +230,9 @@ curl http://localhost:4242/status
 | `POD_NAME` / `POD_NAMESPACE` | downward-API identity; the pod's ordinal (from `POD_NAME`) selects its account |
 | `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
 | `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
-| `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | enable the soft region-spread preference |
-| `TUNDLER_FLEET_REPLICAS` | this provider's pod count: rotation stride of the region walk (default 1) |
+| `TUNDLER_FLEET_LAYOUT` | fleet topology file for the soft region-spread preference (default `/etc/tundler/fleet/vpn-providers.yaml`, re-read at every pick) |
+| `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | static fallback for the region-spread preference when no topology file is mounted |
+| `TUNDLER_FLEET_REPLICAS` | with the static fallback: this provider's pod count, the rotation stride of the region walk (default 1) |
 | `TUNDLER_COUNTRY_DWELL` | rotations a pod spends in one country before the region walk moves on (default 4, `0` = every rotation) |
 | `TUNDLER_EXIT_MEMORY` | how long an exit prefix (/24, IPv6 /48) is remembered; a rotation landing in a remembered prefix cools its location and country and retries elsewhere (default `1h`, `0` disables) |
 | `TUNDLER_BLOCKED_COOLDOWN` | how long a spent location and country stay skipped (default `1h`, `0` disables) |

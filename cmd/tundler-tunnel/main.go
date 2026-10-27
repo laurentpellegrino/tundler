@@ -281,14 +281,17 @@ func main() {
 	exits = newExitMemoryFromEnv()
 	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s), refused-exit memory %s (%s)",
 		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory, exits.refusedTTL, envRefusedMemory)
-	pref = newLocationPreferenceFromEnv()
+	pref = newLocationPreference(providerName)
 	if pref != nil {
 		pref.cooldown = blocked
-		state.SetFleetSlot(pref.slot)
+		pref.onSlot = state.SetFleetSlot
+		slot, slots, replicas := pref.position()
+		state.SetFleetSlot(slot)
 		log.Printf("tundler-tunnel: region preference enabled (fleet_slot=%d/%d, stride=%d, dwell=%d rotations)",
-			pref.slot, pref.slots, pref.replicas, pref.dwellCap)
+			slot, slots, replicas, pref.dwellCap)
 	} else {
-		log.Printf("tundler-tunnel: region preference disabled (no %s/%s)", envFleetSlotBase, envFleetSlots)
+		log.Printf("tundler-tunnel: region preference disabled (no %s, no %s/%s)",
+			fleetLayoutPath(), envFleetSlotBase, envFleetSlots)
 	}
 
 	drain := newProxyDrainController(proxySrv)

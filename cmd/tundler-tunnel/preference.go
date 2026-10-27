@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,10 +45,16 @@ import (
 // 2026-10-19: the 7 OVPN pods (17 countries on offer, 146 in the ring)
 // would have collapsed onto 2 countries — worse than uniform random.
 //
+// Where the two ints come from: preferably the fleet topology file
+// (vpn-providers.yaml mounted from the renderer's ConfigMap, see
+// fleet.go) which every pod re-reads at each pick, so a topology edit
+// lands at the next rotation without a pod roll; otherwise the static
+// env vars the renderer used to inject.
+//
 // This is a PREFERENCE, never a guarantee: any miss (provider has no
 // mappable catalog — Windscribe cities, "auto" — or every preferred
 // country is excluded/unavailable) falls back to the legacy uniform
-// random pick. Disabled entirely when the env vars are absent.
+// random pick. Disabled entirely when neither source is available.
 const (
 	envFleetSlotBase = "TUNDLER_FLEET_SLOT_BASE"
 	envFleetSlots    = "TUNDLER_FLEET_SLOTS"
@@ -57,13 +65,24 @@ const (
 )
 
 type locationPreference struct {
+	// mu guards the layout fields (base, slot, slots, replicas), which
+	// refresh() may move when the topology file changes.
+	mu      sync.Mutex
 	base    int // first fleet-global slot of this provider's block
 	ordinal int // this pod's StatefulSet ordinal (rank within the block)
 	slot    int // base + ordinal: this pod's fleet-global slot, in [0, slots)
 	slots   int // fleet-wide pod total
 	// replicas is this provider's pod count: the stride of the walk
-	// over the offered list (1 when the renderer did not provide it).
+	// over the offered list (1 when the layout did not provide it);
+	// width is the raw count the layout stated, kept to detect change.
 	replicas int
+	width    int
+	// layoutPath is the topology file re-read at every pick ("" when
+	// the layout came from env and is static); provider is this pod's
+	// entry in it. onSlot, when set, is told about a moved slot.
+	layoutPath string
+	provider   string
+	onSlot     func(slot int)
 	// cooldown is the blocked-exit memory consulted by pick (nil = none).
 	cooldown *locationCooldown
 	// dwell counts rotations spent at the current position; dwellCap is
@@ -85,9 +104,32 @@ type locationPreference struct {
 	now func() time.Time // injectable for tests
 }
 
+// newLocationPreference builds the preference for provider from the
+// fleet topology file when it is mounted and lists the provider, else
+// from the renderer-provided env, or returns nil (feature off → pure
+// legacy random behavior) when neither source is usable.
+func newLocationPreference(provider string) *locationPreference {
+	path := fleetLayoutPath()
+	layout, err := readFleetLayout(path, provider)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("tundler-tunnel: fleet layout %s unusable (%v) — falling back to env", path, err)
+		}
+		return newLocationPreferenceFromEnv()
+	}
+	p := newLocationPreferenceFrom(layout, accounts.PodOrdinal())
+	if p == nil {
+		return nil
+	}
+	p.layoutPath = path
+	p.provider = provider
+	log.Printf("tundler-tunnel: fleet layout from %s: slot %d/%d, stride %d", path, p.slot, p.slots, p.replicas)
+	return p
+}
+
 // newLocationPreferenceFromEnv builds the preference from the
-// renderer-provided env, or returns nil (feature off → pure legacy
-// random behavior) when the vars are absent or inconsistent.
+// renderer-provided env, or returns nil when the vars are absent or
+// inconsistent.
 func newLocationPreferenceFromEnv() *locationPreference {
 	baseStr := strings.TrimSpace(os.Getenv(envFleetSlotBase))
 	slotsStr := strings.TrimSpace(os.Getenv(envFleetSlots))
@@ -101,31 +143,97 @@ func newLocationPreferenceFromEnv() *locationPreference {
 			envFleetSlotBase, baseStr, envFleetSlots, slotsStr)
 		return nil
 	}
-	ordinal := accounts.PodOrdinal()
-	slot := base + ordinal
-	if slot < 0 || slot >= total {
-		log.Printf("tundler-tunnel: fleet slot %d (base %d + ordinal %d) outside [0,%d) — region preference disabled",
-			slot, base, ordinal, total)
-		return nil
-	}
-	replicas := 1
+	replicas := 0
 	if raw := strings.TrimSpace(os.Getenv(envFleetReplicas)); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil || n <= 0 || ordinal >= n {
-			log.Printf("tundler-tunnel: invalid %s=%q for ordinal %d — walking the ring with stride 1",
-				envFleetReplicas, raw, ordinal)
+		if err != nil || n <= 0 {
+			log.Printf("tundler-tunnel: invalid %s=%q — walking the ring with stride 1", envFleetReplicas, raw)
 		} else {
 			replicas = n
 		}
 	}
-	return &locationPreference{base: base, ordinal: ordinal, slot: slot, slots: total, replicas: replicas,
+	return newLocationPreferenceFrom(fleetLayout{base: base, slots: total, replicas: replicas}, accounts.PodOrdinal())
+}
+
+// newLocationPreferenceFrom places pod ordinal in layout, or returns nil
+// when the pod falls outside the fleet range.
+func newLocationPreferenceFrom(layout fleetLayout, ordinal int) *locationPreference {
+	slot := layout.base + ordinal
+	if layout.slots <= 0 || slot < 0 || slot >= layout.slots {
+		log.Printf("tundler-tunnel: fleet slot %d (base %d + ordinal %d) outside [0,%d) — region preference disabled",
+			slot, layout.base, ordinal, layout.slots)
+		return nil
+	}
+	return &locationPreference{base: layout.base, ordinal: ordinal, slot: slot, slots: layout.slots,
+		replicas: stride(layout.replicas, ordinal), width: layout.replicas,
 		dwellCap: getEnvInt(envCountryDwell, defaultCountryDwell), now: time.Now}
+}
+
+// stride is the walk stride for a provider of replicas pods: 1 when the
+// count is unknown or stale (an ordinal at or past it means the layout
+// predates a scale-up).
+func stride(replicas, ordinal int) int {
+	if replicas <= 0 || ordinal >= replicas {
+		if replicas > 0 {
+			log.Printf("tundler-tunnel: fleet replicas %d stale for ordinal %d — walking the ring with stride 1",
+				replicas, ordinal)
+		}
+		return 1
+	}
+	return replicas
+}
+
+// refresh re-reads the topology file and moves the layout when it
+// changed. A missing or unparsable file keeps the last good layout: the
+// ConfigMap projection may be mid-update, and a stale preference beats
+// none. Reports whether this pod still has a slot in the fleet.
+func (p *locationPreference) refresh() bool {
+	if p.layoutPath == "" {
+		return true
+	}
+	layout, err := readFleetLayout(p.layoutPath, p.provider)
+	if err != nil {
+		slot, slots, _ := p.position()
+		log.Printf("tundler-tunnel: fleet layout %s: %v — keeping slot %d/%d", p.layoutPath, err, slot, slots)
+		return true
+	}
+	p.mu.Lock()
+	changed := layout.base != p.base || layout.slots != p.slots || layout.replicas != p.width
+	if !changed {
+		p.mu.Unlock()
+		return true
+	}
+	was := fmt.Sprintf("%d/%d stride %d", p.slot, p.slots, p.replicas)
+	p.base, p.slots, p.width = layout.base, layout.slots, layout.replicas
+	p.slot = layout.base + p.ordinal
+	p.replicas = stride(layout.replicas, p.ordinal)
+	slot, slots, replicas := p.slot, p.slots, p.replicas
+	p.mu.Unlock()
+	log.Printf("tundler-tunnel: fleet layout changed: slot %s → %d/%d stride %d", was, slot, slots, replicas)
+	if p.onSlot != nil {
+		p.onSlot(slot)
+	}
+	return slot >= 0 && slot < slots
+}
+
+// position reports this pod's current slot, the fleet total and the
+// walk stride.
+func (p *locationPreference) position() (slot, slots, replicas int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.slot, p.slots, p.replicas
 }
 
 // pick returns (location, countryAlpha2, true) when a preferred country
 // is available, or ok=false meaning "caller falls back to pickLocation"
 // — the always-fall-back contract.
 func (p *locationPreference) pick(locations, excluded []string) (string, string, bool) {
+	if !p.refresh() {
+		return "", "", false // scaled out of the fleet: the pod is on its way out
+	}
+	p.mu.Lock()
+	base, slots, replicas := p.base, p.slots, p.replicas
+	p.mu.Unlock()
 	// Excluded filtering happens BEFORE country grouping, so a country
 	// whose every location is excluded is invisible to the walk — never
 	// fought over, never wastefully preferred.
@@ -152,7 +260,7 @@ func (p *locationPreference) pick(locations, excluded []string) (string, string,
 	// The provider's block starts base/slots of the way around the
 	// ring, so different providers begin at different places of the
 	// same permutation.
-	start := p.base * len(order) / p.slots
+	start := base * len(order) / slots
 	// Offered countries in ring order from the block start. Siblings
 	// then index this list by ordinal (+ completed rotations), which
 	// hands each of them a distinct country for as long as the catalog
@@ -167,7 +275,7 @@ func (p *locationPreference) pick(locations, excluded []string) (string, string,
 	if len(offered) == 0 {
 		return "", "", false
 	}
-	cc, candidates := p.choose(offered, byCountry)
+	cc, candidates := p.choose(offered, byCountry, replicas)
 	if avoid, _ := p.avoid.Load().(string); avoid != "" && len(candidates) > 1 {
 		fresh := make([]string, 0, len(candidates))
 		for _, loc := range candidates {
@@ -186,8 +294,7 @@ func (p *locationPreference) pick(locations, excluded []string) (string, string,
 // current position until it finds a country that is not cooling (and
 // still has a location that is not cooling). Falls back to walking the
 // whole list, then to ignoring the cool-down entirely.
-func (p *locationPreference) choose(offered []string, byCountry map[string][]string) (string, []string) {
-	stride := p.replicas
+func (p *locationPreference) choose(offered []string, byCountry map[string][]string, stride int) (string, []string) {
 	if stride < 1 {
 		stride = 1
 	}

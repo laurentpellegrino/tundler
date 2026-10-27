@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -135,23 +137,24 @@ func TestNilPreferenceUsesLegacyPick(t *testing.T) {
 
 func TestNewLocationPreferenceFromEnv(t *testing.T) {
 	t.Setenv("POD_NAME", "tundler-tunnel-x-2")
+	t.Setenv(envFleetLayout, filepath.Join(t.TempDir(), "absent.yaml"))
 
 	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "")
 	t.Setenv("TUNDLER_FLEET_SLOTS", "")
-	if newLocationPreferenceFromEnv() != nil {
+	if newLocationPreference("x") != nil {
 		t.Fatal("unset env must disable the preference")
 	}
 
 	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "10")
 	t.Setenv("TUNDLER_FLEET_SLOTS", "20")
-	p := newLocationPreferenceFromEnv()
-	if p == nil || p.slot != 12 || p.slots != 20 || p.base != 10 || p.ordinal != 2 {
-		t.Fatalf("pref = %+v, want slot 12 (base 10 + ordinal 2) of 20", p)
+	p := newLocationPreference("x")
+	if p == nil || p.slot != 12 || p.slots != 20 || p.base != 10 || p.ordinal != 2 || p.layoutPath != "" {
+		t.Fatalf("pref = %+v, want static slot 12 (base 10 + ordinal 2) of 20", p)
 	}
 
 	// Slot outside the fleet range: disabled, not fatal.
 	t.Setenv("TUNDLER_FLEET_SLOTS", "11")
-	if newLocationPreferenceFromEnv() != nil {
+	if newLocationPreference("x") != nil {
 		t.Fatal("out-of-range slot must disable the preference")
 	}
 }
@@ -293,6 +296,7 @@ func TestCooledLocationSkipsWithinCountryThenCountry(t *testing.T) {
 
 func TestNewLocationPreferenceReplicasEnv(t *testing.T) {
 	t.Setenv("POD_NAME", "tundler-tunnel-x-2")
+	t.Setenv(envFleetLayout, filepath.Join(t.TempDir(), "absent.yaml"))
 	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "10")
 	t.Setenv("TUNDLER_FLEET_SLOTS", "20")
 	t.Setenv(envFleetReplicas, "")
@@ -307,5 +311,99 @@ func TestNewLocationPreferenceReplicasEnv(t *testing.T) {
 	t.Setenv(envFleetReplicas, "2")
 	if p := newLocationPreferenceFromEnv(); p == nil || p.replicas != 1 {
 		t.Fatalf("stale replicas env → stride 1, got %+v", p)
+	}
+}
+
+const topologyDoc = `
+defaults:
+  min_rotation_seconds: 1
+providers:
+  nordvpn:
+    max_tunnels: 10
+  expressvpn:
+    # comments and unrelated keys are fine
+    max_tunnels: 4
+    excluded_locations: [x]
+  hidemyass:
+    max_tunnels: 5
+    accounts:
+      - id: main
+`
+
+func TestParseFleetLayout(t *testing.T) {
+	// Sorted order: expressvpn [0,4), hidemyass [4,9), nordvpn [9,19).
+	l, err := parseFleetLayout([]byte(topologyDoc), "hidemyass")
+	if err != nil || l != (fleetLayout{base: 4, slots: 19, replicas: 5}) {
+		t.Fatalf("hidemyass layout = %+v, %v", l, err)
+	}
+	if l, _ := parseFleetLayout([]byte(topologyDoc), "expressvpn"); l.base != 0 || l.replicas != 4 {
+		t.Fatalf("expressvpn layout = %+v", l)
+	}
+	if l, _ := parseFleetLayout([]byte(topologyDoc), "nordvpn"); l.base != 9 {
+		t.Fatalf("nordvpn layout = %+v", l)
+	}
+	if _, err := parseFleetLayout([]byte(topologyDoc), "pia"); err == nil {
+		t.Fatal("unknown provider must error")
+	}
+	if _, err := parseFleetLayout([]byte("providers: ["), "pia"); err == nil {
+		t.Fatal("malformed document must error")
+	}
+}
+
+func TestNewLocationPreferenceFromLayoutFile(t *testing.T) {
+	t.Setenv("POD_NAME", "tundler-tunnel-hidemyass-2")
+	// Env that disagrees with the file: the file wins.
+	t.Setenv("TUNDLER_FLEET_SLOT_BASE", "0")
+	t.Setenv("TUNDLER_FLEET_SLOTS", "3")
+	path := filepath.Join(t.TempDir(), "vpn-providers.yaml")
+	if err := os.WriteFile(path, []byte(topologyDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envFleetLayout, path)
+
+	p := newLocationPreference("hidemyass")
+	if p == nil || p.slot != 6 || p.slots != 19 || p.base != 4 || p.replicas != 5 || p.layoutPath != path {
+		t.Fatalf("pref = %+v, want slot 6 (base 4 + ordinal 2) of 19, stride 5", p)
+	}
+	// A provider the file does not list falls back to env.
+	if q := newLocationPreference("pia"); q == nil || q.layoutPath != "" || q.slots != 3 {
+		t.Fatalf("unlisted provider must fall back to env, got %+v", q)
+	}
+
+	// Topology edit: a new provider before us shifts the block and
+	// grows the fleet; the next pick sees it without a restart.
+	var moved []int
+	p.onSlot = func(slot int) { moved = append(moved, slot) }
+	p.now = fixedNow
+	edited := topologyDoc + "  fastvpn:\n    max_tunnels: 3\n"
+	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := p.pick(multiCountryCatalog, nil); !ok {
+		t.Fatal("pick must still succeed after the layout moved")
+	}
+	if slot, slots, stride := p.position(); slot != 9 || slots != 22 || stride != 5 {
+		t.Fatalf("after edit: slot %d/%d stride %d, want 9/22 stride 5", slot, slots, stride)
+	}
+	if len(moved) != 1 || moved[0] != 9 {
+		t.Fatalf("onSlot calls = %v, want [9]", moved)
+	}
+
+	// A broken file (ConfigMap mid-update) keeps the last good layout.
+	if err := os.WriteFile(path, []byte("providers: ["), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.pick(multiCountryCatalog, nil)
+	if slot, slots, _ := p.position(); slot != 9 || slots != 22 {
+		t.Fatalf("broken file must keep the layout, got %d/%d", slot, slots)
+	}
+
+	// Scaled below our ordinal: the pick declines rather than guessing.
+	shrunk := "providers:\n  hidemyass:\n    max_tunnels: 2\n"
+	if err := os.WriteFile(path, []byte(shrunk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := p.pick(multiCountryCatalog, nil); ok {
+		t.Fatal("a pod outside the fleet range must fall back to random")
 	}
 }
