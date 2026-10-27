@@ -8,14 +8,15 @@ set -e
 # Server configs ship as a daily-refreshed zip baked into the image
 # at build time — sourced from the `fastvpn-configs` GitHub release
 # tag, which is itself a mirror of
-# https://vpn.ncapi.io/groupedServerList.zip (UDP subset only),
-# refreshed daily by .github/workflows/update-fastvpn-configs.yml.
+# https://vpn.ncapi.io/groupedServerList.zip (TCP and UDP configs,
+# flattened), refreshed daily by
+# .github/workflows/update-fastvpn-configs.yml.
 #
 # Each .ovpn carries multiple `remote ...` lines + `remote-random`,
 # so openvpn handles edge-IP load-balancing client-side. Our Go
-# provider picks ONE .ovpn (one city) per Connect() call and
-# overrides only its `auth-user-pass` directive — no other
-# config rewriting needed.
+# provider picks ONE .ovpn (one city, the protocol its transport
+# needs) per Connect() call and rewrites only its `auth-user-pass`
+# directive, plus a `socks-proxy` line in warp mode.
 
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -27,11 +28,12 @@ apt-get install -y --no-install-recommends \
     unzip
 echo "FastVPN: openvpn installed ($(openvpn --version 2>&1 | head -1))"
 
-# FastVPN tunnels INSIDE a Cloudflare WARP transport (WLVPN's edge
-# blocks datacenter IPs; WARP presents a Cloudflare source IP so
-# the connection is accepted). Install the WARP client here so the
-# provider can bring the outer tunnel up at runtime — see the
-# package doc in internal/provider/fastvpn/fastvpn.go.
+# FastVPN's outer connection rides Cloudflare WARP in proxy mode
+# (WLVPN's edge blocks datacenter IPs; WARP's local SOCKS5 proxy
+# presents a Cloudflare source IP so the connection is accepted).
+# Install the WARP client here so the provider can bring the proxy
+# up at runtime — see the package doc in
+# internal/provider/fastvpn/fastvpn.go.
 curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
   | gpg --yes --dearmor \
       --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -55,8 +57,9 @@ chmod 700 "$CONFIG_DIR"
 if curl -fsSL --max-time 120 "$CONFIGS_URL" -o "$TMP_ZIP"; then
     unzip -oq "$TMP_ZIP" -d "$CONFIG_DIR"
     rm -f "$TMP_ZIP"
-    n=$(find "$CONFIG_DIR" -maxdepth 1 -name 'NCVPN-*-UDP.ovpn' | wc -l)
-    echo "FastVPN: baked $n server configs from $CONFIGS_URL into image."
+    n_tcp=$(find "$CONFIG_DIR" -maxdepth 1 -name 'NCVPN-*-TCP.ovpn' | wc -l)
+    n_udp=$(find "$CONFIG_DIR" -maxdepth 1 -name 'NCVPN-*-UDP.ovpn' | wc -l)
+    echo "FastVPN: baked $n_tcp TCP + $n_udp UDP server configs from $CONFIGS_URL into image."
 else
     rm -f "$TMP_ZIP"
     echo "FastVPN: WARN — could not fetch $CONFIGS_URL; runtime will need configs mounted some other way."

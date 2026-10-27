@@ -51,7 +51,7 @@ integration shapes:
 | Shape | Providers | How it connects |
 |-------|-----------|-----------------|
 | **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
-| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential |
+| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs) |
 | **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
@@ -228,6 +228,7 @@ curl http://localhost:4242/status
 | `TUNDLER_EXIT_MEMORY` | how long an exit prefix (/24, IPv6 /48) is remembered; a rotation landing in a remembered prefix cools its location and country and retries elsewhere (default `1h`, `0` disables) |
 | `TUNDLER_BLOCKED_COOLDOWN` | how long a spent location and country stay skipped (default `1h`, `0` disables) |
 | `TUNDLER_REFUSED_MEMORY` | how long an exit prefix the upstream refused (`POST /rotate` with `reason=banned`) is avoided by later rotations (default `24h`, `0` disables) |
+| `FASTVPN_TRANSPORT` | fastvpn only: `warp` (default) runs openvpn over TCP/443 through WARP's SOCKS5 proxy; `direct` runs plain UDP/1194 openvpn for hosts whose source IP WLVPN accepts |
 | `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
 | `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
 
