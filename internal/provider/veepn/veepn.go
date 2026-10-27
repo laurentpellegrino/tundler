@@ -1,35 +1,32 @@
-// Package veepn drives VeePN over OpenVPN directly (no provider daemon),
-// the same OpenVPN-direct shape as fastvpn / ovpn / purevpn — but with
-// per-pod credentials (each pod owns one VeePN manual-config
-// username/password, like cyberghost/mullvad) rather than a single
-// shared credential.
+// Package veepn drives VeePN over OpenVPN directly (no provider daemon)
+// with per-pod credentials: each pod owns one VeePN manual-config
+// username/password (a Slots=1 account; the legacy shim keeps
+// POD_<n>_VEEPN_USERNAME / POD_<n>_VEEPN_PASSWORD working), because every
+// device credential consumes one of the account's connection slots.
 //
 // VeePN's per-location OpenVPN configs are NOT templatable: every one of
 // the ~135 locations is fully self-contained, carrying its OWN embedded
-// CA + tls-auth key + server IP (verified: 135 distinct CAs). So instead
-// of generating a .ovpn from a template + shared CA (cyberghost), we BAKE
-// the actual upstream .ovpn files into the image (a zip from the
-// `veepn-configs` GitHub release — see docker/providers/veepn/install.sh)
-// and at Connect() pick the chosen location's file, rewriting only its
-// bare `auth-user-pass` directive to point at this pod's credentials.
+// CA + tls-auth key + the ONE server IP of that location. So the upstream
+// .ovpn files are baked into the image as they are (a zip from the
+// `veepn-configs` GitHub release, see docker/providers/veepn/install.sh
+// and .github/workflows/update-veepn-configs.yml) and Connect picks the
+// chosen location's file, keeps its transport and keys, and replaces
+// only the credential and lifecycle directives.
 //
-// The config archive lives behind VeePN's Cloudflare-gated account
-// dashboard, so it's refreshed by a headless-browser workflow
-// (.github/workflows/update-veepn-configs.yml) that logs in, downloads
-// "all configs", and republishes the release. The tunnels themselves
-// connect straight to the server IPs (no Cloudflare), so a stale list
-// only costs the few locations whose IPs have since rotated.
+// One owned openvpn child per connection, supervised over a management
+// socket (internal/shared/ovpn): password over the socket, AUTH_FAILED
+// classified as an auth failure, a fixed tun interface, no process
+// leaks. udp is tried first, tcp is the fallback for the same location.
 //
-// Per-pod credentials: each VeePN device-credential consumes one of the
-// account's connection slots (Pro = 10), so each pod owns exactly one —
-// a Slots=1 account in the accounts model. Account mode reads
-// /etc/tundler/accounts/<id>/{username,password}; the legacy shim keeps
-// POD_<N>_VEEPN_USERNAME / POD_<N>_VEEPN_PASSWORD env pairs working
-// (one pair per pod from OpenBao vpn/veepn/pod-<n>).
+// One IP per location means the whole provider has ~135 exits: a target
+// that bans them one by one exhausts the pool, and nothing in the
+// provider can change that — only a refreshed config set with rotated
+// addresses or fewer rotations per account can.
 package veepn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,39 +39,57 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
 	name             = "veepn"
 	defaultConfigDir = "/etc/veepn/configs"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
+	defaultRunDir    = "/run/veepn"
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-veepn"
+	// connectTimeout bounds one openvpn attempt: management startup,
+	// TLS handshake and the CONNECTED state.
+	connectTimeout = 35 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
 )
 
 var (
 	// Upstream filename format: <location>.<proto>.veepn.com.ovpn
 	// e.g. ae.udp.veepn.com.ovpn, au-nsw.tcp.veepn.com.ovpn.
 	filenameRe = regexp.MustCompile(`^(.+)\.(udp|tcp)\.veepn\.com\.ovpn$`)
-	// Bare `auth-user-pass` directive (no file argument) — present in
-	// every upstream .ovpn. We rewrite it so openvpn reads our per-pod
-	// credentials file instead of prompting on the (absent) console.
-	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
+	// Directives dropped from the vendor config before ours are
+	// appended: credentials come over the management socket, the
+	// interface is pinned, verbosity and lifecycle are ours.
+	droppedDirectiveRe = regexp.MustCompile(`(?m)^[ \t]*(auth-user-pass|dev|dev-type|management[a-z-]*|verb|daemon|log|log-append|auth-retry|auth-nocache|connect-retry|connect-retry-max|connect-timeout)\b.*\n?`)
+	// Inline blocks (<ca>, <tls-auth>) are kept verbatim.
+	inlineBlockRe = regexp.MustCompile(`(?s)<([a-z-]+)>.*?</[a-z-]+>`)
+	remoteRe      = regexp.MustCompile(`(?m)^[ \t]*remote[ \t]+\S+`)
 
 	serverCache   []veepnServer
 	serverCacheMu sync.RWMutex
 
-	activeServer   *veepnServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	activeMu sync.RWMutex
+	current  *active
+	loggedIn bool
 )
 
-// veepnServer is one baked .ovpn (one location, one protocol). udp is
-// preferred at connect time; tcp is the fallback.
+// veepnServer is one baked .ovpn (one location, one protocol).
 type veepnServer struct {
 	Location string // e.g. "ae", "au-nsw", "albania"
 	Proto    string // "udp" | "tcp"
 	Filename string
+}
+
+// active is the current connection: the owned openvpn child plus what
+// it was asked to connect to.
+type active struct {
+	tunnel   *ovpn.Tunnel
+	server   *veepnServer
+	location string
 }
 
 type VeePN struct{}
@@ -92,6 +107,15 @@ func configDir() string {
 		return d
 	}
 	return defaultConfigDir
+}
+
+// runDir holds the per-connection config and management socket
+// (tmpfs in the image; Unix socket paths are limited to 107 bytes).
+func runDir() string {
+	if d := os.Getenv("VEEPN_RUN_DIR"); d != "" {
+		return d
+	}
+	return defaultRunDir
 }
 
 // getCredentials returns this pod's VeePN manual-config username/password
@@ -153,8 +177,9 @@ func loadServers() ([]veepnServer, error) {
 	return append([]veepnServer(nil), servers...), nil
 }
 
-// pickServer returns the udp config for the location (tcp fallback).
-func pickServer(servers []veepnServer, location string) *veepnServer {
+// candidates returns the location's configs in try order: udp first,
+// tcp as the fallback.
+func candidates(servers []veepnServer, location string) []*veepnServer {
 	want := strings.ToLower(strings.TrimSpace(location))
 	var udp, tcp *veepnServer
 	for i := range servers {
@@ -168,40 +193,61 @@ func pickServer(servers []veepnServer, location string) *veepnServer {
 			tcp = &s
 		}
 	}
-	if udp != nil {
-		return udp
+	var out []*veepnServer
+	for _, s := range []*veepnServer{udp, tcp} {
+		if s != nil {
+			out = append(out, s)
+		}
 	}
-	return tcp
+	return out
 }
 
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
+// openVPNConfig turns a vendor .ovpn into the config this provider
+// runs: transport, keys and server kept, credential and lifecycle
+// handling replaced by ours. socket is the management socket path.
+func openVPNConfig(vendor []byte, socket string) ([]byte, error) {
+	if !ovpn.ValidSocket(socket) {
+		return nil, errors.New("invalid VeePN management socket path")
+	}
+	text := strings.ReplaceAll(string(vendor), "\r\n", "\n")
+	if !remoteRe.MatchString(text) {
+		return nil, errors.New("VeePN config has no remote")
+	}
+	var blocks []string
+	text = inlineBlockRe.ReplaceAllStringFunc(text, func(b string) string {
+		blocks = append(blocks, b)
+		return fmt.Sprintf("\x00BLOCK%d\x00", len(blocks)-1)
+	})
+	text = droppedDirectiveRe.ReplaceAllString(text, "")
+	for i, b := range blocks {
+		text = strings.Replace(text, fmt.Sprintf("\x00BLOCK%d\x00", i), b, 1)
+	}
+	text = strings.TrimRight(text, "\n") + "\n"
+	ours := "\n# --- tundler ---\ndev " + tunnelInterface + "\ndev-type tun\n" + ovpn.Directives(socket) +
+		"connect-retry-max 1\nconnect-timeout 15\nverb 0\n"
+	return []byte(text + ours), nil
 }
 
-func writeActiveConfig(server *veepnServer, credentialsFile string) (string, error) {
-	src := filepath.Join(configDir(), server.Filename)
-	raw, err := os.ReadFile(src)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", src, err)
-	}
-	rewritten := authUserPassRe.ReplaceAllString(string(raw), "auth-user-pass "+credentialsFile)
-	dst := filepath.Join(configDir(), activeConfigName)
-	if err := os.WriteFile(dst, []byte(rewritten), 0600); err != nil {
-		return "", fmt.Errorf("write active config: %w", err)
-	}
-	return dst, nil
-}
-
-// isOpenVPNConnected returns true once openvpn's pushed redirect-gateway
-// has taken effect — a route lookup for an arbitrary public address
-// resolves via tun0. Same default-route gating as the other
-// openvpn-direct providers.
+// isOpenVPNConnected reports whether the tunnel is the path packets
+// take RIGHT NOW: a route lookup for a public address resolves via the
+// tunnel interface (the pushed redirect-gateway has landed).
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // ---- VPNProvider ------------------------------------------------------
@@ -253,90 +299,135 @@ func (VeePN) Locations(context.Context) []string {
 }
 
 func (v VeePN) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
 	user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("VeePN: %v", err)
-		return provider.Status{Connected: false, Provider: name}
+		return failed
 	}
 	servers, err := loadServers()
 	if err != nil {
 		shared.Debugf("VeePN: %v", err)
-		return provider.Status{Connected: false, Provider: name}
+		return failed
 	}
-	server := pickServer(servers, location)
-	if server == nil {
+	tries := candidates(servers, location)
+	if len(tries) == 0 {
 		shared.Debugf("VeePN: no config for location %q", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
 
-	authPath, err := writeCredentials(user, pass)
-	if err != nil {
-		shared.Debugf("VeePN: write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-	if _, err := writeActiveConfig(server, authPath); err != nil {
-		shared.Debugf("VeePN: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
 
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir(),
-		"--config", activeConfigName,
-		"--daemon"); err != nil {
-		shared.Debugf("VeePN: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeMu.Lock()
-			activeServer = server
-			activeLocation = location
-			activeMu.Unlock()
-			return v.Status(ctx)
+	for _, server := range tries {
+		if ctx.Err() != nil {
+			break
 		}
+		vendor, err := os.ReadFile(filepath.Join(configDir(), server.Filename))
+		if err != nil {
+			shared.Debugf("VeePN: read %s: %v", server.Filename, err)
+			continue
+		}
+		tunnel, err := ovpn.Start(ctx, ovpn.Options{Name: "VeePN", RunDir: runDir(), CD: configDir(), User: user, Pass: pass, Timeout: connectTimeout},
+			func(socket string) ([]byte, error) { return openVPNConfig(vendor, socket) })
+		if errors.Is(err, ovpn.ErrAuthFailed) {
+			// This pod's device credential was rejected: another
+			// transport cannot help. Report it so the runtime holds.
+			shared.Debugf("VeePN: %s: %v", server.Filename, err)
+			failed.AuthFailed = true
+			return failed
+		}
+		if err != nil {
+			shared.Debugf("VeePN: %s: %v", server.Filename, err)
+			continue
+		}
+		if !waitForRoute(ctx, tunnel) {
+			shared.Debugf("VeePN: %s: connected but the default route never moved to %s", server.Filename, tunnelInterface)
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+			_ = tunnel.Stop(stopCtx)
+			cancel()
+			continue
+		}
+		activeMu.Lock()
+		current = &active{tunnel: tunnel, server: server, location: location}
+		activeMu.Unlock()
+		return v.Status(ctx)
 	}
-	shared.Debugf("VeePN: connection timeout for %s", server.Filename)
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	return provider.Status{Connected: false, Provider: name, Location: location}
+	return failed
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("VeePN: %v", err)
+	}
 }
 
 func (VeePN) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 20; j++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeMu.Lock()
-	activeServer = nil
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
 
-func (VeePN) Connected(context.Context) bool { return isOpenVPNConnected() }
-
-func (v VeePN) Status(context.Context) provider.Status {
+func (VeePN) Connected(context.Context) bool {
 	activeMu.RLock()
-	defer activeMu.RUnlock()
-	if activeServer == nil {
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
+}
+
+func (v VeePN) Status(ctx context.Context) provider.Status {
+	if !v.Connected(ctx) {
 		return provider.Status{Connected: false, Provider: name}
 	}
-	return provider.Status{
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	status := provider.Status{
 		Connected: true,
 		Provider:  name,
-		Location:  activeLocation,
-		Region:    strings.ToUpper(activeLocation),
+		Location:  a.location,
+		Region:    strings.ToUpper(a.location) + " (" + a.server.Proto + ")",
 	}
+	if ip := publicIP(ctx); ip != "" {
+		status.IP = ip
+	}
+	return status
+}
+
+func publicIP(ctx context.Context) string {
+	const host = "icanhazip.com"
+	resolveIP := ""
+	if out, err := shared.RunCmd(ctx, "getent", "ahostsv4", host); err == nil {
+		resolveIP = shared.FirstIPv4(out)
+	}
+	args := []string{"-s", "--max-time", "5"}
+	if resolveIP != "" {
+		args = append(args, "--resolve", host+":443:"+resolveIP)
+	}
+	args = append(args, "https://"+host)
+	out, err := shared.RunCmd(ctx, "curl", args...)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 func (VeePN) ActiveLocation(context.Context) string {
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (VeePN) Version(ctx context.Context) (string, error) {
