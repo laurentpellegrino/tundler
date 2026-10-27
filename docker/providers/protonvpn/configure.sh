@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# ProtonVPN server metadata is embedded in the tundler-tunnel binary
-# at build time (via go:embed of internal/provider/protonvpn/servers.json,
-# regenerated daily by the proton-updater GH Actions workflow).
-# Nothing to download at pod boot — just lay out the OpenVPN config
-# dir the runtime writes into.
+# The ProtonVPN server catalog is baked into the image at build time
+# (install.sh downloads servers.json from the protonvpn-servers GitHub
+# release, refreshed daily by the update-proton-servers workflow). At
+# runtime the provider writes each connection's config and management
+# socket under a private tmpfs directory (/run/protonvpn); nothing to
+# prepare here beyond checking the catalog is present.
 #
 set -e
 
-CONFIG_DIR="/etc/protonvpn/openvpn"
-
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-
-echo "ProtonVPN config directory ready: $CONFIG_DIR"
+SERVERS_FILE="${PROTON_SERVERS_FILE:-/etc/protonvpn/servers.json}"
+if [[ ! -s "$SERVERS_FILE" ]]; then
+    echo "ERROR: ProtonVPN catalog $SERVERS_FILE missing — broken image" >&2
+    exit 1
+fi
+echo "ProtonVPN: catalog $SERVERS_FILE present ($(stat -c%s "$SERVERS_FILE") bytes, baked at build time)."

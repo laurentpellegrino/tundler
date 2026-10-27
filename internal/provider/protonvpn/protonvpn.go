@@ -1,12 +1,27 @@
+// Package protonvpn is the ProtonVPN provider: OpenVPN-direct against
+// Proton's logical-server catalog (api.proton.me/vpn/v1/logicals,
+// mirrored daily by the update-proton-servers workflow into the
+// `protonvpn-servers` GitHub release and baked into the image as
+// servers.json), with one owned openvpn child per connection supervised
+// over a private management socket (internal/shared/ovpn): password
+// over the socket, AUTH_FAILED classified as an auth failure, a fixed
+// tun interface, at most a couple of servers tried per connect, no
+// process leaks.
+//
+// Proton accepts datacenter source IPs, so there is no outer transport.
+// The provider's history is about the crawl target, not connectivity:
+// in 2026-05 the crawl target blanket-blocked Proton's commodity exit ranges
+// (~10 dense /16s). PROTON_FEATURE_FILTER restricts the pool to a tier
+// (securecore, tor, p2p, stream) whose exits live elsewhere.
 package protonvpn
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,26 +31,37 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
-	name             = "protonvpn"
-	defaultProtocol  = "udp"
-	defaultConfigDir = "/etc/protonvpn/openvpn"
+	name            = "protonvpn"
+	defaultProtocol = "udp"
 	// defaultServersFile is where docker/providers/protonvpn/install.sh
 	// drops the server catalog at image-build time, downloaded from
 	// the protonvpn-servers GitHub release. Overridable via
 	// PROTON_SERVERS_FILE for local dev.
 	defaultServersFile = "/etc/protonvpn/servers.json"
+	// defaultRunDir holds the per-connection config and management
+	// socket (tmpfs in the image).
+	defaultRunDir = "/run/protonvpn"
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-proton"
+	// connectTimeout bounds one openvpn attempt: management startup,
+	// TLS handshake and the CONNECTED state.
+	connectTimeout = 35 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
+	// serversPerConnect caps how many servers of a location one Connect
+	// tries.
+	serversPerConnect = 2
 )
 
-// embeddedServers is the ProtonVPN server catalog, loaded lazily
-// from defaultServersFile on first fetchServers() call. Refreshed
-// daily by the update-proton-servers workflow which uploads it as
-// the `protonvpn-servers` GH release asset; install.sh in the
-// protonvpn image curl-downloads it at image-build time. Kept as a
-// package-level var (not a function-local read) so tests can
-// override it via useTestServers without touching disk.
+// embeddedServers is the ProtonVPN server catalog, loaded lazily from
+// defaultServersFile on first fetchServers() call. Kept as a
+// package-level var so tests can override it without touching disk.
 var embeddedServers []byte
 
 type ProtonVPN struct{}
@@ -71,20 +97,27 @@ type serversFile struct {
 	} `json:"protonvpn"`
 }
 
+// active is the current connection: the owned openvpn child plus what
+// it was asked to connect to.
+type active struct {
+	tunnel   *ovpn.Tunnel
+	server   *protonServer
+	location string
+}
+
 var (
-	// serverCache holds the protocol-filtered subset of embeddedServers,
-	// built once on first access (via initServers). Stays valid for the
-	// process lifetime — the catalog only refreshes when a new image is
-	// rolled out, so there's no reason to invalidate at runtime.
+	// serverCache holds the protocol/feature-filtered subset of
+	// embeddedServers, built once on first access. Stays valid for the
+	// process lifetime — the catalog only refreshes with a new image.
 	serverCache    []protonServer
 	serverCacheMu  sync.Mutex
 	serverCacheErr error
 	serverCacheOK  bool
 
-	activeServer   *protonServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	activeMu sync.RWMutex
+	current  *active
+
+	loggedIn bool
 )
 
 func init() {
@@ -96,8 +129,8 @@ func init() {
 }
 
 // getCredentials resolves the OpenVPN credential pair (NOT the Proton
-// account login — see cmd/proton-updater for that). Protocol/port/
-// config-dir knobs stay plain env: they are config, not credentials.
+// account login — see cmd/proton-updater for that). Protocol/port
+// knobs stay plain env: they are config, not credentials.
 func getCredentials() (string, string, error) {
 	acct, err := accounts.Current(name)
 	if err != nil {
@@ -116,9 +149,6 @@ func getCredentials() (string, string, error) {
 
 func getProtocol() string {
 	proto := strings.ToLower(os.Getenv("PROTON_OPENVPN_PROTOCOL"))
-	if proto == "" {
-		return defaultProtocol
-	}
 	if proto != "udp" && proto != "tcp" {
 		return defaultProtocol
 	}
@@ -137,11 +167,11 @@ func getPort(protocol string) string {
 	return "1194"
 }
 
-func configDir() string {
-	if dir := os.Getenv("PROTON_OPENVPN_CONFIG_DIR"); dir != "" {
+func runDir() string {
+	if dir := os.Getenv("PROTON_RUN_DIR"); dir != "" {
 		return dir
 	}
-	return defaultConfigDir
+	return defaultRunDir
 }
 
 // serversFilePath returns the path where install.sh drops the
@@ -154,10 +184,6 @@ func serversFilePath() string {
 	return defaultServersFile
 }
 
-// loadEmbeddedServersFromDisk reads the catalog file once and
-// caches it into the embeddedServers package var so subsequent
-// fetchServers() calls use the cached bytes. Tests bypass this by
-// pre-setting embeddedServers before fetchServers runs.
 func loadEmbeddedServersFromDisk() error {
 	if embeddedServers != nil {
 		return nil
@@ -175,22 +201,14 @@ func loadEmbeddedServersFromDisk() error {
 // bits. A server is kept iff every bit in this mask is also set on
 // its Features field. Returns 0 (no filter) when the env var is
 // empty or unset.
-//
-// Used to restrict the connect-time pool to a subset of Proton's
-// tiers. The motivating case: the crawl target blanket-blocks Proton's
-// commodity OpenVPN exit IPs (which live in ~10 dense /16s); Proton
-// SecureCore exits route through Proton-owned datacenters in IS/SE/
-// CH and use a separate, smaller IP pool that may not be on the
-// same blocklist. Operators flip this via the StatefulSet env spec
-// without a code change.
 func requiredFeatureMask() int {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("PROTON_FEATURE_FILTER")))
 	if raw == "" {
 		return 0
 	}
 	mask := 0
-	for _, name := range strings.Split(raw, ",") {
-		switch strings.TrimSpace(name) {
+	for _, token := range strings.Split(raw, ",") {
+		switch strings.TrimSpace(token) {
 		case "securecore", "secure-core", "secure_core":
 			mask |= featureSecureCore
 		case "tor":
@@ -200,17 +218,15 @@ func requiredFeatureMask() int {
 		case "stream":
 			mask |= featureStream
 		default:
-			shared.Debugf("ProtonVPN: PROTON_FEATURE_FILTER token %q not recognized; ignoring", name)
+			shared.Debugf("ProtonVPN: PROTON_FEATURE_FILTER token %q not recognized; ignoring", token)
 		}
 	}
 	return mask
 }
 
-// fetchServers returns the protocol-filtered ProtonVPN OpenVPN server
-// list from the embedded catalog. Result is cached for the process
-// lifetime — there's nothing dynamic to invalidate at runtime, the
-// catalog only changes when a fresh image rolls out. ctx accepted for
-// API symmetry with the previous HTTP-fetching version; not used.
+// fetchServers returns the protocol- and feature-filtered OpenVPN
+// server list from the embedded catalog, cached for the process
+// lifetime.
 func fetchServers(_ context.Context) ([]protonServer, error) {
 	serverCacheMu.Lock()
 	defer serverCacheMu.Unlock()
@@ -254,11 +270,7 @@ func fetchServers(_ context.Context) ([]protonServer, error) {
 		return nil, serverCacheErr
 	}
 	serverCache = servers
-	if requiredMask != 0 {
-		shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog (feature filter mask=%d)", len(servers), requiredMask)
-	} else {
-		shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog", len(servers))
-	}
+	shared.Debugf("ProtonVPN: loaded %d OpenVPN servers from embedded catalog (feature filter mask=%d)", len(servers), requiredMask)
 	return append([]protonServer(nil), serverCache...), nil
 }
 
@@ -266,12 +278,10 @@ func findServers(servers []protonServer, location string) []protonServer {
 	if location == "" {
 		return servers
 	}
-
 	want := strings.ToLower(location)
 	var matches []protonServer
 	for _, srv := range servers {
-		fields := []string{srv.Country, srv.Region, srv.City, srv.ServerName, srv.Hostname}
-		for _, field := range fields {
+		for _, field := range []string{srv.Country, srv.Region, srv.City, srv.ServerName, srv.Hostname} {
 			if strings.ToLower(field) == want {
 				matches = append(matches, srv)
 				break
@@ -281,139 +291,125 @@ func findServers(servers []protonServer, location string) []protonServer {
 	return matches
 }
 
-func pickRandomServer(servers []protonServer) *protonServer {
-	if len(servers) == 0 {
-		return nil
-	}
-	server := servers[rand.Intn(len(servers))]
-	return &server
-}
-
-// isOpenVPNConnected returns true once the tunnel's redirect-gateway
-// push has actually taken effect — i.e. a route LOOKUP for an
-// arbitrary public address resolves via tun0, not via eth0. The
-// looser "any route on tun0 exists" check returns true too early:
-// openvpn installs the per-pod link-local route (e.g. 10.2.4.0/24
-// dev tun0) BEFORE the redirect-gateway default-eclipsing routes
-// are pushed, so the exit-IP contract probe in cmd/tundler-tunnel/
-// egress.go fires while the main-ns default route is still via
-// eth0 and flags a leak that doesn't actually exist. Validated
-// against cyberghost — same race, same fix.
-//
-// Looks in MAIN namespace because openvpn is launched via RunCmd
-// (which defaults to main ns post-bb88d29). 8.8.8.8 is a stable
-// public-IPv4 destination; we don't actually send a packet to it,
-// this is purely a kernel route-table lookup.
+// isOpenVPNConnected reports whether the tunnel is the path packets
+// take RIGHT NOW: a route lookup for a public address resolves via the
+// tunnel interface. The looser "the interface exists" check is true too
+// early (openvpn adds the link-local route before the redirect-gateway
+// routes), which would trip the exit-IP contract probe on a leak that
+// does not exist. Main namespace: openvpn runs there.
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+// waitForRoute waits for the pushed default route to land.
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // ActiveLocation returns whatever was passed to Connect — i.e. an
 // entry from Locations(). Reporting the verbatim pool string is what
 // makes a config block/allow list match. Granular per-server detail
-// (e.g. "Cuba - Havana") is exposed via Status.Region.
+// (e.g. "CU - Havana") is exposed via Status.Region.
 func (p ProtonVPN) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (p ProtonVPN) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
+	user, pass, err := getCredentials()
+	if err != nil {
+		shared.Debugf("ProtonVPN: %v", err)
+		return failed
+	}
 	servers, err := fetchServers(ctx)
 	if err != nil {
 		shared.Debugf("ProtonVPN: failed to fetch servers: %v", err)
-		return provider.Status{Connected: false, Provider: name}
+		return failed
 	}
-
 	matches := findServers(servers, location)
 	if len(matches) == 0 {
 		shared.Debugf("ProtonVPN: no servers found for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
 
-	server := pickRandomServer(matches)
-	if err := connectOpenVPN(ctx, server); err != nil {
-		shared.Debugf("ProtonVPN: connection failed: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-	activeMu.Lock()
-	activeLocation = location
-	activeMu.Unlock()
-	return p.Status(ctx)
-}
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
 
-func connectOpenVPN(ctx context.Context, server *protonServer) error {
-	user, pass, err := getCredentials()
-	if err != nil {
-		return err
-	}
-
-	dir := configDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("failed to create ProtonVPN config dir: %w", err)
-	}
-
-	credentialsFile, err := shared.WriteUserPassFile(dir, "auth.txt", user, pass)
-	if err != nil {
-		return fmt.Errorf("failed to write ProtonVPN credentials: %w", err)
-	}
-
-	configFile := filepath.Join(dir, "client.ovpn")
-	config := buildOpenVPNConfig(server, credentialsFile)
-	if err := os.WriteFile(configFile, []byte(config), 0600); err != nil {
-		return fmt.Errorf("failed to write ProtonVPN config: %w", err)
-	}
-
-	// RunCmd (the default — main ns, NOT a NetNS variant) so openvpn — and the tun0 it
-	// creates — land in the pod's MAIN network namespace. The
-	// in-process CONNECT proxy in tundler-tunnel dials upstream
-	// with a plain net.DialTimeout (no fwmark), so the only way
-	// proxy traffic flows through the VPN is if tun0 is the
-	// main-ns default route. `shared.RunCmd` wraps under
-	// `ip netns exec vpnns` because the systemd unit sets
-	// TUNDLER_NETNS=vpnns — that would put tun0 in vpnns where
-	// the proxy can't reach it, and the proxy would then leak
-	// crawler traffic out the pod's node IP.
-	if _, err := shared.RunCmd(ctx, "openvpn", "--config", configFile, "--daemon"); err != nil {
-		return fmt.Errorf("failed to start ProtonVPN OpenVPN: %w", err)
-	}
-
-	for i := 0; i < 60; i++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			return nil
+	rand.Shuffle(len(matches), func(a, b int) { matches[a], matches[b] = matches[b], matches[a] })
+	for idx := range matches {
+		if idx >= serversPerConnect || ctx.Err() != nil {
+			break
 		}
+		server := &matches[idx]
+		tunnel, err := ovpn.Start(ctx, ovpn.Options{Name: "ProtonVPN", RunDir: runDir(), User: user, Pass: pass, Timeout: connectTimeout},
+			func(socket string) ([]byte, error) { return buildOpenVPNConfig(server, socket) })
+		if errors.Is(err, ovpn.ErrAuthFailed) {
+			// Account-wide: another server cannot help. Report it so
+			// the runtime holds instead of re-logging in.
+			shared.Debugf("ProtonVPN: %s: %v", server.ServerName, err)
+			failed.AuthFailed = true
+			return failed
+		}
+		if err != nil {
+			shared.Debugf("ProtonVPN: %s: %v", server.ServerName, err)
+			continue
+		}
+		if !waitForRoute(ctx, tunnel) {
+			shared.Debugf("ProtonVPN: %s: connected but the default route never moved to %s", server.ServerName, tunnelInterface)
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+			_ = tunnel.Stop(stopCtx)
+			cancel()
+			continue
+		}
+		activeMu.Lock()
+		current = &active{tunnel: tunnel, server: server, location: location}
+		activeMu.Unlock()
+		return p.Status(ctx)
 	}
-
-	return fmt.Errorf("ProtonVPN OpenVPN connection timeout")
+	return failed
 }
 
 func (p ProtonVPN) Connected(ctx context.Context) bool {
-	return isOpenVPNConnected()
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("ProtonVPN: %v", err)
+	}
 }
 
 func (p ProtonVPN) Disconnect(ctx context.Context) error {
-	// Direct (no netns wrap) — matches the namespace openvpn was
-	// started in. Symmetry note same as ipvanish.go's Disconnect.
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for i := 0; i < 20; i++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
 
@@ -434,10 +430,10 @@ func (p ProtonVPN) Locations(ctx context.Context) []string {
 	return locations
 }
 
-func (p ProtonVPN) LoggedIn(ctx context.Context) bool {
-	return loggedIn
-}
+func (p ProtonVPN) LoggedIn(ctx context.Context) bool { return loggedIn }
 
+// Login only checks that credentials and the catalog are present:
+// every connect authenticates on its own.
 func (p ProtonVPN) Login(ctx context.Context) error {
 	if _, _, err := getCredentials(); err != nil {
 		return err
@@ -458,7 +454,6 @@ func (p ProtonVPN) Status(ctx context.Context) provider.Status {
 	if !p.Connected(ctx) {
 		return provider.Status{Connected: false, Provider: name}
 	}
-
 	status := provider.Status{
 		Connected: true,
 		Location:  p.ActiveLocation(ctx),
@@ -477,13 +472,11 @@ func publicIP(ctx context.Context) string {
 	if out, err := shared.RunCmd(ctx, "getent", "ahostsv4", host); err == nil {
 		resolveIP = shared.FirstIPv4(out)
 	}
-
 	args := []string{"-s", "--max-time", "5"}
 	if resolveIP != "" {
 		args = append(args, "--resolve", host+":443:"+resolveIP)
 	}
 	args = append(args, "https://"+host)
-
 	out, err := shared.RunCmd(ctx, "curl", args...)
 	if err != nil {
 		return ""
@@ -492,16 +485,19 @@ func publicIP(ctx context.Context) string {
 }
 
 func activeRegion() string {
-	if activeServer == nil {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if current == nil || current.server == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
+	s := current.server
+	if s.City != "" {
+		return s.Country + " - " + s.City
 	}
-	if activeServer.Region != "" {
-		return activeServer.Region
+	if s.Region != "" {
+		return s.Region
 	}
-	return activeServer.Country
+	return s.Country
 }
 
 func (p ProtonVPN) Version(ctx context.Context) (string, error) {

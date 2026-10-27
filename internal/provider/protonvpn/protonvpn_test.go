@@ -2,78 +2,52 @@ package protonvpn
 
 import (
 	"context"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const testServersJSON = `{
   "protonvpn": {
     "servers": [
-      {
-        "vpn": "openvpn",
-        "country": "France",
-        "region": "Europe",
-        "city": "Paris",
-        "server_name": "FR#1",
-        "hostname": "fr-001.protonvpn.net",
-        "tcp": true,
-        "udp": true,
-        "ips": ["1.2.3.4"]
-      },
-      {
-        "vpn": "openvpn",
-        "country": "Germany",
-        "region": "Europe",
-        "city": "Berlin",
-        "server_name": "DE#1",
-        "hostname": "de-001.protonvpn.net",
-        "tcp": true,
-        "udp": false,
-        "ips": ["5.6.7.8"]
-      },
-      {
-        "vpn": "wireguard",
-        "country": "France",
-        "hostname": "fr-wg.protonvpn.net",
-        "tcp": true,
-        "udp": true,
-        "ips": ["9.9.9.9"]
-      }
+      {"vpn": "openvpn", "country": "France", "region": "Europe", "city": "Paris", "server_name": "FR#1",
+       "hostname": "fr-001.protonvpn.net", "tcp": true, "udp": true, "ips": ["1.2.3.4"], "features": 12, "tier": 2},
+      {"vpn": "openvpn", "country": "Germany", "region": "Europe", "city": "Berlin", "server_name": "DE#1",
+       "hostname": "de-001.protonvpn.net", "tcp": true, "udp": false, "ips": ["5.6.7.8"], "features": 0, "tier": 2},
+      {"vpn": "openvpn", "country": "Iceland", "region": "Europe", "city": "Reykjavik", "server_name": "CH-IS#1",
+       "hostname": "ch-is-001.protonvpn.net", "tcp": true, "udp": true, "ips": ["9.9.9.9"], "features": 1, "tier": 2},
+      {"vpn": "wireguard", "country": "France", "hostname": "fr-wg.protonvpn.net", "tcp": true, "udp": true, "ips": ["9.9.9.10"]}
     ]
   }
 }`
 
 // resetTestState clears the parsed-catalog memo so the next
 // fetchServers re-parses embeddedServers, and clears the connection
-// state vars between tests.
+// state between tests.
 func resetTestState(t *testing.T) {
 	t.Helper()
 	serverCacheMu.Lock()
 	serverCache = nil
 	serverCacheOK = false
 	serverCacheErr = nil
-	activeServer = nil
 	loggedIn = false
 	serverCacheMu.Unlock()
 	activeMu.Lock()
-	activeLocation = ""
+	current = nil
 	activeMu.Unlock()
 }
 
 // useTestServers stuffs the embedded-catalog package var with a
-// deterministic test fixture. Because fetchServers() only reads
-// from disk when embeddedServers is nil, this bypasses the disk
-// load entirely — tests don't need a /etc/protonvpn/servers.json
-// file to exist. Cleared on test cleanup.
+// deterministic fixture so tests never read /etc/protonvpn/servers.json.
 func useTestServers(t *testing.T) {
 	t.Helper()
 	original := embeddedServers
 	embeddedServers = []byte(testServersJSON)
-	t.Cleanup(func() {
-		embeddedServers = original
-		resetTestState(t)
-	})
+	t.Cleanup(func() { embeddedServers = original })
 }
 
 func TestLoginRequiresOpenVPNCredentials(t *testing.T) {
@@ -81,7 +55,6 @@ func TestLoginRequiresOpenVPNCredentials(t *testing.T) {
 	useTestServers(t)
 	t.Setenv("PROTON_OPENVPN_USERNAME", "")
 	t.Setenv("PROTON_OPENVPN_PASSWORD", "")
-
 	err := ProtonVPN{}.Login(context.Background())
 	if err == nil {
 		t.Fatal("expected missing credentials error")
@@ -97,119 +70,112 @@ func TestLoginLoadsOpenVPNServerMetadata(t *testing.T) {
 	t.Setenv("PROTON_OPENVPN_USERNAME", "user")
 	t.Setenv("PROTON_OPENVPN_PASSWORD", "pass")
 	t.Setenv("PROTON_OPENVPN_PROTOCOL", "udp")
-
-	provider := ProtonVPN{}
-	if err := provider.Login(context.Background()); err != nil {
+	t.Setenv("PROTON_FEATURE_FILTER", "")
+	p := ProtonVPN{}
+	if err := p.Login(context.Background()); err != nil {
 		t.Fatalf("Login returned error: %v", err)
 	}
-	if !provider.LoggedIn(context.Background()) {
+	if !p.LoggedIn(context.Background()) {
 		t.Fatal("expected provider to be logged in")
 	}
-
-	got := provider.Locations(context.Background())
-	want := []string{"France"}
-	if !slices.Equal(got, want) {
+	got := p.Locations(context.Background())
+	if want := []string{"France", "Iceland"}; !slices.Equal(got, want) {
 		t.Fatalf("unexpected locations: got %v want %v", got, want)
 	}
 }
 
-func TestFetchServersHonorsProtocol(t *testing.T) {
+func TestFetchServersHonorsProtocolAndFeatureFilter(t *testing.T) {
 	resetTestState(t)
 	useTestServers(t)
 	t.Setenv("PROTON_OPENVPN_PROTOCOL", "tcp")
-
+	t.Setenv("PROTON_FEATURE_FILTER", "")
 	servers, err := fetchServers(context.Background())
 	if err != nil {
 		t.Fatalf("fetchServers returned error: %v", err)
 	}
-	if len(servers) != 2 {
-		t.Fatalf("unexpected server count: got %d want 2", len(servers))
+	if len(servers) != 3 {
+		t.Fatalf("unexpected server count: got %d want 3", len(servers))
 	}
-
-	matches := findServers(servers, "Berlin")
-	if len(matches) != 1 || matches[0].Country != "Germany" {
+	if matches := findServers(servers, "Berlin"); len(matches) != 1 || matches[0].Country != "Germany" {
 		t.Fatalf("unexpected Berlin matches: %#v", matches)
 	}
+	resetTestState(t)
+	t.Setenv("PROTON_FEATURE_FILTER", "securecore")
+	servers, err = fetchServers(context.Background())
+	if err != nil || len(servers) != 1 || servers[0].ServerName != "CH-IS#1" {
+		t.Fatalf("securecore filter: servers=%v err=%v", servers, err)
+	}
 }
 
-func TestBuildOpenVPNConfig(t *testing.T) {
+func TestBuildOpenVPNConfigOwnsLifecycleAndKeepsProtonTransport(t *testing.T) {
 	resetTestState(t)
 	t.Setenv("PROTON_OPENVPN_PROTOCOL", "tcp")
-
-	config := buildOpenVPNConfig(&protonServer{
-		Hostname: "fr-001.protonvpn.net",
-		IPs:      []string{"1.2.3.4", "1.2.3.5"},
-	}, "/tmp/proton-auth.txt")
-
+	t.Setenv("PROTON_OPENVPN_PORT", "")
+	raw, err := buildOpenVPNConfig(&protonServer{Hostname: "fr-001.protonvpn.net", IPs: []string{"1.2.3.4", "1.2.3.5"}}, "/run/protonvpn/openvpn-1/management.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(raw)
 	for _, want := range []string{
-		"proto tcp",
-		"remote 1.2.3.4 443",
-		"remote 1.2.3.5 443",
-		"auth-user-pass /tmp/proton-auth.txt",
-		"data-ciphers AES-256-GCM:AES-128-GCM",
-		"<ca>",
-		"<tls-crypt>",
+		"dev " + tunnelInterface + "\n", "proto tcp\n", "remote 1.2.3.4 443\n", "remote 1.2.3.5 443\n", "remote-random\n",
+		"management \"/run/protonvpn/openvpn-1/management.sock\" unix\n", "management-query-passwords\n", "management-hold\n",
+		"auth-user-pass\n", "auth-nocache\n", "connect-retry-max 1\n", "connect-timeout 15\n", "verb 0\n",
+		"data-ciphers AES-256-GCM:AES-128-GCM\n", "remote-cert-tls server\n", "<ca>\n", "<tls-crypt>\n",
+		"pull-filter ignore \"auth-token\"\n",
 	} {
 		if !strings.Contains(config, want) {
-			t.Fatalf("generated config missing %q:\n%s", want, config)
+			t.Errorf("generated config missing %q", want)
 		}
 	}
-	if strings.Contains(config, "fast-io") {
-		t.Fatalf("tcp config should not include udp-only fast-io:\n%s", config)
+	for _, dropped := range []string{"fast-io", "auth-user-pass /", "auth-retry", "verb 3", "dev tun\n"} {
+		if strings.Contains(config, dropped) {
+			t.Errorf("generated config kept %q", dropped)
+		}
+	}
+	t.Setenv("PROTON_OPENVPN_PROTOCOL", "udp")
+	raw, err = buildOpenVPNConfig(&protonServer{Hostname: "fr-001.protonvpn.net"}, "/m.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if udp := string(raw); !strings.Contains(udp, "remote fr-001.protonvpn.net 1194\n") || !strings.Contains(udp, "fast-io") {
+		t.Fatalf("udp config must fall back to the hostname on 1194 with fast-io:\n%s", udp)
+	}
+	if _, err := buildOpenVPNConfig(&protonServer{IPs: []string{"1.2.3.4\nremote evil 443"}}, "/m.sock"); err == nil {
+		t.Fatal("a remote with embedded whitespace must be rejected")
+	}
+	if _, err := buildOpenVPNConfig(&protonServer{Hostname: "x"}, "/bad\"quote.sock"); err == nil {
+		t.Fatal("a socket path that breaks quoting must be rejected")
 	}
 }
 
-// TestActiveLocationRoundTrip pins the contract that ActiveLocation
-// returns the verbatim string passed to Connect, so a value pulled
-// from Locations() (the candidate pool the manager picks from) and
-// stamped onto Status.Location can be matched byte-for-byte against a
-// config block/allow entry.
-func TestActiveLocationRoundTrip(t *testing.T) {
+func TestActiveLocationRoundTripAndDisconnect(t *testing.T) {
 	resetTestState(t)
-	activeServer = &protonServer{Country: "France", City: "Paris"}
-	activeMu.Lock()
-	activeLocation = "France"
-	activeMu.Unlock()
-
-	if got := (ProtonVPN{}).ActiveLocation(context.Background()); got != "France" {
-		t.Fatalf("ActiveLocation = %q, want %q", got, "France")
-	}
-}
-
-func TestActiveLocationEmptyWhenDisconnected(t *testing.T) {
-	resetTestState(t)
-	// activeServer is nil → not connected → ActiveLocation must not
-	// surface a stale value, even if activeLocation happens to be set.
-	activeMu.Lock()
-	activeLocation = "France"
-	activeMu.Unlock()
-
 	if got := (ProtonVPN{}).ActiveLocation(context.Background()); got != "" {
 		t.Fatalf("ActiveLocation while disconnected = %q, want empty", got)
 	}
-}
-
-func TestDisconnectClearsActiveLocation(t *testing.T) {
-	resetTestState(t)
-	activeServer = &protonServer{Country: "France"}
+	owned := exec.Command("sleep", "30")
+	if err := owned.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tunnel := ovpn.NewForTest(owned)
 	activeMu.Lock()
-	activeLocation = "France"
+	current = &active{tunnel: tunnel, server: &protonServer{Country: "France", City: "Paris"}, location: "France"}
 	activeMu.Unlock()
-
-	// Disconnect calls `pkill openvpn`, which is fine even when openvpn
-	// isn't running (RunCmd swallows the non-zero exit). The state we
-	// care about — activeServer/activeLocation — is cleared
-	// unconditionally on the way out.
+	if got := (ProtonVPN{}).ActiveLocation(context.Background()); got != "France" {
+		t.Fatalf("ActiveLocation = %q, want the verbatim Connect argument", got)
+	}
+	if got := activeRegion(); got != "France - Paris" {
+		t.Fatalf("activeRegion = %q", got)
+	}
 	if err := (ProtonVPN{}).Disconnect(context.Background()); err != nil {
-		t.Fatalf("Disconnect error: %v", err)
+		t.Fatal(err)
 	}
-	if activeServer != nil {
-		t.Fatalf("activeServer not cleared after Disconnect")
+	if (ProtonVPN{}).ActiveLocation(context.Background()) != "" || activeRegion() != "" {
+		t.Fatal("Disconnect must clear the active connection")
 	}
-	activeMu.RLock()
-	got := activeLocation
-	activeMu.RUnlock()
-	if got != "" {
-		t.Fatalf("activeLocation after Disconnect = %q, want empty", got)
+	select {
+	case <-tunnel.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Disconnect left the owned process running")
 	}
 }

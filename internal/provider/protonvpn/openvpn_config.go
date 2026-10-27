@@ -1,7 +1,10 @@
 package protonvpn
 
 import (
+	"errors"
 	"strings"
+
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 // Proton OpenVPN CA and tls-crypt key are public material embedded in Proton
@@ -11,25 +14,43 @@ const protonCA = "MIIFnTCCA4WgAwIBAgIUCI574SM3Lyh47GyNl0WAOYrqb5QwDQYJKoZIhvcNAQ
 
 const protonTLSCrypt = "6acef03f62675b4b1bbd03e53b187727423cea742242106cb2916a8a4c8297563d22c7e5cef430b1103c6f66eb1fc5b375a672f158e2e2e936c3faa48b035a6de17beaac23b5f03b10b868d53d03521d8ba115059da777a60cbfd7b2c9c5747278a15b8f6e68a3ef7fd583ec9f398c8bd4735dab40cbd1e3c62a822e97489186c30a0b48c7c38ea32ceb056d3fa5a710e10ccc7a0ddb363b08c3d2777a3395e10c0b6080f56309192ab5aacd4b45f55da61fc77af39bd81a19218a79762c33862df55785075f37d8c71dc8a42097ee43344739a0dd48d03025b0450cf1fb5e8caeb893d9a96d1f15519bb3c4dcb40ee316672ea16c012664f8a9f11255518deb"
 
-func buildOpenVPNConfig(server *protonServer, credentialsFile string) string {
+var (
+	errInvalidSocket = errors.New("invalid ProtonVPN management socket path")
+	errNoRemote      = errors.New("ProtonVPN server has no remote")
+)
+
+// buildOpenVPNConfig renders the per-connection config for server:
+// Proton's recommended transport lines, the pinned CA and tls-crypt
+// key, and the owned-process block (fixed interface, management socket
+// for the credentials, one attempt per remote). socket is the
+// management socket path.
+func buildOpenVPNConfig(server *protonServer, socket string) ([]byte, error) {
+	if !ovpn.ValidSocket(socket) {
+		return nil, errInvalidSocket
+	}
 	proto := getProtocol()
 	port := getPort(proto)
 
-	var lines []string
-	lines = append(lines,
+	lines := []string{
 		"client",
-		"dev tun",
-		"proto "+proto,
-	)
+		"dev " + tunnelInterface,
+		"dev-type tun",
+		"proto " + proto,
+	}
 
 	remotes := server.IPs
 	if len(remotes) == 0 {
 		remotes = []string{server.Hostname}
 	}
+	n := 0
 	for _, remote := range remotes {
-		if strings.TrimSpace(remote) != "" {
+		if remote = strings.TrimSpace(remote); remote != "" && !strings.ContainsAny(remote, " \t\r\n") {
 			lines = append(lines, "remote "+remote+" "+port)
+			n++
 		}
+	}
+	if n == 0 {
+		return nil, errNoRemote
 	}
 
 	lines = append(lines,
@@ -40,7 +61,7 @@ func buildOpenVPNConfig(server *protonServer, credentialsFile string) string {
 		"data-ciphers AES-256-GCM:AES-128-GCM",
 		"data-ciphers-fallback AES-256-GCM",
 		"auth SHA512",
-		"verb 3",
+		"verb 0",
 		"setenv CLIENT_CERT 0",
 		"tun-mtu 1500",
 		"tun-mtu-extra 32",
@@ -49,10 +70,10 @@ func buildOpenVPNConfig(server *protonServer, credentialsFile string) string {
 		"persist-tun",
 		"reneg-sec 0",
 		"remote-cert-tls server",
-		"auth-user-pass "+credentialsFile,
+		"connect-retry-max 1",
+		"connect-timeout 15",
+		strings.TrimRight(ovpn.Directives(socket), "\n"),
 		"pull",
-		"auth-nocache",
-		"auth-retry nointeract",
 		"pull-filter ignore \"auth-token\"",
 		"pull-filter ignore \"tun-ipv6\"",
 		"pull-filter ignore \"route-ipv6\"",
@@ -76,5 +97,5 @@ func buildOpenVPNConfig(server *protonServer, credentialsFile string) string {
 		"",
 	)
 
-	return strings.Join(lines, "\n")
+	return []byte(strings.Join(lines, "\n")), nil
 }
