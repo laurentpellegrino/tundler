@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/laurentpellegrino/tundler/internal/shared/warpproxy"
 )
 
 // One owned openvpn child per connection, supervised over a private Unix
@@ -62,19 +64,43 @@ var (
 	// looks like one of the above inside a block must not be touched,
 	// so the dropping runs on the directive lines outside blocks only.
 	inlineBlockRe = regexp.MustCompile(`(?s)<([a-z-]+)>.*?</[a-z-]+>`)
+	// protoRe is the vendor's `proto udp` line, replaced in warp mode.
+	protoRe = regexp.MustCompile(`(?m)^[ \t]*proto\b.*\n?`)
 )
+
+// warpTCPPort is the TCP port IPVanish's OpenVPN servers listen on.
+const warpTCPPort = 443
+
+// remoteRe finds the vendor's `remote <host> [port] [proto]` line.
+var remoteRe = regexp.MustCompile(`(?m)^[ \t]*remote[ \t]+([A-Za-z0-9.-]+)(?:[ \t]+(\d+))?.*\n?`)
 
 // openVPNConfig turns a vendor .ovpn (read from the baked config dir,
 // so relative file references resolve under --cd) into the config this
 // provider runs: vendor transport lines kept, credential and lifecycle
 // handling replaced by ours. socket is the management socket path.
-func openVPNConfig(vendor []byte, socket string) ([]byte, error) {
+// viaWarp switches the outer connection to TCP/443 through WARP's
+// local SOCKS5 proxy (the vendor configs are UDP, which OpenVPN cannot
+// proxy): IPVanish drops datacenter source IPs at L3, so from the
+// fleet the edge is only reachable with a Cloudflare source IP.
+func openVPNConfig(vendor []byte, socket string, viaWarp bool) ([]byte, error) {
 	if len(socket) > 107 || strings.ContainsAny(socket, "\r\n\x00\"") {
 		return nil, errors.New("invalid IPVanish management socket path")
 	}
 	text := strings.ReplaceAll(string(vendor), "\r\n", "\n")
-	if !strings.Contains(text, "\nremote ") && !strings.HasPrefix(text, "remote ") {
+	remote := remoteRe.FindStringSubmatch(text)
+	if remote == nil {
 		return nil, errors.New("IPVanish config has no remote")
+	}
+	var outer string
+	if viaWarp {
+		// Same server, TCP flavour, dialed through the SOCKS proxy.
+		// OpenVPN resolves the hostname itself and hands the IP to
+		// the proxy; a longer connect timeout covers the extra hop.
+		text = remoteRe.ReplaceAllString(text, "")
+		text = protoRe.ReplaceAllString(text, "")
+		outer = fmt.Sprintf("proto tcp-client\nremote %s %d\nsocks-proxy %s\nconnect-timeout 25\n", remote[1], warpTCPPort, warpproxy.Addr)
+	} else {
+		outer = "connect-timeout 15\n"
 	}
 	// Protect inline blocks from the directive filter.
 	var blocks []string
@@ -104,11 +130,10 @@ redirect-gateway def1
 pull-filter ignore "dhcp-option"
 persist-key
 connect-retry-max 1
-connect-timeout 15
-tun-mtu 1320
+%stun-mtu 1320
 mssfix 1280
 verb 0
-`, tunnelInterface, strconv.Quote(socket))
+`, tunnelInterface, strconv.Quote(socket), outer)
 	return []byte(text + ours), nil
 }
 
@@ -325,7 +350,7 @@ func startTunnel(ctx context.Context, server *ipvanishServer, user, pass string)
 		return nil, errors.New("create IPVanish connection directory")
 	}
 	socket := filepath.Join(dir, "management.sock")
-	config, err := openVPNConfig(vendor, socket)
+	config, err := openVPNConfig(vendor, socket, transport() == transportWarp)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err

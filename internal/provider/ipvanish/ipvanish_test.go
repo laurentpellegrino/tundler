@@ -117,7 +117,7 @@ cipher AES-256-CBC
 `
 
 func TestOpenVPNConfigKeepsTransportAndOwnsLifecycle(t *testing.T) {
-	raw, err := openVPNConfig([]byte(vendorConfig), "/run/ipvanish/openvpn-1/management.sock")
+	raw, err := openVPNConfig([]byte(vendorConfig), "/run/ipvanish/openvpn-1/management.sock", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +149,10 @@ func TestOpenVPNConfigKeepsTransportAndOwnsLifecycle(t *testing.T) {
 	if !strings.Contains(got, "auth-user-pass looks like a directive but is key material\ncipher AES-256-CBC\n-----END") {
 		t.Fatal("inline block was altered")
 	}
-	if _, err := openVPNConfig([]byte("client\nproto udp\n"), "/m.sock"); err == nil {
+	if _, err := openVPNConfig([]byte("client\nproto udp\n"), "/m.sock", false); err == nil {
 		t.Fatal("a config without remote must be rejected")
 	}
-	if _, err := openVPNConfig([]byte(vendorConfig), "/bad\"quote.sock"); err == nil {
+	if _, err := openVPNConfig([]byte(vendorConfig), "/bad\"quote.sock", false); err == nil {
 		t.Fatal("a socket path that breaks quoting must be rejected")
 	}
 }
@@ -352,5 +352,43 @@ func TestFindServersMatchesCountryCodeAndCity(t *testing.T) {
 	}
 	if n := len(findServers(servers, "")); n != 3 {
 		t.Fatalf("empty location = %d, want all", n)
+	}
+}
+
+func TestOpenVPNConfigWarpDialsTCP443ThroughTheProxy(t *testing.T) {
+	raw, err := openVPNConfig([]byte(vendorConfig), "/run/ipvanish/openvpn-1/management.sock", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(raw)
+	for _, want := range []string{"proto tcp-client\n", "remote nyc-c28.ipvanish.com 443\n", "socks-proxy 127.0.0.1 40000\n", "connect-timeout 25\n"} {
+		if strings.Count(got, want) != 1 {
+			t.Errorf("warp config must contain %q exactly once:\n%s", want, got)
+		}
+	}
+	for _, dropped := range []string{"proto udp", "remote nyc-c28.ipvanish.com 443\nresolv", "connect-timeout 15"} {
+		if strings.Contains(got, dropped) {
+			t.Errorf("warp config kept %q", dropped)
+		}
+	}
+	// Direct mode leaves the vendor transport alone.
+	direct, _ := openVPNConfig([]byte(vendorConfig), "/m.sock", false)
+	if strings.Contains(string(direct), "socks-proxy") || !strings.Contains(string(direct), "proto udp\n") {
+		t.Fatal("direct mode must keep the vendor UDP transport")
+	}
+}
+
+func TestTransportDefaultsToWarp(t *testing.T) {
+	t.Setenv(envTransport, "")
+	if transport() != transportWarp {
+		t.Fatal("default transport must be warp")
+	}
+	t.Setenv(envTransport, "direct")
+	if transport() != transportDirect {
+		t.Fatal("direct must be honoured")
+	}
+	t.Setenv(envTransport, "bogus")
+	if transport() != transportWarp {
+		t.Fatal("unknown transport must fall back to warp")
 	}
 }

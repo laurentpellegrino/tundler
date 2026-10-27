@@ -51,7 +51,7 @@ integration shapes:
 | Shape | Providers | How it connects |
 |-------|-----------|-----------------|
 | **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
-| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs; `ipvanish` owns its openvpn child over a management socket, passes the password through it and reports `AUTH_FAILED` as an auth failure so the runtime holds instead of re-logging in, because IPVanish suspends accounts that log in too often) |
+| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs; `ipvanish` owns its openvpn child over a management socket, passes the password through it, reports `AUTH_FAILED` as an auth failure so the runtime holds instead of re-logging in because IPVanish suspends accounts that log in too often, and like `fastvpn` dials TCP/443 through WARP's SOCKS5 proxy by default because IPVanish drops datacenter source IPs) |
 | **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
@@ -239,6 +239,7 @@ curl http://localhost:4242/status
 | `TUNDLER_BLOCKED_COOLDOWN` | how long a spent location and country stay skipped (default `1h`, `0` disables) |
 | `TUNDLER_REFUSED_MEMORY` | how long an exit prefix the upstream refused (`POST /rotate` with `reason=banned`) is avoided by later rotations (default `24h`, `0` disables) |
 | `FASTVPN_TRANSPORT` | fastvpn only: `warp` (default) runs openvpn over TCP/443 through WARP's SOCKS5 proxy; `direct` runs plain UDP/1194 openvpn for hosts whose source IP WLVPN accepts |
+| `IPVANISH_TRANSPORT` | `warp` (default: OpenVPN TCP/443 through Cloudflare WARP's local SOCKS5 proxy, IPVanish drops datacenter source IPs) or `direct` (vendor UDP config as is, for residential source IPs) |
 | `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
 | `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
 
