@@ -281,6 +281,8 @@ func main() {
 	exits = newExitMemoryFromEnv()
 	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s), refused-exit memory %s (%s)",
 		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory, exits.refusedTTL, envRefusedMemory)
+	hold = newAuthHoldFromEnv()
+	log.Printf("tundler-tunnel: auth-failure hold %s base (%s), doubling to %s", hold.base, envAuthFailureBackoff, maxAuthFailureBackoff)
 	pref = newLocationPreference(providerName)
 	if pref != nil {
 		pref.cooldown = blocked
@@ -474,11 +476,21 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	backoff := watchdogMinBackoff
+	var holdLoggedAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if r := hold.remaining(); r > 0 {
+				// Credentials rejected: no reconnect until the hold
+				// ends, whatever the tunnel looks like.
+				if time.Since(holdLoggedAt) > 10*time.Minute {
+					log.Printf("tundler-tunnel: watchdog idle — auth-failure hold for another %s", r.Round(time.Second))
+					holdLoggedAt = time.Now()
+				}
+				continue
+			}
 			current := state.Get()
 			// Stay out of the way while some other code path drives
 			// the connection. /rotate handlers, initial connect, and

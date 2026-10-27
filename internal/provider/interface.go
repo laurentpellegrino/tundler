@@ -15,6 +15,12 @@ type Status struct {
 	Location  string `json:"location,omitempty"`
 	Region    string `json:"region,omitempty"`
 	Provider  string `json:"provider,omitempty"`
+	// AuthFailed marks a failed Connect that the provider rejected for
+	// the account's credentials (OpenVPN AUTH_FAILED and the like)
+	// rather than for the location: retrying elsewhere cannot help and
+	// every retry is one more login against a provider that may be
+	// rate-limiting logins. The caller holds all connects for a while.
+	AuthFailed bool `json:"auth_failed,omitempty"`
 }
 
 // VPNProvider is the contract every CLI wrapper (ExpressVPN, NordVPN, …)

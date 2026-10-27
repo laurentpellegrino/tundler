@@ -29,6 +29,7 @@ type fakeProvider struct {
 	noLocations bool // when true, Locations() returns nil to force pick-fail
 
 	failLocations map[string]bool // Connect(location) fails for these, whatever connectOK says
+	authFail      bool            // Connect reports a credential rejection (Status.AuthFailed)
 
 	disconnectCalls   atomic.Int32 // number of Disconnect() invocations
 	disconnectCtxErrd atomic.Bool  // true if any Disconnect saw a cancelled ctx
@@ -51,9 +52,13 @@ func (f *fakeProvider) Connect(_ context.Context, location string) provider.Stat
 	hook := f.onConnect
 	ok := f.connectOK && !f.failLocations[location]
 	ip := f.connectIP
+	authFail := f.authFail
 	f.mu.Unlock()
 	if hook != nil {
 		hook(location)
+	}
+	if authFail {
+		return provider.Status{Connected: false, AuthFailed: true}
 	}
 	if !ok {
 		return provider.Status{Connected: false}

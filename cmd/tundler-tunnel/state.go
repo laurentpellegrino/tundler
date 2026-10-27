@@ -75,6 +75,8 @@ type StateTracker struct {
 	authFailuresTotal     int
 	lastAuthFailureAt     time.Time
 	lastAuthFailureReason string
+	// authHoldUntil is when the auth-failure hold ends (zero = none).
+	authHoldUntil time.Time
 
 	// accountID/accountSource identify which provider account this pod
 	// selected at boot (accounts.Select) and where it came from
@@ -287,12 +289,22 @@ func (s *StateTracker) Snapshot() Snapshot {
 	if !s.lastAuthFailureAt.IsZero() {
 		snap.LastAuthFailureAt = s.lastAuthFailureAt.Format(time.RFC3339)
 	}
+	if !s.authHoldUntil.IsZero() && s.authHoldUntil.After(time.Now()) {
+		snap.AuthHoldUntil = s.authHoldUntil.UTC().Format(time.RFC3339)
+	}
 	if !s.nextRotationAt.IsZero() {
 		if remaining := time.Until(s.nextRotationAt); remaining > 0 {
 			snap.NextRotationInSeconds = int(remaining.Round(time.Second).Seconds())
 		}
 	}
 	return snap
+}
+
+// SetAuthHold records when the auth-failure hold ends (zero clears).
+func (s *StateTracker) SetAuthHold(until time.Time) {
+	s.mu.Lock()
+	s.authHoldUntil = until
+	s.mu.Unlock()
 }
 
 // RecordAuthFailure bumps the auth-failure counter and stamps a
@@ -348,4 +360,7 @@ type Snapshot struct {
 	AuthFailuresTotal     int    `json:"auth_failures_total"`
 	LastAuthFailureAt     string `json:"last_auth_failure_at,omitempty"`
 	LastAuthFailureReason string `json:"last_auth_failure_reason,omitempty"`
+	// AuthHoldUntil is when the auth-failure hold on connects ends
+	// (absent when no hold is active).
+	AuthHoldUntil string `json:"auth_hold_until,omitempty"`
 }
