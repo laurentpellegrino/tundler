@@ -213,7 +213,7 @@ docker run --rm -d --name tundler-windscribe \
 #   -e POD_NAME=tundler-tunnel-windscribe-6   # ordinal 6 → backup
 
 # crawl through the tunnel:
-curl -x http://localhost:8485 https://example.com
+curl -x http://localhost:8485 https://www.cloudflare.com/cdn-cgi/trace
 # check health / current exit / selected account:
 curl http://localhost:4242/status
 ```
