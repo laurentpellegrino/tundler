@@ -127,6 +127,10 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	state.RecordConnectAttempt()
 	status := prov.Connect(ctx, location)
 	if !status.Connected {
+		if status.AuthFailed {
+			noteAuthFailure(state, providerName, location)
+			return location, fmt.Errorf("%w (provider=%s location=%s)", errAuthFailed, providerName, location)
+		}
 		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
@@ -144,6 +148,8 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	// Boot and watchdog reconnects only record the exit: a reconnect
 	// to the same server legitimately repeats it, so no pool verdict.
 	exits.remember(exitIP)
+	hold.clear()
+	state.SetAuthHold(time.Time{})
 	state.RecordTunnelUp(location, exitIP)
 	state.RecordCountry(preferredCountry, currentCountry(location))
 	state.Set(StateReady)
@@ -288,6 +294,12 @@ func loginInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state
 // backoff is injected so tests can drive it without real sleeps;
 // production passes bootConnectBackoff.
 func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string, backoff func(attempt int) time.Duration) error {
+	return connectInitialWithRetryObserved(ctx, prov, state, providerName, excluded, baselineEgressIP, backoff, nil)
+}
+
+// connectInitialWithRetryObserved is connectInitialWithRetry with a hook
+// that sees each wait before it starts (tests assert on the hold).
+func connectInitialWithRetryObserved(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, baselineEgressIP string, backoff func(attempt int) time.Duration, observe func(time.Duration)) error {
 	// Locations that failed during this boot are excluded from the
 	// next pick, exactly like connectWithRetry does for rotations.
 	// Without this the region preference — deterministic by design,
@@ -319,8 +331,16 @@ func connectInitialWithRetry(ctx context.Context, prov provider.VPNProvider, sta
 			recentlyFailed = append(recentlyFailed, location)
 		}
 		wait := backoff(attempt)
+		if r := hold.remaining(); r > 0 {
+			// Credential rejection: the hold replaces the short backoff
+			// so a suspended account sees no login until it ends.
+			wait = r
+		}
 		log.Printf("tundler-tunnel: initial connect attempt %d failed: %v; retrying in %s (staying up, no re-login)",
 			attempt, err, wait.Round(time.Millisecond))
+		if observe != nil {
+			observe(wait)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -410,6 +430,13 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 		log.Printf("tundler-tunnel: rotation attempt %d/%d to location=%s", attempt, maxAttempts, location)
 		state.RecordConnectAttempt()
 		status := prov.Connect(ctx, location)
+		if status.AuthFailed {
+			// Account-wide: no other location can help and every
+			// attempt is a login. Fail the rotation now; the watchdog
+			// reconnects once the hold ends.
+			noteAuthFailure(state, providerName, location)
+			return fmt.Errorf("attempt %d/%d: %w (provider=%s)", attempt, maxAttempts, errAuthFailed, providerName)
+		}
 		if status.Connected {
 			observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
 			if err != nil {
@@ -439,6 +466,8 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 					attempt, maxAttempts, location, exitIP)
 				continue
 			}
+			hold.clear()
+			state.SetAuthHold(time.Time{})
 			state.RecordTunnelUp(location, exitIP)
 			state.RecordCountry(preferredCountry, currentCountry(location))
 			state.Set(StateReady)
