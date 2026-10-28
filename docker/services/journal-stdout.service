@@ -1,17 +1,23 @@
 [Unit]
-Description=Forward tundler-tunnel journal to PID 1 stdout (for kubectl logs)
+Description=Forward tundler-tunnel journal to the container log (kubectl logs)
 After=systemd-journald.service
 # tundler-tunnel.service may not exist yet when this unit fires; that's
 # fine — journalctl -f blocks until matching entries appear.
+# Requires the FIFO created by tundler-entrypoint.sh before systemd
+# boots; opening it blocks until the entrypoint's drain loop reads.
 
 [Service]
 Type=simple
 # Tail tundler-tunnel.service entries in plain "message-only" format
-# so kubectl logs output is the same Go log line we'd see in
-# journalctl -u tundler-tunnel. Redirect via /bin/sh -c so the shell
-# evaluates /proc/1/fd/1 fresh on every (re)start — that's container
-# PID 1's stdout, which is exactly what kubelet collects.
-ExecStart=/bin/sh -c 'exec journalctl --follow --unit=tundler-tunnel.service --no-pager --output=cat >/proc/1/fd/1 2>&1'
+# so the container log shows the same Go log line we'd see in
+# journalctl -u tundler-tunnel, plus systemd's own lines about the
+# unit (exit status, signal, restart). The destination is the FIFO
+# that tundler-entrypoint.sh drains into the container's real stdout:
+# writing to /proc/1/fd/1 reaches nothing, PID 1 (systemd) reopens its
+# stdio on /dev/null at boot. --lines=all replays entries logged before
+# this unit started (the first boot of the binary is the one that
+# matters after a crash-recreate).
+ExecStart=/bin/sh -c 'exec journalctl --follow --lines=all --unit=tundler-tunnel.service --no-pager --output=cat >/run/tundler/stdout 2>&1'
 Restart=always
 RestartSec=2
 

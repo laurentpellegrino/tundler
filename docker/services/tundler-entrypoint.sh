@@ -175,4 +175,24 @@ for DEST in $DNS_DESTS; do
     done
 done
 
+# Keep the container's real stdout reachable after systemd takes over.
+# systemd running as PID 1 reopens its stdin/stdout/stderr on /dev/null
+# (verified on systemd 255: /proc/1/fd/1 -> /dev/null once booted), so
+# journal-stdout.service writing to /proc/1/fd/1 forwarded nothing and
+# the pod log stopped at the entrypoint lines above — a crashed binary
+# left no trace outside the journal, which dies with the container.
+# This helper inherits the stdout the runtime handed PID 1 and drains a
+# FIFO into it; the service writes the journal to that FIFO instead.
+# The helper is a child of PID 1 and outlives the exec below; cat
+# blocks on open until a writer appears, so an idle FIFO costs nothing.
+STDOUT_FIFO=/run/tundler/stdout
+mkdir -p "$(dirname "$STDOUT_FIFO")"
+rm -f "$STDOUT_FIFO"
+if mkfifo -m 0600 "$STDOUT_FIFO"; then
+    ( while :; do cat "$STDOUT_FIFO"; done ) </dev/null &
+    echo "[tundler-entrypoint] forwarding the tundler-tunnel journal to the container log via $STDOUT_FIFO"
+else
+    echo "[tundler-entrypoint] WARNING: could not create $STDOUT_FIFO — the tundler-tunnel journal will not reach the container log"
+fi
+
 exec /lib/systemd/systemd
