@@ -132,7 +132,7 @@ func TestOpenVPNConfigKeepsVendorTransportAndKeys(t *testing.T) {
 	got := string(raw)
 	for _, want := range []string{
 		"remote 146.70.19.146 23499\n", "proto udp\n", "cipher AES-256-CBC\n", "key-direction 1\n", "auth SHA512\n",
-		"tun-mtu 1500\n", "mssfix 1450\n", "-----BEGIN CERTIFICATE-----", "-----BEGIN OpenVPN Static key V1-----",
+		"tun-mtu 1320\n", "mssfix 1280\n", "-----BEGIN CERTIFICATE-----", "-----BEGIN OpenVPN Static key V1-----",
 		"dev " + tunnelInterface + "\n", "management \"/run/veepn/openvpn-1/management.sock\" unix\n",
 		"management-query-passwords\n", "management-hold\n", "auth-nocache\n", "connect-retry-max 1\n", "connect-timeout 15\n", "verb 0\n",
 	} {
@@ -140,7 +140,7 @@ func TestOpenVPNConfigKeepsVendorTransportAndKeys(t *testing.T) {
 			t.Errorf("config missing %q", want)
 		}
 	}
-	for _, dropped := range []string{"dev tun\n", "verb 3", "auth-user-pass /"} {
+	for _, dropped := range []string{"dev tun\n", "verb 3", "auth-user-pass /", "tun-mtu 1500", "tun-mtu-extra", "mssfix 1450"} {
 		if strings.Contains(got, dropped) {
 			t.Errorf("config kept %q", dropped)
 		}
