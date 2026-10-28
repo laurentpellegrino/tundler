@@ -46,12 +46,16 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/requirements-veepn.txt
 
       - name: Install Botasaurus driver + xvfb
         run: |
           set -euo pipefail
-          pip install -r scripts/requirements-veepn.txt
-          sudo apt-get update && sudo apt-get install -y xvfb
+          # apt and pip don't contend; overlap them.
+          (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends xvfb) &
+          pip install -q -r scripts/requirements-veepn.txt
+          wait
           # Google Chrome is preinstalled on GitHub's Ubuntu runner image.
           google-chrome --version
 
