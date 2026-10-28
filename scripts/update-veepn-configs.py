@@ -13,8 +13,15 @@ import re
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from pathlib import Path
+
+try:
+    from botasaurus_driver.exceptions import DetachedElementException
+except ImportError:  # --from-zip validation needs no browser driver
+    class DetachedElementException(Exception):
+        pass
 
 LOGIN_URL = "https://account.veepn.com/login/"
 MIN_CONFIGS = 100
@@ -32,9 +39,14 @@ def wait_for(check, description: str, timeout: float = 60):
 
 
 def visible_element(driver, selector: str):
-    for element in driver.select_all(selector, wait=None):
-        if element.run_js("(el) => !!el.getClientRects().length && !el.disabled"):
-            return element
+    try:
+        for element in driver.select_all(selector, wait=None):
+            if element.run_js("(el) => !!el.getClientRects().length && !el.disabled"):
+                return element
+    except DetachedElementException:
+        # The page swapped its document mid-probe (Cloudflare interstitial,
+        # client-side hydration); the caller polls, so report "not yet".
+        return None
     return None
 
 
@@ -46,8 +58,6 @@ def settled(driver, selector: str, description: str, action, attempts: int = 6):
     on it raises DetachedElementException. Re-resolve and retry until the same
     node survives a short settle window.
     """
-    from botasaurus_driver.exceptions import DetachedElementException
-
     for _ in range(attempts):
         element = wait_for(lambda: visible_element(driver, selector), description)
         time.sleep(1)
@@ -73,6 +83,13 @@ def fill(driver, selector: str, description: str, value: str):
 
 def control(driver, labels: tuple[str, ...] = (), *, archive: bool = False):
     """Find a visible control by label, excluding unrelated downloads."""
+    try:
+        return _control(driver, labels, archive)
+    except DetachedElementException:
+        return None
+
+
+def _control(driver, labels: tuple[str, ...], archive: bool):
     found = driver.run_js(r"""
         document.querySelectorAll('[data-tundler-control]').forEach(
             e => e.removeAttribute('data-tundler-control'));
@@ -122,13 +139,25 @@ def completed_download(directory: Path):
     return None
 
 
+def open_login(driver):
+    for _ in range(3):
+        try:
+            driver.google_get(LOGIN_URL, bypass_cloudflare=True)
+            return
+        except DetachedElementException:
+            # The Cloudflare challenge replaces the document while the
+            # driver's bypass is still inspecting it; load again.
+            time.sleep(3)
+    raise RuntimeError("login page kept re-rendering during the Cloudflare check")
+
+
 def download_archive(directory: Path, email: str, password: str) -> Path:
     from botasaurus_driver import Driver, cdp
 
     driver = Driver(headless=False, lang="en-US", window_size=(1400, 1000))
     try:
         print(f"[veepn] opening {LOGIN_URL}", flush=True)
-        driver.google_get(LOGIN_URL, bypass_cloudflare=True)
+        open_login(driver)
         fill(driver, 'input[autocomplete="email"], input[type="email"]', "login email field", email)
         fill(driver, 'input[type="password"]', "login password field", password)
         settled(driver, 'button[type="submit"]', "login submit button", lambda el: el.click())
@@ -220,6 +249,10 @@ def main() -> int:
         # Browser exceptions can contain form values. Do not dump page state or traces.
         print(f"::error::VeePN refresh failed ({type(error).__name__}); "
               "existing release retained.", file=sys.stderr)
+        # Frame locations only (no source lines, no locals): safe to log publicly.
+        frames = traceback.extract_tb(error.__traceback__)[-6:]
+        print("where: " + " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}"
+                                      for f in reversed(frames)), file=sys.stderr)
         if isinstance(error, (ValueError, zipfile.BadZipFile)) or (
                 isinstance(error, RuntimeError) and str(error).startswith("Timed out waiting for")):
             print(str(error), file=sys.stderr)
