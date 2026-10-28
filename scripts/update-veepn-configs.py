@@ -38,19 +38,55 @@ def visible_element(driver, selector: str):
     return None
 
 
+def settled(driver, selector: str, description: str, action, attempts: int = 6):
+    """Run `action` on a visible element once the dashboard stops re-rendering it.
+
+    The login form is hydrated client-side after the Cloudflare check, so the
+    first node matching `selector` is often replaced moments later and acting
+    on it raises DetachedElementException. Re-resolve and retry until the same
+    node survives a short settle window.
+    """
+    from botasaurus_driver.exceptions import DetachedElementException
+
+    for _ in range(attempts):
+        element = wait_for(lambda: visible_element(driver, selector), description)
+        time.sleep(1)
+        try:
+            if not element.run_js("(el) => el.isConnected"):
+                continue
+            result = action(element)
+        except DetachedElementException:
+            continue
+        if result is not False:
+            return element
+    raise RuntimeError(f"{description} kept re-rendering")
+
+
+def fill(driver, selector: str, description: str, value: str):
+    def action(element):
+        element.click()
+        element.type(value)
+        # A re-render can swallow typed text; verify before moving on.
+        return element.run_js("(el) => el.value") == value
+    return settled(driver, selector, description, action)
+
+
 def control(driver, labels: tuple[str, ...] = (), *, archive: bool = False):
     """Find a visible control by label, excluding unrelated downloads."""
     found = driver.run_js(r"""
         document.querySelectorAll('[data-tundler-control]').forEach(
             e => e.removeAttribute('data-tundler-control'));
         const elements = [...document.querySelectorAll('a, button, [role="button"]')];
-        const match = elements.find(e => {
+        const matches = elements.filter(e => {
             if (!e.getClientRects().length || e.disabled) return false;
             const text = (e.innerText || e.textContent || e.getAttribute('aria-label') || '')
                 .trim().replace(/\s+/g, ' ').toLowerCase();
             return args.labels.includes(text) || (args.archive &&
                 /download.*all.*(config|location)|all.*config.*(file|download)/.test(text));
         });
+        // The dashboard offers the archive for Linux and for Router; the
+        // Linux one is the OpenVPN set the tunnel image expects.
+        const match = matches.find(e => e.href && /\/linux\//.test(e.href)) || matches[0];
         if (match) match.setAttribute('data-tundler-control', 'true');
         return !!match;
     """, args={"labels": list(labels), "archive": archive})
@@ -58,11 +94,17 @@ def control(driver, labels: tuple[str, ...] = (), *, archive: bool = False):
 
 
 def logged_in(driver) -> bool:
-    # A redirect alone is not proof of authentication (e.g. OTP / error pages).
+    # A redirect alone is not proof of authentication (e.g. OTP / error pages):
+    # require a logout control, or the dashboard's own sections rendered with
+    # no password prompt on the page.
     return bool(driver.run_js(r"""
-        return document.querySelector('meta[name="meta-auth"]')?.content === '1'
-            || [...document.querySelectorAll('a[href]')].some(
-                e => /\/(logout|sign-out)\/?$/.test(new URL(e.href).pathname));
+        const text = e => (e.innerText || e.getAttribute('aria-label') || '').trim();
+        const controls = [...document.querySelectorAll('a[href], button')];
+        const logout = controls.some(e => /^(log ?out|sign ?out)$/i.test(text(e))
+            || (e.href && /\/(logout|sign-out)\/?$/.test(new URL(e.href).pathname)));
+        const dashboard = !document.querySelector('input[type="password"]')
+            && [...document.querySelectorAll('h1, h2')].some(h => /^(overview|my devices)$/i.test(text(h)));
+        return document.querySelector('meta[name="meta-auth"]')?.content === '1' || logout || dashboard;
     """))
 
 
@@ -87,12 +129,9 @@ def download_archive(directory: Path, email: str, password: str) -> Path:
     try:
         print(f"[veepn] opening {LOGIN_URL}", flush=True)
         driver.google_get(LOGIN_URL, bypass_cloudflare=True)
-        wait_for(lambda: visible_element(driver, 'input[autocomplete="email"], input[type="email"]'),
-                 "login email field").type(email)
-        wait_for(lambda: visible_element(driver, 'input[type="password"]'),
-                 "login password field").type(password)
-        wait_for(lambda: visible_element(driver, 'button[type="submit"]'),
-                 "login submit button").click()
+        fill(driver, 'input[autocomplete="email"], input[type="email"]', "login email field", email)
+        fill(driver, 'input[type="password"]', "login password field", password)
+        settled(driver, 'button[type="submit"]', "login submit button", lambda el: el.click())
         wait_for(lambda: logged_in(driver), "authenticated dashboard; check credentials or OTP")
         print("[veepn] authenticated; locating manual configurations", flush=True)
 
