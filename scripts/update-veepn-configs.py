@@ -1,151 +1,190 @@
 #!/usr/bin/env python3
-"""Refresh the VeePN OpenVPN config archive by driving a real browser.
+"""Mirror VeePN configs using the Botasaurus Chrome driver.
 
-VeePN gates its account dashboard + API behind a Cloudflare JS challenge
-(`cf-mitigated: challenge`), so a plain HTTP client (curl / requests) gets
-403'd. The only reliable way to fetch the per-location configs unattended
-is to drive a real Chromium that clears the challenge, logs in, and
-downloads the "all configurations" archive — exactly what this does.
-
-Flow:
-  1. Launch Chromium (headed, under xvfb in CI) so Cloudflare's managed
-     challenge passes (headless is reliably blocked).
-  2. Log in at account.veepn.com with VEEPN_EMAIL / VEEPN_PASSWORD.
-  3. Open the manual-config downloads page and trigger "download all
-     configuration files".
-  4. Unzip, sanity-check (>= MIN_CONFIGS .ovpn), re-zip to --out.
-
-Env:
-  VEEPN_EMAIL, VEEPN_PASSWORD   account login (NOT the manual-config creds)
-Args:
-  --out PATH                    output zip (default /tmp/veepn-configs.zip)
-
-NOTE: the login-form + download-button selectors below are best-effort
-(from the dashboard's visible labels). VeePN's SPA may differ or change;
-if a step times out, update the selector list and re-run. This script is
-intentionally verbose so a CI failure shows exactly which step broke.
+Requires Google Chrome and requirements-veepn.txt; use xvfb-run in CI.
+VEEPN_EMAIL / VEEPN_PASSWORD are account credentials, not VPN device credentials.
+Follows Overview -> Linux/Router -> download all without generating credentials.
 """
+from __future__ import annotations
+
 import argparse
 import os
+import re
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-LOGIN_URL = "https://account.veepn.com/en/account-auth/"
-DOWNLOADS_URL = "https://account.veepn.com/en/downloads/"
+LOGIN_URL = "https://account.veepn.com/login/"
 MIN_CONFIGS = 100
-
-# Best-effort selector candidates (tried in order). Update if the SPA changes.
-EMAIL_SELECTORS = ['input[type="email"]', 'input[name="email"]', '#email']
-PASSWORD_SELECTORS = ['input[type="password"]', 'input[name="password"]', '#password']
-SUBMIT_SELECTORS = ['button[type="submit"]', 'button:has-text("Log in")', 'button:has-text("Sign in")']
-# The "download all configuration files" control (cloud icon next to
-# "Download all configuration files" / French "Téléchargez tous les
-# fichiers de configuration").
-DOWNLOAD_ALL_SELECTORS = [
-    'a:has-text("all configuration")',
-    'button:has-text("all configuration")',
-    '[href$=".zip"]',
-    'a[download]',
-]
+CONFIG_NAME = re.compile(r"^[a-z0-9-]+\.(tcp|udp)\.veepn\.com\.ovpn$")
 
 
-def first_visible(page, selectors, timeout=15000):
-    last = None
-    for sel in selectors:
-        try:
-            el = page.wait_for_selector(sel, timeout=timeout, state="visible")
-            if el:
-                return el
-        except PWTimeout as e:
-            last = e
-    raise RuntimeError(f"none of {selectors} appeared (last: {last})")
+def wait_for(check, description: str, timeout: float = 60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.5)
+    raise RuntimeError(f"Timed out waiting for {description}")
+
+
+def visible_element(driver, selector: str):
+    for element in driver.select_all(selector, wait=None):
+        if element.run_js("(el) => !!el.getClientRects().length && !el.disabled"):
+            return element
+    return None
+
+
+def control(driver, labels: tuple[str, ...] = (), *, archive: bool = False):
+    """Find a visible control by label, excluding unrelated downloads."""
+    found = driver.run_js(r"""
+        document.querySelectorAll('[data-tundler-control]').forEach(
+            e => e.removeAttribute('data-tundler-control'));
+        const elements = [...document.querySelectorAll('a, button, [role="button"]')];
+        const match = elements.find(e => {
+            if (!e.getClientRects().length || e.disabled) return false;
+            const text = (e.innerText || e.textContent || e.getAttribute('aria-label') || '')
+                .trim().replace(/\s+/g, ' ').toLowerCase();
+            return args.labels.includes(text) || (args.archive &&
+                /download.*all.*(config|location)|all.*config.*(file|download)/.test(text));
+        });
+        if (match) match.setAttribute('data-tundler-control', 'true');
+        return !!match;
+    """, args={"labels": list(labels), "archive": archive})
+    return driver.select('[data-tundler-control="true"]', wait=None) if found else None
+
+
+def logged_in(driver) -> bool:
+    # A redirect alone is not proof of authentication (e.g. OTP / error pages).
+    return bool(driver.run_js(r"""
+        return document.querySelector('meta[name="meta-auth"]')?.content === '1'
+            || [...document.querySelectorAll('a[href]')].some(
+                e => /\/(logout|sign-out)\/?$/.test(new URL(e.href).pathname));
+    """))
+
+
+def completed_download(directory: Path):
+    files = [p for p in directory.iterdir()
+             if p.is_file() and not p.name.endswith((".crdownload", ".tmp"))]
+    if any(directory.glob("*.crdownload")):
+        return None
+    if len(files) > 1:
+        raise RuntimeError("Expected one configuration archive download")
+    if files:
+        if not zipfile.is_zipfile(files[0]):
+            raise ValueError("Downloaded file is not a ZIP archive")
+        return files[0]
+    return None
+
+
+def download_archive(directory: Path, email: str, password: str) -> Path:
+    from botasaurus_driver import Driver, cdp
+
+    driver = Driver(headless=False, lang="en-US", window_size=(1400, 1000))
+    try:
+        print(f"[veepn] opening {LOGIN_URL}", flush=True)
+        driver.google_get(LOGIN_URL, bypass_cloudflare=True)
+        wait_for(lambda: visible_element(driver, 'input[autocomplete="email"], input[type="email"]'),
+                 "login email field").type(email)
+        wait_for(lambda: visible_element(driver, 'input[type="password"]'),
+                 "login password field").type(password)
+        wait_for(lambda: visible_element(driver, 'button[type="submit"]'),
+                 "login submit button").click()
+        wait_for(lambda: logged_in(driver), "authenticated dashboard; check credentials or OTP")
+        print("[veepn] authenticated; locating manual configurations", flush=True)
+
+        # Follow rendered navigation instead of guessing a /downloads/ URL.
+        overview = control(driver, ("overview",))
+        if overview:
+            overview.click()
+
+        target = wait_for(lambda: control(driver, archive=True)
+                          or control(driver, ("linux", "router")),
+                          "Linux/Router configuration control")
+        # Find again because control() marks the selected element for clicking.
+        download = control(driver, archive=True)
+        if download is None:
+            target = control(driver, ("linux", "router"))
+            if target is None:
+                raise RuntimeError("Manual configuration control disappeared")
+            target.click()
+            download = wait_for(lambda: control(driver, archive=True),
+                                "download all configuration files control")
+        driver.run_cdp_command(cdp.browser.set_download_behavior(
+            behavior="allow", download_path=str(directory.resolve())))
+        print("[veepn] downloading all configurations", flush=True)
+        download.click()
+        return wait_for(lambda: completed_download(directory), "completed ZIP download", timeout=120)
+    finally:
+        driver.close()
+
+
+def normalize_archive(raw: Path, out: Path) -> int:
+    """Validate and flatten configs with stable ordering, timestamps and bytes."""
+    entries: dict[str, bytes] = {}
+    protocols = set()
+    with zipfile.ZipFile(raw) as source:
+        for info in source.infolist():
+            if info.is_dir() or not info.filename.endswith(".ovpn"):
+                continue
+            name = info.filename.rsplit("/", 1)[-1]
+            match = CONFIG_NAME.fullmatch(name)
+            if not match:
+                raise ValueError(f"Unexpected OpenVPN filename: {name!r}")
+            if name in entries:
+                raise ValueError(f"Duplicate flattened config: {name}")
+            data = source.read(info)
+            if not re.search(rb"(?m)^\s*remote\s+\S+", data):
+                raise ValueError(f"Config has no OpenVPN remote directive: {name}")
+            entries[name] = data
+            protocols.add(match[1])
+    if len(entries) < MIN_CONFIGS or protocols != {"tcp", "udp"}:
+        raise ValueError(f"Expected >= {MIN_CONFIGS} TCP+UDP configs; "
+                         f"got {len(entries)} with protocols {sorted(protocols)}")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # No upstream paths are extracted. Replace output only after successful writing.
+    with tempfile.TemporaryDirectory(dir=out.parent) as work:
+        fresh = Path(work) / "configs.zip"
+        with zipfile.ZipFile(fresh, "w", zipfile.ZIP_DEFLATED) as dest:
+            for name, data in sorted(entries.items()):
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                dest.writestr(info, data)
+        fresh.replace(out)
+    return len(entries)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/tmp/veepn-configs.zip")
-    args = ap.parse_args()
-
-    email = os.environ.get("VEEPN_EMAIL")
-    password = os.environ.get("VEEPN_PASSWORD")
-    if not email or not password:
-        print("::error::VEEPN_EMAIL / VEEPN_PASSWORD must be set", file=sys.stderr)
-        return 2
-
-    with sync_playwright() as p:
-        # channel="chrome" + headed (xvfb) gives the best odds against
-        # Cloudflare's managed challenge; headless chromium is blocked.
-        browser = p.chromium.launch(
-            headless=False,
-            channel="chrome",
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
-            accept_downloads=True,
-            viewport={"width": 1400, "height": 1000},
-        )
-        # Light stealth: hide webdriver flag.
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-        page = ctx.new_page()
-
-        print(f"[veepn] login at {LOGIN_URL}")
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(6000)  # let Cloudflare's challenge settle
-
-        first_visible(page, EMAIL_SELECTORS).fill(email)
-        first_visible(page, PASSWORD_SELECTORS).fill(password)
-        first_visible(page, SUBMIT_SELECTORS).click()
-        page.wait_for_timeout(8000)
-        if "account-auth" in page.url:
-            print("::error::still on the login page after submit — bad creds or selector drift", file=sys.stderr)
-            print(f"[veepn] current url: {page.url}", file=sys.stderr)
-            return 1
-        print(f"[veepn] logged in (url={page.url})")
-
-        print(f"[veepn] open downloads {DOWNLOADS_URL}")
-        page.goto(DOWNLOADS_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
-        # Some dashboards need the "Manual"/"Router" sub-section opened first;
-        # try clicking it if present (best-effort, non-fatal).
-        for label in ("Manual", "Manuel", "Router", "Routeur"):
-            try:
-                page.click(f'text="{label}"', timeout=3000)
-                page.wait_for_timeout(2000)
-            except PWTimeout:
-                pass
-
-        print("[veepn] trigger 'download all configurations'")
-        with page.expect_download(timeout=60000) as dl_info:
-            first_visible(page, DOWNLOAD_ALL_SELECTORS).click()
-        download = dl_info.value
-        raw = Path(tempfile.mkdtemp()) / (download.suggested_filename or "veepn.zip")
-        download.save_as(str(raw))
-        print(f"[veepn] downloaded {raw} ({raw.stat().st_size} bytes)")
-
-        browser.close()
-
-    # Validate + normalize: extract .ovpn, sanity-floor, re-zip flat.
-    work = Path(tempfile.mkdtemp())
-    with zipfile.ZipFile(raw) as zf:
-        zf.extractall(work)
-    ovpns = list(work.rglob("*.ovpn"))
-    print(f"[veepn] archive contains {len(ovpns)} .ovpn files")
-    if len(ovpns) < MIN_CONFIGS:
-        print(f"::error::only {len(ovpns)} .ovpn (<{MIN_CONFIGS} floor) — refusing to publish", file=sys.stderr)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, default=Path("/tmp/veepn-configs.zip"))
+    parser.add_argument("--from-zip", type=Path,
+                        help="validate/normalize a downloaded archive without logging in")
+    args = parser.parse_args()
+    try:
+        if args.from_zip:
+            count = normalize_archive(args.from_zip, args.out)
+        else:
+            email, password = os.environ.get("VEEPN_EMAIL"), os.environ.get("VEEPN_PASSWORD")
+            if not email or not password:
+                print("::error::VEEPN_EMAIL / VEEPN_PASSWORD must be set", file=sys.stderr)
+                return 2
+            with tempfile.TemporaryDirectory(prefix="veepn-") as work:
+                raw = download_archive(Path(work), email, password)
+                count = normalize_archive(raw, args.out)
+        print(f"[veepn] wrote {count} configs to {args.out}")
+        return 0
+    except Exception as error:
+        # Browser exceptions can contain form values. Do not dump page state or traces.
+        print(f"::error::VeePN refresh failed ({type(error).__name__}); "
+              "existing release retained.", file=sys.stderr)
+        if isinstance(error, (ValueError, zipfile.BadZipFile)) or (
+                isinstance(error, RuntimeError) and str(error).startswith("Timed out waiting for")):
+            print(str(error), file=sys.stderr)
         return 1
-
-    out = Path(args.out)
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(ovpns):
-            zf.write(f, arcname=f.name)  # flat, matching install.sh's expectation
-    print(f"[veepn] wrote {out} ({out.stat().st_size} bytes, {len(ovpns)} configs)")
-    return 0
 
 
 if __name__ == "__main__":

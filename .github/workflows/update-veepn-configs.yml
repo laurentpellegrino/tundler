@@ -2,7 +2,7 @@ name: Update VeePN configs
 
 # VeePN's dashboard + API sit behind a Cloudflare JS challenge, so the
 # config archive can't be fetched with curl (it 403s). This workflow
-# drives a real Chrome (headed, under xvfb) to clear the challenge, log
+# drives Chrome with Botasaurus (headed, under xvfb) to clear the challenge, log
 # in, and download "all configuration files", then republishes the
 # `veepn-configs` release that docker/providers/veepn/install.sh bakes.
 #
@@ -12,20 +12,18 @@ name: Update VeePN configs
 #                     (the ACCOUNT login, NOT the per-pod manual-config
 #                      credentials that live in OpenBao vpn/veepn/pod-<n>)
 #
-# Intentionally workflow_dispatch-ONLY for now: Cloudflare + SPA
-# automation is fragile and the login/download selectors in
-# scripts/update-veepn-configs.py are best-effort. Run it manually once;
-# once it succeeds reliably, uncomment the schedule below to go daily.
+# Botasaurus handles the dashboard's browser challenge.
+# WARP also avoids direct GitHub runner egress, as in the IPVanish updater.
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '40 5 * * *'   # 05:40 UTC, before docker-image.yml's 07:00 rebuild
+  schedule:
+    - cron: '40 5 * * *'   # 05:40 UTC, before docker-image.yml's 07:00 rebuild
 
 permissions:
   contents: write   # create/upload the veepn-configs release
 
 concurrency:
-  cancel-in-progress: true
+  cancel-in-progress: false
   group: update-veepn-configs
 
 jobs:
@@ -43,16 +41,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Playwright + Chrome + xvfb
+      - name: Install Botasaurus driver + xvfb
         run: |
           set -euo pipefail
-          pip install playwright
+          pip install -r scripts/requirements-veepn.txt
           sudo apt-get update && sudo apt-get install -y xvfb
-          # channel="chrome" → install real Google Chrome (best odds vs
-          # Cloudflare's managed challenge; headless chromium is blocked).
-          python -m playwright install --with-deps chrome
+          # Google Chrome is preinstalled on GitHub's Ubuntu runner image.
+          google-chrome --version
 
-      - name: Download configs via headless browser
+      - name: Test archive validation
+        run: python -m unittest discover -s scripts -p 'test_veepn_configs.py' -v
+
+      - name: Setup Cloudflare WARP
+        uses: ./.github/actions/setup-cloudflare-warp
+
+      - name: Download configs via Botasaurus + Chrome
         env:
           VEEPN_EMAIL: ${{ secrets.VEEPN_EMAIL }}
           VEEPN_PASSWORD: ${{ secrets.VEEPN_PASSWORD }}
@@ -71,10 +74,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release download "$RELEASE_TAG" --pattern veepn-configs.zip --dir /tmp/current 2>/dev/null; then
-            # zips aren't byte-stable; compare the sorted set of member names + sizes.
-            sig() { unzip -l "$1" | awk 'NF>=4 && $4 ~ /\.ovpn$/ {print $1, $4}' | sort | sha256sum; }
-            if [ "$(sig /tmp/veepn-configs.zip)" = "$(sig /tmp/current/veepn-configs.zip)" ]; then
-              echo "Configs unchanged (same file set); nothing to publish."
+            # Normalize legacy assets too; upstream ZIP timestamps/order may vary.
+            python scripts/update-veepn-configs.py \
+              --from-zip /tmp/current/veepn-configs.zip --out /tmp/current/normalized.zip
+            if [ "$(sha256sum /tmp/veepn-configs.zip | cut -d ' ' -f1)" = "$(sha256sum /tmp/current/normalized.zip | cut -d ' ' -f1)" ]; then
+              echo "Configs unchanged (content sha256 match); nothing to publish."
               echo "skip=true" >> "$GITHUB_OUTPUT"
             else
               echo "Configs changed."
@@ -95,6 +99,6 @@ jobs:
             || gh release create "$RELEASE_TAG" \
                 --repo "$GITHUB_REPOSITORY" \
                 --title "VeePN OpenVPN configs (account dashboard mirror)" \
-                --notes "All-locations OpenVPN config archive from VeePN's 'download all configs', fetched via headless browser (Cloudflare-gated). See update-veepn-configs.yml."
+                --notes "All-locations OpenVPN config archive from VeePN's 'download all configs', fetched via Botasaurus + Chrome. See update-veepn-configs.yml."
           gh release upload "$RELEASE_TAG" /tmp/veepn-configs.zip --clobber --repo "$GITHUB_REPOSITORY"
           echo "::notice::Refreshed ${RELEASE_TAG} veepn-configs.zip"
