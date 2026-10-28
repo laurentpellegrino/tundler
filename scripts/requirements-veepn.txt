@@ -1,0 +1,2 @@
+# Botasaurus's Chrome/CDP driver for dashboard automation.
+botasaurus-driver==4.0.101

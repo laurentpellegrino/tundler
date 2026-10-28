@@ -9,7 +9,7 @@ set -e
 # CA + tls-auth + server IP — 135 distinct CAs), so we bake the actual
 # upstream config files (not a template). They ship as a zip baked at
 # build time from the `veepn-configs` GitHub release, refreshed by
-# .github/workflows/update-veepn-configs.yml (a headless-browser login
+# .github/workflows/update-veepn-configs.yml (a Botasaurus + Chrome login
 # to VeePN's Cloudflare-gated dashboard that re-downloads "all configs").
 # The Go provider picks one location's .ovpn per Connect() and rewrites
 # only its bare `auth-user-pass` directive.
