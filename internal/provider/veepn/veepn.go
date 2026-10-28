@@ -63,8 +63,8 @@ var (
 	filenameRe = regexp.MustCompile(`^(.+)\.(udp|tcp)\.veepn\.com\.ovpn$`)
 	// Directives dropped from the vendor config before ours are
 	// appended: credentials come over the management socket, the
-	// interface is pinned, verbosity and lifecycle are ours.
-	droppedDirectiveRe = regexp.MustCompile(`(?m)^[ \t]*(auth-user-pass|dev|dev-type|management[a-z-]*|verb|daemon|log|log-append|auth-retry|auth-nocache|connect-retry|connect-retry-max|connect-timeout)\b.*\n?`)
+	// interface is pinned, verbosity, lifecycle and packet size are ours.
+	droppedDirectiveRe = regexp.MustCompile(`(?m)^[ \t]*(auth-user-pass|dev|dev-type|management[a-z-]*|verb|daemon|log|log-append|auth-retry|auth-nocache|connect-retry|connect-retry-max|connect-timeout|tun-mtu-extra|tun-mtu|mssfix)\b.*\n?`)
 	// Inline blocks (<ca>, <tls-auth>) are kept verbatim.
 	inlineBlockRe = regexp.MustCompile(`(?s)<([a-z-]+)>.*?</[a-z-]+>`)
 	remoteRe      = regexp.MustCompile(`(?m)^[ \t]*remote[ \t]+\S+`)
@@ -223,8 +223,13 @@ func openVPNConfig(vendor []byte, socket string) ([]byte, error) {
 		text = strings.Replace(text, fmt.Sprintf("\x00BLOCK%d\x00", i), b, 1)
 	}
 	text = strings.TrimRight(text, "\n") + "\n"
+	// --tun-mtu / --mssfix clamp packet size below the k8s pod MTU
+	// (1370 on Talos/Cilium), as the other OpenVPN providers do. The
+	// vendor's tun-mtu 1500 / mssfix 1450 let the login, the management
+	// socket and small probes through, so the tunnel looked Ready, while
+	// every full-size page fetch stalled until the client's read timeout.
 	ours := "\n# --- tundler ---\ndev " + tunnelInterface + "\ndev-type tun\n" + ovpn.Directives(socket) +
-		"connect-retry-max 1\nconnect-timeout 15\nverb 0\n"
+		"connect-retry-max 1\nconnect-timeout 15\ntun-mtu 1320\nmssfix 1280\nverb 0\n"
 	return []byte(text + ours), nil
 }
 
