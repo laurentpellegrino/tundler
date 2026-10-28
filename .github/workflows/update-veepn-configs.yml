@@ -6,11 +6,16 @@ name: Update VeePN configs
 # in, and download "all configuration files", then republishes the
 # `veepn-configs` release that docker/providers/veepn/install.sh bakes.
 #
-# Prerequisites (repo Settings → Secrets and variables → Actions):
-#   VEEPN_EMAIL     — VeePN account login email
-#   VEEPN_PASSWORD  — VeePN account login password
-#                     (the ACCOUNT login, NOT the per-pod manual-config
-#                      credentials that live in OpenBao vpn/veepn/pod-<n>)
+# Auth: the VeePN ACCOUNT login (email + password — NOT the per-pod
+# manual-config credentials at vpn/veepn/pod-<n>) lives in OpenBao at
+# kv/vpn/veepn (`username` / `password`), in the fleet operator's
+# namespace. vault-action exchanges this workflow's GitHub OIDC token
+# for a short-lived OpenBao token via the `tundler` role, bound to this
+# repo's main branch so forks and PR runs can't obtain it; the role's
+# policy grants read on that single path only. The namespace name is
+# supplied by the repo secret OPENBAO_VPN_NAMESPACE rather than spelled
+# out here. Role + policy are managed by
+# elaunira-openbao/scripts/configure-github-jwt.sh (SCOPED_ROLES).
 #
 # Botasaurus handles the dashboard's browser challenge.
 # WARP also avoids direct GitHub runner egress, as in the IPVanish updater.
@@ -21,6 +26,7 @@ on:
 
 permissions:
   contents: write   # create/upload the veepn-configs release
+  id-token: write   # for vault-action JWT auth
 
 concurrency:
   cancel-in-progress: false
@@ -55,14 +61,25 @@ jobs:
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
 
+      - name: Fetch VeePN account login from OpenBao
+        uses: hashicorp/vault-action@v4
+        with:
+          url: https://bao.elaunira.com
+          method: jwt
+          path: github-actions
+          role: tundler
+          namespace: ${{ secrets.OPENBAO_VPN_NAMESPACE }}
+          jwtGithubAudience: https://github.com/laurentpellegrino
+          # Exported as env vars for the step below; vault-action masks them.
+          secrets: |
+            kv/data/vpn/veepn username | VEEPN_EMAIL ;
+            kv/data/vpn/veepn password | VEEPN_PASSWORD
+
       - name: Download configs via Botasaurus + Chrome
-        env:
-          VEEPN_EMAIL: ${{ secrets.VEEPN_EMAIL }}
-          VEEPN_PASSWORD: ${{ secrets.VEEPN_PASSWORD }}
         run: |
           set -euo pipefail
           if [ -z "${VEEPN_EMAIL:-}" ] || [ -z "${VEEPN_PASSWORD:-}" ]; then
-            echo "::error::VEEPN_EMAIL / VEEPN_PASSWORD repo secrets are not set."
+            echo "::error::VeePN account login not received from OpenBao (kv/vpn/veepn username/password)."
             exit 1
           fi
           xvfb-run -a python scripts/update-veepn-configs.py --out /tmp/veepn-configs.zip

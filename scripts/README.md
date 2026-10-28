@@ -8,9 +8,12 @@ of assuming a `/en/downloads/` route. The current login email field is a text
 input with `autocomplete="email"`, not an `input[type="email"]`.
 See [VeePN's Linux setup instructions](https://help.veepn.com/hc/en-us/articles/19525834017810-VeePN-Linux-Setup).
 
-Set the GitHub Actions secrets `VEEPN_EMAIL` and `VEEPN_PASSWORD` to the account
-login. These differ from per-device OpenVPN credentials. The updater only
-downloads configurations; it does not generate or rotate device credentials.
+The workflow reads the account login from OpenBao (`kv/vpn/veepn`, keys
+`username` / `password`) through `hashicorp/vault-action` and exposes it to the
+script as `VEEPN_EMAIL` / `VEEPN_PASSWORD`; no GitHub Actions secret holds the
+credentials. The account login differs from per-device OpenVPN credentials. The
+updater only downloads configurations; it does not generate or rotate device
+credentials.
 It runs daily at 05:40 UTC and can also be dispatched manually. After merging,
 run **Update VeePN configs** once to verify authenticated access from the runner.
 An OTP requirement or changed dashboard control causes a failure before release
