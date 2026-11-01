@@ -231,6 +231,7 @@ curl http://localhost:4242/status
 | `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
 | `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
 | `TUNDLER_AUTH_FAILURE_BACKOFF_SECONDS` | hold on every connect after the provider rejects the credentials (`Status.AuthFailed`, e.g. OpenVPN `AUTH_FAILED`); doubles per consecutive rejection up to 24 h, cleared by the next successful connect (default 3600) |
+| `TUNDLER_THROTTLE_BACKOFF_SECONDS` | hold on every connect after the provider refuses one for too many connection attempts (`Status.Throttled`, NordVPN's "Too many connection attempts"); `/rotate` answers 200 and keeps the current tunnel meanwhile; doubles per consecutive refusal up to 30 min, cleared by the next successful connect (default 300) |
 | `TUNDLER_FLEET_LAYOUT` | fleet topology file for the soft region-spread preference (default `/etc/tundler/fleet/vpn-providers.yaml`, re-read at every pick) |
 | `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | static fallback for the region-spread preference when no topology file is mounted |
 | `TUNDLER_FLEET_REPLICAS` | with the static fallback: this provider's pod count, the rotation stride of the region walk (default 1) |

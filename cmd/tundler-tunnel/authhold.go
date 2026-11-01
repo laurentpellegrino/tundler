@@ -38,6 +38,7 @@ var errAuthFailed = errors.New("provider rejected the account credentials")
 type authHold struct {
 	mu      sync.Mutex
 	base    time.Duration
+	max     time.Duration
 	strikes int       // consecutive auth failures
 	until   time.Time // zero when no hold is active
 	now     func() time.Time
@@ -50,7 +51,7 @@ func newAuthHold(base time.Duration) *authHold {
 	if base <= 0 {
 		base = time.Duration(defaultAuthFailureBackoff) * time.Second
 	}
-	return &authHold{base: base, now: time.Now}
+	return &authHold{base: base, max: maxAuthFailureBackoff, now: time.Now}
 }
 
 func newAuthHoldFromEnv() *authHold {
@@ -62,11 +63,11 @@ func (h *authHold) strike() time.Duration {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	wait := h.base
-	for i := 0; i < h.strikes && wait < maxAuthFailureBackoff; i++ {
+	for i := 0; i < h.strikes && wait < h.max; i++ {
 		wait *= 2
 	}
-	if wait > maxAuthFailureBackoff {
-		wait = maxAuthFailureBackoff
+	if wait > h.max {
+		wait = h.max
 	}
 	h.strikes++
 	h.until = h.now().Add(wait)

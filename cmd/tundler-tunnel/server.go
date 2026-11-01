@@ -206,6 +206,18 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		}
 		switch snap.State {
 		case StateReady:
+			if r := throttle.remaining(); r > 0 {
+				// The provider refused the last connect for too many
+				// attempts: keep the current exit rather than tear it
+				// down for a connect that would be refused again.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"state":   string(StateReady),
+					"message": fmt.Sprintf("rotation held (connect-throttle hold for another %s)", r.Round(time.Second)),
+				})
+				return
+			}
 			if since, recent := timeSinceLastRotation(snap); recent {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
