@@ -131,6 +131,10 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 			noteAuthFailure(state, providerName, location)
 			return location, fmt.Errorf("%w (provider=%s location=%s)", errAuthFailed, providerName, location)
 		}
+		if status.Throttled {
+			noteThrottled(providerName, location)
+			return location, fmt.Errorf("%w (provider=%s location=%s)", errThrottled, providerName, location)
+		}
 		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
@@ -149,6 +153,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	// to the same server legitimately repeats it, so no pool verdict.
 	exits.remember(exitIP)
 	hold.clear()
+	throttle.clear()
 	state.SetAuthHold(time.Time{})
 	state.RecordTunnelUp(location, exitIP)
 	state.RecordCountry(preferredCountry, currentCountry(location))
@@ -331,9 +336,10 @@ func connectInitialWithRetryObserved(ctx context.Context, prov provider.VPNProvi
 			recentlyFailed = append(recentlyFailed, location)
 		}
 		wait := backoff(attempt)
-		if r := hold.remaining(); r > 0 {
-			// Credential rejection: the hold replaces the short backoff
-			// so a suspended account sees no login until it ends.
+		if r := connectHoldRemaining(); r > 0 {
+			// Credential rejection or throttle refusal: the hold
+			// replaces the short backoff so the account sees no
+			// attempt until it ends.
 			wait = r
 		}
 		log.Printf("tundler-tunnel: initial connect attempt %d failed: %v; retrying in %s (staying up, no re-login)",
@@ -437,6 +443,11 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			noteAuthFailure(state, providerName, location)
 			return fmt.Errorf("attempt %d/%d: %w (provider=%s)", attempt, maxAttempts, errAuthFailed, providerName)
 		}
+		if status.Throttled {
+			// Account-wide too, and a retry extends the refusal.
+			noteThrottled(providerName, location)
+			return fmt.Errorf("attempt %d/%d: %w (provider=%s)", attempt, maxAttempts, errThrottled, providerName)
+		}
 		if status.Connected {
 			observed, err := verifyExitIPDiffers(ctx, baselineEgressIP)
 			if err != nil {
@@ -467,6 +478,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				continue
 			}
 			hold.clear()
+			throttle.clear()
 			state.SetAuthHold(time.Time{})
 			state.RecordTunnelUp(location, exitIP)
 			state.RecordCountry(preferredCountry, currentCountry(location))

@@ -21,6 +21,11 @@ type Status struct {
 	// every retry is one more login against a provider that may be
 	// rate-limiting logins. The caller holds all connects for a while.
 	AuthFailed bool `json:"auth_failed,omitempty"`
+	// Throttled marks a failed Connect that the provider refused for too
+	// many recent connection attempts on the account (NordVPN's "Too many
+	// connection attempts"). Retrying soon extends the refusal, so the
+	// caller holds all connects for a few minutes.
+	Throttled bool `json:"throttled,omitempty"`
 }
 
 // VPNProvider is the contract every CLI wrapper (ExpressVPN, NordVPN, …)

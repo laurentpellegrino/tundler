@@ -2,8 +2,19 @@ package nordvpn
 
 import (
 	"context"
+	"errors"
+	"os"
 	"testing"
 )
+
+// TestMain keeps every test away from a real nordvpn client: on a machine
+// with one logged in, Connect would open (or be refused) a real tunnel.
+func TestMain(m *testing.M) {
+	runCmd = func(context.Context, string, ...string) (string, error) {
+		return "", errors.New("nordvpn CLI disabled in tests")
+	}
+	os.Exit(m.Run())
+}
 
 func resetActiveLocation(t *testing.T) {
 	t.Helper()
@@ -14,8 +25,8 @@ func resetActiveLocation(t *testing.T) {
 
 // TestConnectStoresLocation pins the contract that Connect stores
 // whatever was passed in (an entry from Locations()). RunCmd shells
-// out to `nordvpn`; in tests that binary is absent, exec returns an
-// error that quiet() swallows, and the location-mutation step that
+// out to `nordvpn`; in tests runCmd is stubbed to return an error
+// that quiet() swallows, and the location-mutation step that
 // follows runs unconditionally. That's the behaviour we want: the
 // invariant is "Connect was asked to connect to X, so X is the active
 // location", not "we read X back from the CLI".
@@ -107,5 +118,17 @@ func TestActiveLocationEmptyWhenDisconnected(t *testing.T) {
 
 	if got := (NordVPN{}).ActiveLocation(context.Background()); got != "" {
 		t.Fatalf("ActiveLocation while disconnected = %q, want empty", got)
+	}
+}
+
+func TestThrottledOutput(t *testing.T) {
+	refusal := "Connecting to Portugal #148 (pt148.nordvpn.com)\nToo many connection attempts. Wait a while before trying again. Retrying now can make the waiting period longer."
+	if !throttledOutput(refusal) {
+		t.Fatal("the daemon's refusal must read as throttled")
+	}
+	for _, out := range []string{"", "You are connected to Portugal #148 (pt148.nordvpn.com)!", "Whoops! Connection failed. Please try again."} {
+		if throttledOutput(out) {
+			t.Fatalf("%q must not read as throttled", out)
+		}
 	}
 }

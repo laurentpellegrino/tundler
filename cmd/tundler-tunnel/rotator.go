@@ -101,6 +101,12 @@ func rotateIfReadyWithDeps(ctx context.Context, prov provider.VPNProvider, state
 		log.Printf("tundler-tunnel: rotator skipping; state=%s (not Ready/Failed)", current)
 		return
 	}
+	if r := throttle.remaining(); r > 0 {
+		// Disconnecting now would leave the pod without a tunnel until
+		// the hold ends; the current exit keeps serving meanwhile.
+		log.Printf("tundler-tunnel: rotator skipping; connect-throttle hold for another %s", r.Round(time.Second))
+		return
+	}
 
 	started := time.Now()
 	previousIP := state.SnapshotCurrentExitIP()

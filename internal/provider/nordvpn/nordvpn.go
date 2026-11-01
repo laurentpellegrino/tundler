@@ -34,7 +34,11 @@ func init() {
 	}))
 }
 
-func quiet(ctx context.Context, args ...string) { _, _ = shared.RunCmd(ctx, bin, args...) }
+// runCmd runs the daemon's CLI; tests replace it so they never reach a
+// real nordvpn client installed on the machine running them.
+var runCmd = shared.RunCmd
+
+func quiet(ctx context.Context, args ...string) { _, _ = runCmd(ctx, bin, args...) }
 
 func (n NordVPN) ActiveLocation(ctx context.Context) string {
 	if !n.Connected(ctx) {
@@ -46,7 +50,7 @@ func (n NordVPN) ActiveLocation(ctx context.Context) string {
 }
 
 func (n NordVPN) activeHostname(ctx context.Context) string {
-	out, _ := shared.RunCmd(ctx, bin, "status")
+	out, _ := runCmd(ctx, bin, "status")
 	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "Hostname:") {
@@ -63,15 +67,27 @@ func (n NordVPN) Connect(ctx context.Context, location string) provider.Status {
 	if location != "" {
 		args = append(args, location)
 	}
-	quiet(ctx, args...)
+	out, _ := runCmd(ctx, bin, args...)
+	if throttledOutput(out) {
+		return provider.Status{Connected: false, Throttled: true}
+	}
 	activeMu.Lock()
 	activeLocation = location
 	activeMu.Unlock()
 	return n.Status(ctx)
 }
 
+// throttledOutput reports the daemon's refusal of a connect for too many
+// recent attempts on the account ("Too many connection attempts. Wait a
+// while before trying again. Retrying now can make the waiting period
+// longer."), seen when several pods of one account connect within a few
+// minutes.
+func throttledOutput(out string) bool {
+	return strings.Contains(strings.ToLower(out), "too many connection attempts")
+}
+
 func (n NordVPN) Connected(ctx context.Context) bool {
-	out, _ := shared.RunCmd(ctx, bin, "status")
+	out, _ := runCmd(ctx, bin, "status")
 	return strings.Contains(out, "Status: Connected")
 }
 
@@ -79,12 +95,12 @@ func (n NordVPN) Disconnect(ctx context.Context) error {
 	activeMu.Lock()
 	activeLocation = ""
 	activeMu.Unlock()
-	_, err := shared.RunCmd(ctx, bin, "disconnect")
+	_, err := runCmd(ctx, bin, "disconnect")
 	return err
 }
 
 func (n NordVPN) Locations(ctx context.Context) []string {
-	out, _ := shared.RunCmd(ctx, bin, "countries")
+	out, _ := runCmd(ctx, bin, "countries")
 	return strings.Fields(out)
 }
 
@@ -94,7 +110,7 @@ func (n NordVPN) LoggedIn(ctx context.Context) bool {
 	// trigger the interactive OAuth flow that `nordvpn login` (no
 	// args) starts — which would block waiting for browser auth
 	// and balloon RunCmd's stdout buffer until OOM.
-	_, err := shared.RunCmd(ctx, bin, "account")
+	_, err := runCmd(ctx, bin, "account")
 	return err == nil
 }
 
@@ -123,7 +139,7 @@ func (n NordVPN) Login(ctx context.Context) error {
 	// the daemon eagerly downloads the meshnet/libtelio/nordwhisper
 	// remote configs which slows boot and burns memory.
 	configureDaemon(ctx)
-	if _, err := shared.RunCmd(ctx, bin, "login", "--token", token); err != nil {
+	if _, err := runCmd(ctx, bin, "login", "--token", token); err != nil {
 		return fmt.Errorf("nordvpn login failed: %w", err)
 	}
 	return nil
@@ -138,7 +154,7 @@ func configureDaemon(ctx context.Context) {
 	// IPC. Piping "n" into the interactive `nordvpn login` (no args)
 	// dismisses the prompt without progressing into the OAuth flow.
 	cmd := []string{"sh", "-c", `printf "n\n" | nordvpn login 2>/dev/null || true`}
-	_, _ = shared.RunCmd(ctx, cmd[0], cmd[1:]...)
+	_, _ = runCmd(ctx, cmd[0], cmd[1:]...)
 
 	// Baseline settings. lan-discovery=enable is intentional (lets
 	// the pod talk to its sibling slot-controller via cluster DNS);
@@ -175,9 +191,9 @@ func (n NordVPN) Logout(ctx context.Context) error {
 	// before the daemon is contacted. Fall back to the 6.0 spelling on
 	// that specific rejection only — never on other failures, where a
 	// plain `logout` against a 5.x CLI would revoke the fleet's token.
-	out, err := shared.RunCmd(ctx, bin, "logout", "--persist-token")
+	out, err := runCmd(ctx, bin, "logout", "--persist-token")
 	if err != nil && strings.Contains(out, "flag provided but not defined") {
-		_, err = shared.RunCmd(ctx, bin, "logout")
+		_, err = runCmd(ctx, bin, "logout")
 	}
 	return err
 }
@@ -186,7 +202,7 @@ func (n NordVPN) Status(ctx context.Context) provider.Status {
 	if !n.Connected(ctx) {
 		return provider.Status{Connected: false}
 	}
-	out, _ := shared.RunCmd(ctx, bin, "status") // needed for the public IP
+	out, _ := runCmd(ctx, bin, "status") // needed for the public IP
 	return provider.Status{
 		Connected: true,
 		IP:        shared.FirstIPv4(out),
@@ -197,7 +213,7 @@ func (n NordVPN) Status(ctx context.Context) provider.Status {
 }
 
 func (n NordVPN) Version(ctx context.Context) (string, error) {
-	out, err := shared.RunCmd(ctx, bin, "--version")
+	out, err := runCmd(ctx, bin, "--version")
 	if err != nil {
 		return "", err
 	}

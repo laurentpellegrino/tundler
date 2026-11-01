@@ -283,6 +283,8 @@ func main() {
 		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory, exits.refusedTTL, envRefusedMemory)
 	hold = newAuthHoldFromEnv()
 	log.Printf("tundler-tunnel: auth-failure hold %s base (%s), doubling to %s", hold.base, envAuthFailureBackoff, maxAuthFailureBackoff)
+	throttle = newThrottleHoldFromEnv()
+	log.Printf("tundler-tunnel: connect-throttle hold %s base (%s), doubling to %s", throttle.base, envThrottleBackoff, maxThrottleBackoff)
 	pref = newLocationPreference(providerName)
 	if pref != nil {
 		pref.cooldown = blocked
@@ -487,6 +489,14 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 				// ends, whatever the tunnel looks like.
 				if time.Since(holdLoggedAt) > 10*time.Minute {
 					log.Printf("tundler-tunnel: watchdog idle — auth-failure hold for another %s", r.Round(time.Second))
+					holdLoggedAt = time.Now()
+				}
+				continue
+			}
+			if r := throttle.remaining(); r > 0 {
+				// Throttle refusal: a retry now extends it.
+				if time.Since(holdLoggedAt) > 10*time.Minute {
+					log.Printf("tundler-tunnel: watchdog idle — connect-throttle hold for another %s", r.Round(time.Second))
 					holdLoggedAt = time.Now()
 				}
 				continue
