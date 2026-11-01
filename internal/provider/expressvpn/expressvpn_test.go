@@ -3,11 +3,42 @@ package expressvpn
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+// TestMain shadows expressvpnctl and systemctl for the whole package. Each
+// test still puts its own stub first on PATH; a test that forgets would
+// otherwise reach a real expressvpnctl (or restart a real daemon) on the
+// machine running the tests. The guards fail loudly instead.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "expressvpn-test-guard")
+	if err != nil {
+		panic(err)
+	}
+	for _, name := range []string{"expressvpnctl", "systemctl"} {
+		guard := "#!/bin/sh\necho \"" + name + " is not available in tests: stub it\" >&2\nexit 127\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(guard), 0o755); err != nil {
+			panic(err)
+		}
+	}
+	os.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+func TestGuardKeepsTheRealCLIOutOfReach(t *testing.T) {
+	for _, name := range []string{"expressvpnctl", "systemctl"} {
+		out, err := exec.Command(name, "status").CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "not available in tests") {
+			t.Fatalf("%s resolved past the guard: %q, %v", name, out, err)
+		}
+	}
+}
 
 // Locations() and ActiveLocation() must surface CLI failures as "no data"
 // rather than parsing the error stdout as if it were the real result.
