@@ -138,8 +138,9 @@ func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIden
 			RefusedExitPrefixes  int    `json:"refused_exit_prefixes"`
 			CooledLocations      int    `json:"cooled_locations"`
 			CooledCountries      int    `json:"cooled_countries"`
+			HeldLocations        int    `json:"held_locations"`
 		}{snap, tunnelID, nodeIP, imp.Profile, imp.UserAgent,
-			exits.size(), exits.refusedSize(), cooledLocations, cooledCountries}
+			exits.size(), exits.refusedSize(), cooledLocations, cooledCountries, failing.heldCount()}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}

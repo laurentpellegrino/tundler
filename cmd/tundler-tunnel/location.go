@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"log"
 	"math/rand/v2"
 	"strings"
 
@@ -74,6 +75,22 @@ func pickLocation(locations []string, excluded []string) (string, error) {
 // miss. Returns the chosen location plus the preferred ISO country
 // ("" when the fallback won) for /status.
 func pickPreferredLocation(pref *locationPreference, locations, excluded []string) (string, string, error) {
+	// Failing locations (failinglocations.go) are skipped like excluded
+	// ones; when that leaves nothing the holds are ignored rather than
+	// failing the connect.
+	if held := failing.held(); len(held) > 0 {
+		withHeld := append(append([]string{}, excluded...), held...)
+		if loc, country, err := pickUnheldLocation(pref, locations, withHeld); err == nil {
+			return loc, country, nil
+		}
+		log.Printf("tundler-tunnel: every allowed location is excluded or held (%d held); ignoring the holds for this pick", len(held))
+	}
+	return pickUnheldLocation(pref, locations, excluded)
+}
+
+// pickUnheldLocation is pickPreferredLocation without the failing-location
+// holds.
+func pickUnheldLocation(pref *locationPreference, locations, excluded []string) (string, string, error) {
 	if pref != nil {
 		if loc, country, ok := pref.pick(locations, excluded); ok {
 			return loc, country, nil

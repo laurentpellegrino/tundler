@@ -285,6 +285,9 @@ func main() {
 	log.Printf("tundler-tunnel: auth-failure hold %s base (%s), doubling to %s", hold.base, envAuthFailureBackoff, maxAuthFailureBackoff)
 	throttle = newThrottleHoldFromEnv()
 	log.Printf("tundler-tunnel: connect-throttle hold %s base (%s), doubling to %s", throttle.base, envThrottleBackoff, maxThrottleBackoff)
+	failing = newFailingLocationsFromEnv()
+	log.Printf("tundler-tunnel: failing-location hold %s base (%s), doubling to %s",
+		failing.base, envFailingLocationHold, maxFailingLocationHold)
 	pref = newLocationPreference(providerName)
 	if pref != nil {
 		pref.cooldown = blocked

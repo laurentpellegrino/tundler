@@ -135,6 +135,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 			noteThrottled(providerName, location)
 			return location, fmt.Errorf("%w (provider=%s location=%s)", errThrottled, providerName, location)
 		}
+		noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
 		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
@@ -146,8 +147,10 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 		// a failure path, and the subsequent retry / fail-and-exit
 		// will fire either way.
 		_ = prov.Disconnect(ctx)
+		noteFailingLocation(providerName, location, "connected without a working exit again", failing.connectFailed(location))
 		return location, fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
 	}
+	failing.succeeded(location)
 	exitIP := exitIPOrProbe(status.IP, observed)
 	// Boot and watchdog reconnects only record the exit: a reconnect
 	// to the same server legitimately repeats it, so no pool verdict.
@@ -457,6 +460,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				// jumping straight to fail-and-exit.
 				_ = prov.Disconnect(ctx)
 				recentlyFailed = append(recentlyFailed, location)
+				noteFailingLocation(providerName, location, "connected without a working exit again", failing.connectFailed(location))
 				log.Printf("tundler-tunnel: rotation attempt %d/%d FAILED contract (location=%s): %v",
 					attempt, maxAttempts, location, err)
 				if attempt < maxAttempts {
@@ -464,6 +468,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				}
 				continue
 			}
+			failing.succeeded(location)
 			exitIP := exitIPOrProbe(status.IP, observed)
 			if noteRotationExit(location, preferredCountry, exitIP) && attempt < maxAttempts {
 				// A burnt prefix would sit at the crawler's 429 floor
@@ -488,6 +493,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			return nil
 		}
 		recentlyFailed = append(recentlyFailed, location)
+		noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
 		log.Printf("tundler-tunnel: rotation attempt %d/%d failed (location=%s); will try another",
 			attempt, maxAttempts, location)
 		if attempt < maxAttempts {
