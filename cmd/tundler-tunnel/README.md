@@ -218,6 +218,7 @@ response-header IP without locking.
 | `TUNDLER_COUNTRY_DWELL`           | 4       | rotations spent in one country before the walk advances (`0` = every rotation) |
 | `TUNDLER_EXIT_MEMORY`             | 1h      | exit prefixes (/24, IPv6 /48) remembered; a rotation landing in one cools its location and country and retries elsewhere (`0` disables) |
 | `TUNDLER_BLOCKED_COOLDOWN`        | 1h      | how long a spent location and country stay skipped (`0` disables) |
+| `TUNDLER_FAILING_LOCATION_HOLD`   | 24h     | how long a location that rejects the credentials, or fails to connect again after the pod connected elsewhere, is skipped; doubles per repeat up to 7 days, reset by a success there (`0` disables) |
 
 ## Accounts & region preference
 

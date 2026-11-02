@@ -110,6 +110,7 @@ func noteAuthFailure(state *StateTracker, providerName, location string) time.Du
 	state.SetAuthHold(hold.deadline())
 	log.Printf("tundler-tunnel: provider=%s rejected the account credentials (location=%s); holding every connect for %s (strike %d) — no retry elsewhere, no re-login",
 		providerName, location, wait.Round(time.Second), hold.strikesCount())
+	noteFailingLocation(providerName, location, "rejected the credentials", failing.authFailed(location))
 	return wait
 }
 
