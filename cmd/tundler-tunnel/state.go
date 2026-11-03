@@ -40,7 +40,10 @@ type StateTracker struct {
 	currentLocation       string
 	currentExitIP         string
 	tunnelConnectedAt     time.Time
-	rotationCountTotal    int
+	// tunnelUps counts RecordTunnelUp calls, so a late exit-IP lookup
+	// (exitbackfill.go) only applies to the tunnel it was started for.
+	tunnelUps          uint64
+	rotationCountTotal int
 	// connectionsTotal counts every provider connect or login attempt this
 	// process made: boot login, every rotation attempt (failed ones too),
 	// watchdog reconnects. The VPN provider meters these per account; the
@@ -191,12 +194,41 @@ func (s *StateTracker) RecordTunnelUp(location, exitIP string) {
 	s.currentLocation = location
 	s.currentExitIP = exitIP
 	s.tunnelConnectedAt = time.Now().UTC()
+	s.tunnelUps++
 	listener := s.tunnelUpListener
 	s.mu.Unlock()
 
 	if listener != nil {
 		listener(exitIP)
 	}
+}
+
+// TunnelUpCount returns how many tunnels this process has brought up;
+// it identifies the current one.
+func (s *StateTracker) TunnelUpCount() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tunnelUps
+}
+
+// BackfillExitIP records ip as the exit of tunnel number gen when that
+// tunnel is still the current one and its exit is still unknown, then
+// fires the tunnel-up listener with it like RecordTunnelUp does (proxy
+// header, tunnel_up event). Reports whether ip was recorded.
+func (s *StateTracker) BackfillExitIP(gen uint64, ip string) bool {
+	s.mu.Lock()
+	if s.tunnelUps != gen || s.currentExitIP != "" || ip == "" {
+		s.mu.Unlock()
+		return false
+	}
+	s.currentExitIP = ip
+	listener := s.tunnelUpListener
+	s.mu.Unlock()
+
+	if listener != nil {
+		listener(ip)
+	}
+	return true
 }
 
 // SetTunnelUpListener registers a callback fired on every RecordTunnelUp
