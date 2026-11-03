@@ -192,6 +192,12 @@ A per-process semaphore caps concurrent tunnels at 2000.
 `SetExitIP(string)` is an `atomic.Value` swap so rotations update the
 response-header IP without locking.
 
+When neither the provider CLI nor the post-connect egress probe yields
+the exit IP (the probe timed out and the contract soft-passed), a
+background lookup keeps probing (15 s, 30 s, 60 s, then every 2 min)
+until it gets one or the tunnel is replaced. The late exit then lands
+in `/status`, the `x-tundler-exit-ip` header and a `tunnel_up` event.
+
 ## Environment knobs
 
 | variable                          | default | purpose                                                    |

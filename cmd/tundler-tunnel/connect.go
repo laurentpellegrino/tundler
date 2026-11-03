@@ -159,6 +159,9 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	throttle.clear()
 	state.SetAuthHold(time.Time{})
 	state.RecordTunnelUp(location, exitIP)
+	if exitIP == "" {
+		startExitIPBackfill(ctx, state, baselineEgressIP)
+	}
 	state.RecordCountry(preferredCountry, currentCountry(location))
 	state.Set(StateReady)
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
@@ -486,6 +489,9 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			throttle.clear()
 			state.SetAuthHold(time.Time{})
 			state.RecordTunnelUp(location, exitIP)
+			if exitIP == "" {
+				startExitIPBackfill(ctx, state, baselineEgressIP)
+			}
 			state.RecordCountry(preferredCountry, currentCountry(location))
 			state.Set(StateReady)
 			log.Printf("tundler-tunnel: rotation attempt %d/%d succeeded location=%s exit_ip=%s",
