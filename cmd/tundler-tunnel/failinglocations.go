@@ -27,6 +27,14 @@ package main
 // there forgets it. When every location on offer is held the holds are
 // ignored rather than leaving the pod without a location.
 //
+// Below the hold, a location that failed since the pod's last successful
+// connect is steered around by the next pick (unsettled), so a watchdog
+// reconnect or a boot retry tries somewhere else instead of the same
+// server again: the region walk only moves on rotations, and on
+// 2026-11-04 a fastvpn pod reconnected to the same refusing city five
+// times. When every allowed location failed since the last success (an
+// outage) the steer is dropped and they are all tried again.
+//
 // The memory is per pod and in process: siblings learn on their own and
 // a restart forgets it, which costs at most one more failure per pod.
 
@@ -135,6 +143,24 @@ func (f *failingLocations) held() []string {
 	var out []string
 	for loc, e := range f.entries {
 		if e.until.After(now) {
+			out = append(out, loc)
+		}
+	}
+	return out
+}
+
+// unsettled lists the locations that failed since the pod's last
+// successful connect and are not held: the next pick avoids them.
+func (f *failingLocations) unsettled() []string {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	var out []string
+	for loc, e := range f.entries {
+		if !e.lastFailure.IsZero() && !f.lastSuccess.After(e.lastFailure) && !e.until.After(now) {
 			out = append(out, loc)
 		}
 	}
