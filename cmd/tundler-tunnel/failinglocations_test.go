@@ -187,3 +187,51 @@ func TestRotationHoldsALocationThatFailsAgainAfterASuccess(t *testing.T) {
 		t.Fatalf("held = %v, want [be]", failing.held())
 	}
 }
+
+func TestReconnectAvoidsALocationThatFailedSinceTheLastSuccess(t *testing.T) {
+	c := withFailing(t)
+	fp := &fakeProvider{locations: []string{"ec", "pl"}, connectOK: true, connectIP: "198.51.100.7",
+		failLocations: map[string]bool{"ec": true}}
+	st := NewStateTracker("fake")
+	if _, err := connectTunnelAt(context.Background(), fp, st, "fake", []string{"pl"}, ""); err == nil {
+		t.Fatal("ec must fail")
+	}
+	if len(failing.held()) != 0 {
+		t.Fatalf("one failure holds nothing, held = %v", failing.held())
+	}
+	c.advance(time.Minute)
+	// The watchdog reconnects with only the static exclusions: it must
+	// not go back to ec.
+	for i := 0; i < 50; i++ {
+		if loc, _, err := pickPreferredLocation(nil, fp.locations, nil); err != nil || loc != "pl" {
+			t.Fatalf("pick = %q, %v; want pl", loc, err)
+		}
+	}
+	if loc, err := connectTunnelAt(context.Background(), fp, st, "fake", nil, ""); err != nil || loc != "pl" {
+		t.Fatalf("reconnect = %q, %v; want pl", loc, err)
+	}
+	// Once the pod connected elsewhere ec is offered again (and held if
+	// it fails once more).
+	seen := false
+	for i := 0; i < 100 && !seen; i++ {
+		loc, _, _ := pickPreferredLocation(nil, fp.locations, nil)
+		seen = loc == "ec"
+	}
+	if !seen {
+		t.Fatal("ec must be offered again after a success elsewhere")
+	}
+}
+
+func TestEveryLocationFailedSinceTheLastSuccessIsTriedAgain(t *testing.T) {
+	withFailing(t)
+	failing.connectFailed("ec")
+	failing.connectFailed("pl")
+	got := slices.Clone(failing.unsettled())
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"ec", "pl"}) {
+		t.Fatalf("unsettled = %v", got)
+	}
+	if loc, _, err := pickPreferredLocation(nil, []string{"ec", "pl"}, nil); err != nil || loc == "" {
+		t.Fatalf("an outage must not leave the pod without a pick: %q, %v", loc, err)
+	}
+}

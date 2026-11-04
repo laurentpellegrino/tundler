@@ -76,10 +76,20 @@ func pickLocation(locations []string, excluded []string) (string, error) {
 // ("" when the fallback won) for /status.
 func pickPreferredLocation(pref *locationPreference, locations, excluded []string) (string, string, error) {
 	// Failing locations (failinglocations.go) are skipped like excluded
-	// ones; when that leaves nothing the holds are ignored rather than
-	// failing the connect.
-	if held := failing.held(); len(held) > 0 {
-		withHeld := append(append([]string{}, excluded...), held...)
+	// ones, and so are the locations that failed since the last
+	// successful connect. When that leaves nothing the recent failures
+	// are tried again, then the holds are ignored, rather than failing
+	// the connect.
+	held, unsettled := failing.held(), failing.unsettled()
+	withHeld := append(append([]string{}, excluded...), held...)
+	if len(unsettled) > 0 {
+		avoid := append(append([]string{}, withHeld...), unsettled...)
+		if loc, country, err := pickUnheldLocation(pref, locations, avoid); err == nil {
+			return loc, country, nil
+		}
+		log.Printf("tundler-tunnel: every allowed location failed since the last successful connect (%d); trying them again", len(unsettled))
+	}
+	if len(held) > 0 {
 		if loc, country, err := pickUnheldLocation(pref, locations, withHeld); err == nil {
 			return loc, country, nil
 		}
