@@ -1,5 +1,10 @@
 // Package windscribe drives Windscribe over OpenVPN directly (no provider
-// daemon), the same OpenVPN-direct shape as ovpn / purevpn / cyberghost.
+// daemon). One owned openvpn child per connection, supervised over a
+// management socket (internal/shared/ovpn, as ipvanish / veepn /
+// protonvpn): the password travels over the socket, a node that refuses
+// the credentials is reported as such (Status.AuthFailed) instead of
+// timing out like a dead server, the tunnel comes up on a fixed
+// tun-windscribe and Disconnect stops exactly that process.
 //
 // Windscribe is the friendliest provider to automate:
 //
@@ -25,11 +30,11 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -38,14 +43,23 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
-	name             = "windscribe"
-	defaultConfigDir = "/etc/windscribe/openvpn"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
-	serverListURL    = "https://assets.windscribe.com/serverlist/openvpn/1/0"
+	name          = "windscribe"
+	defaultRunDir = "/run/windscribe"
+	serverListURL = "https://assets.windscribe.com/serverlist/openvpn/1/0"
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-windscribe"
+	// connectTimeout bounds one attempt: management startup, TLS
+	// handshake and the CONNECTED state (the old route poll gave up
+	// after 30 s).
+	connectTimeout = 30 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
 )
 
 //go:embed ca.crt
@@ -74,12 +88,22 @@ type serverList struct {
 }
 
 var (
-	serverCache    []location
-	serverCacheMu  sync.RWMutex
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	serverCache   []location
+	serverCacheMu sync.RWMutex
+	activeMu      sync.RWMutex
+	current       *active
+	loggedIn      bool
 )
+
+// startTunnel launches the owned openvpn; tests replace it.
+var startTunnel = ovpn.Start
+
+// active is the owned tunnel and where it goes.
+type active struct {
+	tunnel   *ovpn.Tunnel
+	location string
+	hostname string
+}
 
 type Windscribe struct{}
 
@@ -91,11 +115,11 @@ func init() {
 	}))
 }
 
-func configDir() string {
-	if d := os.Getenv("WINDSCRIBE_CONFIG_DIR"); d != "" {
+func runDir() string {
+	if d := os.Getenv("WINDSCRIBE_RUN_DIR"); d != "" {
 		return d
 	}
-	return defaultConfigDir
+	return defaultRunDir
 }
 
 func getCredentials() (user, pass string, err error) {
@@ -190,19 +214,28 @@ func findLocation(locs []location, want string) *location {
 	return nil
 }
 
-func buildOpenVPNConfig(n node, authPath string) string {
+// buildOpenVPNConfig renders the config for node n. socket is the
+// management socket the owned openvpn answers on.
+func buildOpenVPNConfig(n node, socket string) (string, error) {
+	if !ovpn.ValidSocket(socket) {
+		return "", errors.New("invalid Windscribe management socket path")
+	}
 	// No verify-x509-name: Windscribe's .whiskergalaxy.com node hostnames
 	// don't map 1:1 to server cert CNs (a name can route to a differently-
 	// named physical server, e.g. tw-015.whiskergalaxy.com → cert
 	// tpe-166.windscribe.com), so a derived name fails the check.
 	// remote-cert-tls server still validates the peer is a server cert
 	// signed by Windscribe's CA, which is the protection we need.
+	//
+	// The transport and data-channel directives are the ones the
+	// --daemon version ran with; only the credential, interface and
+	// lifecycle lines changed with the move to the owned process.
 	return fmt.Sprintf(`client
-dev tun
+dev %s
+dev-type tun
 proto udp
 remote %s 443
 nobind
-auth-user-pass %s
 resolv-retry infinite
 cipher AES-256-GCM
 data-ciphers AES-256-GCM:AES-256-CBC:AES-128-GCM
@@ -213,34 +246,53 @@ remote-cert-tls server
 persist-key
 persist-tun
 key-direction 1
-<ca>
+connect-retry-max 1
+%s<ca>
 %s
 </ca>
 <tls-auth>
 %s
 </tls-auth>
-`, n.Hostname, authPath,
-		strings.TrimSpace(embeddedCA), strings.TrimSpace(embeddedTLSAuth))
+`, tunnelInterface, n.Hostname, ovpn.Directives(socket),
+		strings.TrimSpace(embeddedCA), strings.TrimSpace(embeddedTLSAuth)), nil
 }
 
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
-}
-
-func writeActiveConfig(n node, authPath string) (string, error) {
-	dst := filepath.Join(configDir(), activeConfigName)
-	if err := os.WriteFile(dst, []byte(buildOpenVPNConfig(n, authPath)), 0600); err != nil {
-		return "", fmt.Errorf("write active config: %w", err)
-	}
-	return dst, nil
-}
-
+// isOpenVPNConnected reports whether the tunnel is the path packets
+// take RIGHT NOW: a route lookup for a public address resolves via the
+// tunnel interface (the pushed redirect-gateway has landed).
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("Windscribe: %v", err)
+	}
 }
 
 // ---- VPNProvider ------------------------------------------------------
@@ -285,6 +337,7 @@ func (Windscribe) Locations(context.Context) []string {
 }
 
 func (w Windscribe) Connect(ctx context.Context, locationName string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: locationName}
 	user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("Windscribe: %v", err)
@@ -298,76 +351,76 @@ func (w Windscribe) Connect(ctx context.Context, locationName string) provider.S
 	loc := findLocation(locs, locationName)
 	if loc == nil || len(loc.Nodes) == 0 {
 		shared.Debugf("Windscribe: no node for location %q", locationName)
-		return provider.Status{Connected: false, Provider: name, Location: locationName}
+		return failed
 	}
 	n := loc.Nodes[rand.Intn(len(loc.Nodes))]
 
-	authPath, err := writeCredentials(user, pass)
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
+
+	tunnel, err := startTunnel(ctx, ovpn.Options{Name: "Windscribe", RunDir: runDir(), User: user, Pass: pass, Timeout: connectTimeout},
+		func(socket string) ([]byte, error) {
+			cfg, err := buildOpenVPNConfig(n, socket)
+			return []byte(cfg), err
+		})
+	if errors.Is(err, ovpn.ErrAuthFailed) {
+		// The credential is shared by every pod; when one node refuses
+		// it the runtime skips this location and connects elsewhere.
+		shared.Debugf("Windscribe: %s: %v", n.Hostname, err)
+		failed.AuthFailed = true
+		return failed
+	}
 	if err != nil {
-		shared.Debugf("Windscribe: write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: locationName}
+		shared.Debugf("Windscribe: %s: %v", n.Hostname, err)
+		return failed
 	}
-	if _, err := writeActiveConfig(n, authPath); err != nil {
-		shared.Debugf("Windscribe: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: locationName}
+	if !waitForRoute(ctx, tunnel) {
+		shared.Debugf("Windscribe: %s: connected but the default route never moved to %s", n.Hostname, tunnelInterface)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+		_ = tunnel.Stop(stopCtx)
+		cancel()
+		return failed
 	}
-
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir(),
-		"--config", activeConfigName,
-		"--daemon"); err != nil {
-		shared.Debugf("Windscribe: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: locationName}
-	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeMu.Lock()
-			activeLocation = loc.Name
-			activeMu.Unlock()
-			return w.Status(ctx)
-		}
-	}
-	shared.Debugf("Windscribe: connection timeout for %s", n.Hostname)
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	return provider.Status{Connected: false, Provider: name, Location: locationName}
+	activeMu.Lock()
+	current = &active{tunnel: tunnel, location: loc.Name, hostname: n.Hostname}
+	activeMu.Unlock()
+	return w.Status(ctx)
 }
 
 func (Windscribe) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 20; j++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
 
-func (Windscribe) Connected(context.Context) bool { return isOpenVPNConnected() }
-
-func (w Windscribe) Status(context.Context) provider.Status {
+func (Windscribe) Connected(context.Context) bool {
 	activeMu.RLock()
-	defer activeMu.RUnlock()
-	if activeLocation == "" {
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
+}
+
+func (w Windscribe) Status(ctx context.Context) provider.Status {
+	if !w.Connected(ctx) {
 		return provider.Status{Connected: false, Provider: name}
 	}
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
 	return provider.Status{
 		Connected: true,
 		Provider:  name,
-		Location:  activeLocation,
-		Region:    activeLocation,
+		Location:  a.location,
+		Region:    a.location,
 	}
 }
 
 func (Windscribe) ActiveLocation(context.Context) string {
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (Windscribe) Version(ctx context.Context) (string, error) {
