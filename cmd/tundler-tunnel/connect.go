@@ -128,8 +128,10 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	status := prov.Connect(ctx, location)
 	if !status.Connected {
 		if status.AuthFailed {
-			noteAuthFailure(state, providerName, location)
-			return location, fmt.Errorf("%w (provider=%s location=%s)", errAuthFailed, providerName, location)
+			if noteCredentialRejection(state, providerName, location) {
+				return location, fmt.Errorf("%w (provider=%s location=%s)", errAuthFailed, providerName, location)
+			}
+			return location, fmt.Errorf("location refused the credentials (provider=%s location=%s)", providerName, location)
 		}
 		if status.Throttled {
 			noteThrottled(providerName, location)
@@ -443,11 +445,20 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 		state.RecordConnectAttempt()
 		status := prov.Connect(ctx, location)
 		if status.AuthFailed {
-			// Account-wide: no other location can help and every
-			// attempt is a login. Fail the rotation now; the watchdog
-			// reconnects once the hold ends.
-			noteAuthFailure(state, providerName, location)
-			return fmt.Errorf("attempt %d/%d: %w (provider=%s)", attempt, maxAttempts, errAuthFailed, providerName)
+			// Usually one server refusing what the others accept: skip
+			// it and try another. Enough refusals in a row make it the
+			// account: fail the rotation now; the watchdog reconnects
+			// once the hold ends.
+			if noteCredentialRejection(state, providerName, location) {
+				return fmt.Errorf("attempt %d/%d: %w (provider=%s)", attempt, maxAttempts, errAuthFailed, providerName)
+			}
+			recentlyFailed = append(recentlyFailed, location)
+			log.Printf("tundler-tunnel: rotation attempt %d/%d refused the credentials (location=%s); will try another",
+				attempt, maxAttempts, location)
+			if attempt < maxAttempts {
+				sleep(retryBackoff(attempt))
+			}
+			continue
 		}
 		if status.Throttled {
 			// Account-wide too, and a retry extends the refusal.
