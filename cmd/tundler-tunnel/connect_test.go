@@ -200,7 +200,7 @@ func TestWatchdog_DetectsDropAndReconnects(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 	// Wait until the watchdog has triggered at least one reconnect.
@@ -246,7 +246,7 @@ func TestWatchdog_SkipsWhenNotReady(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 20*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 	<-done
@@ -277,7 +277,7 @@ func TestWatchdog_StaysOutOfWayWhenProxyHealthy(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 	<-done
@@ -307,7 +307,7 @@ func TestWatchdog_AbstainsWhenProxySilent(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 	<-done
@@ -347,7 +347,7 @@ func TestWatchdog_ReconnectFailureMarksFailedAndRetries(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 
@@ -401,7 +401,7 @@ func TestWatchdog_RecoversFromFailed(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "")
+		runWatchdog(ctx, fp, st, "fake", nil, 10*time.Millisecond, proxySrv, "", false)
 		close(done)
 	}()
 

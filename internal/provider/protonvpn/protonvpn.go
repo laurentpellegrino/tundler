@@ -385,6 +385,10 @@ func (p ProtonVPN) Connect(ctx context.Context, location string) provider.Status
 	return failed
 }
 
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (ProtonVPN) Daemonless() {}
+
 func (p ProtonVPN) Connected(ctx context.Context) bool {
 	activeMu.RLock()
 	a := current

@@ -457,6 +457,10 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 	return f.Status(ctx)
 }
 
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (FastVPN) Daemonless() {}
+
 func (f FastVPN) Connected(ctx context.Context) bool {
 	activeMu.RLock()
 	a := current

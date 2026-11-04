@@ -79,6 +79,17 @@ type VPNProvider interface {
 	Version(ctx context.Context) (string, error)
 }
 
+// Daemonless is implemented by providers whose tunnel is an openvpn
+// child of tundler-tunnel itself, with no vendor daemon or CLI in
+// between. Restarting the process cannot clear anything for them: a
+// connect that keeps failing is the network, the server or the pod, and
+// a respawn would only discard the failing-location memory and the
+// reconnect backoff. The runtime lets their reconnects back off further
+// and keeps the wedge guard from respawning them while they retry.
+type Daemonless interface {
+	Daemonless()
+}
+
 // Registry is filled at init() time by each provider package so that Manager
 // can discover all compiled-in providers at runtime.
 var Registry = map[string]VPNProvider{}

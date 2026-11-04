@@ -382,6 +382,10 @@ func (VeePN) Disconnect(ctx context.Context) error {
 	return nil
 }
 
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (VeePN) Daemonless() {}
+
 func (VeePN) Connected(context.Context) bool {
 	activeMu.RLock()
 	a := current
