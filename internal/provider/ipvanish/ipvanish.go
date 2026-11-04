@@ -358,6 +358,10 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 	return failed
 }
 
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (IPVanish) Daemonless() {}
+
 func (i IPVanish) Connected(ctx context.Context) bool {
 	activeMu.RLock()
 	a := current

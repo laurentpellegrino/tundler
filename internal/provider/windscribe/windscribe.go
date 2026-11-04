@@ -392,6 +392,10 @@ func (Windscribe) Disconnect(ctx context.Context) error {
 	return nil
 }
 
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (Windscribe) Daemonless() {}
+
 func (Windscribe) Connected(context.Context) bool {
 	activeMu.RLock()
 	a := current

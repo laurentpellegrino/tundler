@@ -84,9 +84,15 @@ const (
 //
 // vars (not consts) so tests can dial them down without going through
 // a full dependency-injection refactor.
+//
+// A Daemonless provider has no daemon to recover: when every reconnect
+// fails, retrying each minute only spends logins on the account (often
+// on a different server each time). Its backoff keeps doubling up to
+// watchdogDaemonlessMaxBackoff instead.
 var (
-	watchdogMinBackoff = 5 * time.Second
-	watchdogMaxBackoff = 60 * time.Second
+	watchdogMinBackoff           = 5 * time.Second
+	watchdogMaxBackoff           = 60 * time.Second
+	watchdogDaemonlessMaxBackoff = 15 * time.Minute
 )
 
 // Watchdog health-check tunables: how the watchdog decides whether the
@@ -126,6 +132,7 @@ func main() {
 	jitterMax := getEnvInt(envBootLoginJitterSec, defaultBootJitterSec)
 
 	prov, ok := provider.Registry[providerName]
+	_, daemonless := prov.(provider.Daemonless)
 	if !ok {
 		log.Fatalf("tundler-tunnel: unknown provider %q (compiled-in providers: %v)",
 			providerName, registryKeys())
@@ -372,7 +379,7 @@ func main() {
 	// says drops should reconnect WITHOUT a re-login (login is one-shot;
 	// session token cached by the VPN client).
 	watchdogInterval := time.Duration(getEnvInt(envWatchdogIntervalSec, defaultWatchdogIntervSec)) * time.Second
-	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv, baselineEgressIP)
+	go runWatchdog(ctx, prov, state, providerName, excluded, watchdogInterval, proxySrv, baselineEgressIP, daemonless)
 
 	// Start the rotator: each interval is a fresh uniform random pick
 	// from [MIN_ROTATION_SECONDS, MAX_ROTATION_SECONDS] (defaults 2h-4h),
@@ -414,7 +421,7 @@ func main() {
 	// kubelet liveness 503) preserves /var/log/journal across the
 	// recovery and keeps the kubelet-visible restart count quiet.
 	wedgeThreshold := time.Duration(getEnvInt(envWedgeGuardSec, defaultWedgeGuardSec)) * time.Second
-	go runWedgeGuard(ctx, state, wedgeThreshold)
+	go runWedgeGuard(ctx, state, wedgeThreshold, daemonless)
 
 	// Self-recycle: after a jittered max lifetime and/or a max rotation
 	// count, gracefully drain and exit the CONTAINER so kubelet recreates
@@ -477,10 +484,14 @@ func main() {
 // caught by runWedgeGuard, which exits the process after the wedge
 // threshold; systemd then respawns the binary fresh in-container
 // (login-free), and the boot login/connect retry loops take over.
-func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server, baselineEgressIP string) {
+func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTracker, providerName string, excluded []string, interval time.Duration, proxySrv *proxy.Server, baselineEgressIP string, daemonless bool) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	backoff := watchdogMinBackoff
+	maxBackoff := watchdogMaxBackoff
+	if daemonless {
+		maxBackoff = watchdogDaemonlessMaxBackoff
+	}
 	var holdLoggedAt time.Time
 	for {
 		select {
@@ -527,10 +538,10 @@ func runWatchdog(ctx context.Context, prov provider.VPNProvider, state *StateTra
 					return
 				case <-time.After(backoff):
 				}
-				if backoff < watchdogMaxBackoff {
+				if backoff < maxBackoff {
 					backoff *= 2
-					if backoff > watchdogMaxBackoff {
-						backoff = watchdogMaxBackoff
+					if backoff > maxBackoff {
+						backoff = maxBackoff
 					}
 				}
 				continue
@@ -577,31 +588,28 @@ func tunnelLooksHealthy(proxySrv *proxy.Server) bool {
 //
 // nonReadySince is reset every time state re-enters Ready, so a
 // flaky-but-recovering watchdog never trips the guard.
-func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Duration) {
+//
+// For a Daemonless provider, Failed is not a wedge: it means the last
+// reconnect returned and the watchdog is backing off before the next
+// one, so the clock restarts on every Failed sample. A connect that
+// hangs (Connecting or Rotating for the whole threshold) still trips it.
+func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Duration, daemonless bool) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	var nonReadySince time.Time
+	clock := wedgeClock{threshold: threshold, daemonless: daemonless}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if state.Get() == StateReady {
-				if !nonReadySince.IsZero() {
-					log.Printf("tundler-tunnel: wedge guard cleared after %s",
-						time.Since(nonReadySince).Round(time.Second))
-					nonReadySince = time.Time{}
-				}
-				continue
+			current := state.Get()
+			cleared, elapsed, trip := clock.observe(current, time.Now())
+			if cleared > 0 {
+				log.Printf("tundler-tunnel: wedge guard cleared after %s", cleared.Round(time.Second))
 			}
-			if nonReadySince.IsZero() {
-				nonReadySince = time.Now()
-				continue
-			}
-			elapsed := time.Since(nonReadySince)
-			if elapsed > threshold {
+			if trip {
 				log.Printf("tundler-tunnel: wedge guard tripped — state=%s for %s (> %s); exiting for systemd respawn",
-					state.Get(), elapsed.Round(time.Second), threshold)
+					current, elapsed.Round(time.Second), threshold)
 				// Drop any half-up tunnel so the respawn doesn't briefly
 				// overlap a second session on the account.
 				gracefulDisconnect()
@@ -609,6 +617,37 @@ func runWedgeGuard(ctx context.Context, state *StateTracker, threshold time.Dura
 			}
 		}
 	}
+}
+
+// wedgeClock is the wedge guard's decision, one state sample at a time.
+type wedgeClock struct {
+	threshold  time.Duration
+	daemonless bool
+	since      time.Time // first non-Ready sample of the current run
+}
+
+// observe records the state sampled at now. cleared is how long the pod
+// had been non-Ready when it is Ready again (0 otherwise); trip is set
+// once it has been non-Ready for longer than the threshold, elapsed
+// being that time.
+func (w *wedgeClock) observe(s State, now time.Time) (cleared, elapsed time.Duration, trip bool) {
+	if w.daemonless && s == StateFailed {
+		w.since = time.Time{}
+		return 0, 0, false
+	}
+	if s == StateReady {
+		if !w.since.IsZero() {
+			cleared = now.Sub(w.since)
+			w.since = time.Time{}
+		}
+		return cleared, 0, false
+	}
+	if w.since.IsZero() {
+		w.since = now
+		return 0, 0, false
+	}
+	elapsed = now.Sub(w.since)
+	return 0, elapsed, elapsed > w.threshold
 }
 
 // NOTE: the old failAndExit / exitUnrecoverable startup-error escalation was

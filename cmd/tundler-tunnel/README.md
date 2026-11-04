@@ -106,6 +106,13 @@ tick. It also recovers from `Failed`, not just from
 `Ready`-with-tunnel-down, so recovery happens within a few backoff
 cycles of the daemon becoming responsive again.
 
+Providers whose tunnel is an openvpn child of tundler-tunnel itself
+(`ipvanish`, `veepn`, `protonvpn`, `windscribe`, `fastvpn`: the
+`provider.Daemonless` marker) have no daemon to wait for. When their
+reconnects keep failing, the backoff keeps doubling up to 15 min, so a
+pod that cannot connect anywhere spends a few logins an hour on the
+account instead of one a minute.
+
 ### 2. Wedge guard (in-process)
 
 Every 30 s, if state has been continuously not-`Ready` for longer
@@ -123,6 +130,12 @@ expressvpnctl IPC stuck, stale session tokens, etc.).
 The 15 min threshold accommodates the watchdog's full backoff
 sequence, so a flapping recovery doesn't trip it; only a
 genuinely-stuck provider does.
+
+For a `Daemonless` provider, `Failed` is not a wedge: it means the
+last reconnect returned and the watchdog is backing off. A respawn
+would only discard the failing-location memory and the backoff, so the
+guard restarts its clock on every `Failed` sample and trips only when
+a connect or rotation hangs for the whole threshold.
 
 ## Rotation
 
