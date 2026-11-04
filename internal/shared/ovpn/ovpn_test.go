@@ -21,6 +21,13 @@ import (
 // handling are exercised without routes or a TUN interface.
 func managementFixture(t *testing.T, user, pass string, authenticate bool) (string, <-chan net.Conn) {
 	t.Helper()
+	return managementFixtureConnecting(t, user, pass, authenticate, "CONNECTED,SUCCESS")
+}
+
+// managementFixtureConnecting is managementFixture announcing the given
+// final state ("CONNECTED,SUCCESS", "CONNECTED,ERROR").
+func managementFixtureConnecting(t *testing.T, user, pass string, authenticate bool, final string) (string, <-chan net.Conn) {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "ovpn-mgmt-")
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +70,7 @@ func managementFixture(t *testing.T, user, pass string, authenticate bool) (stri
 				return
 			}
 		}
-		_, _ = io.WriteString(conn, ">STATE:1,CONNECTED,SUCCESS,10.20.30.40,192.0.2.10,1194\n")
+		_, _ = io.WriteString(conn, ">STATE:1,"+final+",10.20.30.40,192.0.2.10,1194\n")
 		connected <- conn
 	}()
 	return path, connected
@@ -196,4 +203,22 @@ func TestStartWritesAPrivateConfigAndCleansUp(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("connection directory was not removed after the failed start")
+}
+
+func TestConnectedWithErrorsCountsAsUpAndIsLogged(t *testing.T) {
+	logs := captureLog(t)
+	socket, _ := managementFixtureConnecting(t, "u1", "p1", true, "CONNECTED,ERROR")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u1", Pass: "p1"}, "client.ovpn", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tunnel.Stop(context.Background()) })
+	if tunnel.Address() != "10.20.30.40" {
+		t.Fatal("a session up with errors was not published")
+	}
+	if !strings.Contains(logs.String(), "ovpn: Test: connected with errors (CONNECTED,ERROR)") {
+		t.Fatalf("the degraded connect was not logged:\n%s", logs.String())
+	}
 }
