@@ -157,8 +157,8 @@ func TestRotationCredentialRejectionHoldsThatLocation(t *testing.T) {
 	withFailing(t)
 	fp := &fakeProvider{locations: []string{"la-laos", "hu"}, authFail: true}
 	err := connectWithRetry(context.Background(), fp, NewStateTracker("fake"), "fake", []string{"hu"}, 3, (&noSleep{}).sleep, "")
-	if !errors.Is(err, errAuthFailed) {
-		t.Fatalf("rotation must fail with errAuthFailed, got %v", err)
+	if err == nil || errors.Is(err, errAuthFailed) {
+		t.Fatalf("one rejecting location must fail the rotation without the account hold, got %v", err)
 	}
 	if !slices.Equal(failing.held(), []string{"la-laos"}) {
 		t.Fatalf("held = %v, want [la-laos]", failing.held())

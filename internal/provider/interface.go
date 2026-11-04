@@ -17,9 +17,11 @@ type Status struct {
 	Provider  string `json:"provider,omitempty"`
 	// AuthFailed marks a failed Connect that the provider rejected for
 	// the account's credentials (OpenVPN AUTH_FAILED and the like)
-	// rather than for the location: retrying elsewhere cannot help and
-	// every retry is one more login against a provider that may be
-	// rate-limiting logins. The caller holds all connects for a while.
+	// rather than for a network or server fault. Often one server
+	// refuses what the others accept, so the caller skips that location
+	// and connects elsewhere; after several rejections in a row it
+	// holds all connects for a while, since every retry is one more
+	// login against a provider that may be rate-limiting logins.
 	AuthFailed bool `json:"auth_failed,omitempty"`
 	// Throttled marks a failed Connect that the provider refused for too
 	// many recent connection attempts on the account (NordVPN's "Too many
