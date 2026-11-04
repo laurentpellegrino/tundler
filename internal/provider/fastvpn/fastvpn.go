@@ -14,7 +14,7 @@
 //     openvpn connects to the city's TCP/443 edge through that proxy
 //     (`socks-proxy`; OpenVPN's SOCKS support is TCP-only) and the
 //     inner tunnel then behaves like every other OpenVPN-direct
-//     provider: tun0 carries the default route, the upstream sees a
+//     provider: tun-fastvpn carries the default route, the upstream sees a
 //     FastVPN exit, rotation only restarts openvpn.
 //
 //     The one routing assertion left: Cloudflare's 162.159.0.0/16
@@ -45,12 +45,20 @@
 // https://vpn.ncapi.io/groupedServerList.zip, refreshed daily).
 // Each .ovpn carries multiple `remote ...` entries + `remote-random`;
 // the CA is inlined (`<ca>...</ca>`). We pass the .ovpn through
-// untouched except for rewriting the bare `auth-user-pass` directive
-// and, in warp mode, appending the `socks-proxy` line.
+// untouched except for the credential, interface and lifecycle lines
+// and, in warp mode, an appended `socks-proxy` line.
+//
+// Process: one owned openvpn child per connection, supervised over a
+// management socket (internal/shared/ovpn, as ipvanish / veepn /
+// protonvpn): the password travels over the socket, a server that
+// refuses the credentials is reported as such (Status.AuthFailed)
+// instead of timing out like a dead edge, the tunnel comes up on a
+// fixed tun-fastvpn and Disconnect stops exactly that process.
 package fastvpn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -65,17 +73,28 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/geo"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 	"github.com/laurentpellegrino/tundler/internal/shared/warpproxy"
 )
 
 const (
 	name             = "fastvpn"
 	defaultConfigDir = "/etc/fastvpn/configs"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
+	defaultRunDir    = "/run/fastvpn"
 
 	transportWarp   = "warp"
 	transportDirect = "direct"
+
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-fastvpn"
+	// connectTimeout bounds one attempt: management startup, TLS
+	// handshake and the CONNECTED state (the old route poll gave up
+	// after 30 s).
+	connectTimeout = 30 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
 )
 
 type FastVPN struct{}
@@ -89,26 +108,35 @@ type fastvpnServer struct {
 }
 
 var (
-	serverCache    []fastvpnServer
-	serverCacheMu  sync.RWMutex
-	activeServer   *fastvpnServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	serverCache   []fastvpnServer
+	serverCacheMu sync.RWMutex
+	activeMu      sync.RWMutex
+	current       *active
+	loggedIn      bool
+
+	// startTunnel launches the owned openvpn; tests replace it.
+	startTunnel = ovpn.Start
 
 	// Filename format: NCVPN-<CC>-<City>[ - Virtual]-<UDP|TCP>.ovpn
 	filenameRe = regexp.MustCompile(`^NCVPN-([A-Z]{2})-(.+)-(?:UDP|TCP)\.ovpn$`)
 
-	// Bare `auth-user-pass` directive (no file argument) — present
-	// in every upstream .ovpn. We rewrite it so openvpn reads our
-	// credentials file instead of prompting on TTY.
-	authUserPassRe = regexp.MustCompile(`(?m)^auth-user-pass\s*$`)
-
-	// openvpn names its interface tunN with the first free N; after
-	// a leftover process or a slow teardown the live tunnel may be
-	// tun1, so the connected check must not pin tun0.
-	tunRouteRe = regexp.MustCompile(` dev tun\d+ `)
+	// Directives dropped from the vendor config before ours are
+	// appended: credentials come over the management socket, the
+	// interface is pinned, the process lifecycle is the runner's.
+	// Everything else (remotes, remote-random, ciphers, tls-cipher,
+	// persist-*) is kept as the --daemon version ran it.
+	droppedDirectiveRe = regexp.MustCompile(`(?m)^[ \t]*(auth-user-pass|dev|dev-type|management[a-z-]*|daemon|log|log-append|auth-retry|auth-nocache)\b.*\n?`)
+	// Inline blocks (<ca>…</ca>) are kept verbatim: the directive
+	// filter runs on the lines outside them only.
+	inlineBlockRe = regexp.MustCompile(`(?s)<([a-z-]+)>.*?</[a-z-]+>`)
 )
+
+// active is the owned tunnel and where it goes.
+type active struct {
+	tunnel   *ovpn.Tunnel
+	server   *fastvpnServer
+	location string
+}
 
 func init() {
 	provider.Registry[name] = FastVPN{}
@@ -116,6 +144,13 @@ func init() {
 		accounts.FieldUsername: "FASTVPN_USERNAME",
 		accounts.FieldPassword: "FASTVPN_PASSWORD",
 	}))
+}
+
+func runDir() string {
+	if d := os.Getenv("FASTVPN_RUN_DIR"); d != "" {
+		return d
+	}
+	return defaultRunDir
 }
 
 func configDir() string {
@@ -271,69 +306,71 @@ func pickRandomServer(servers []fastvpnServer) *fastvpnServer {
 	return &s
 }
 
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir(), credentialsName, user, pass)
-}
-
-// writeActiveConfig copies the chosen city's .ovpn to active.ovpn,
-// pointing `auth-user-pass` at our credentials file and, in warp
-// mode, dialing the TCP edge through WARP's SOCKS proxy.
-func writeActiveConfig(server *fastvpnServer, credentialsFile string) (string, error) {
-	src := filepath.Join(configDir(), server.Filename)
-	raw, err := os.ReadFile(src)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", src, err)
+// openVPNConfig turns the chosen city's vendor .ovpn into the config
+// this provider runs: transport and keys kept, credential, interface
+// and lifecycle lines replaced by ours, and in warp mode the TCP edge
+// dialed through WARP's SOCKS proxy. socket is the management socket.
+func openVPNConfig(vendor []byte, socket string, viaWarp bool) ([]byte, error) {
+	if !ovpn.ValidSocket(socket) {
+		return nil, errors.New("invalid FastVPN management socket path")
 	}
-	rewritten := authUserPassRe.ReplaceAllString(string(raw), "auth-user-pass "+credentialsFile)
-	if transport() == transportWarp {
-		rewritten = strings.TrimRight(rewritten, "\n") + "\nsocks-proxy " + warpproxy.Addr + "\n"
+	text := strings.ReplaceAll(string(vendor), "\r\n", "\n")
+	var blocks []string
+	text = inlineBlockRe.ReplaceAllStringFunc(text, func(b string) string {
+		blocks = append(blocks, b)
+		return fmt.Sprintf("\x00BLOCK%d\x00", len(blocks)-1)
+	})
+	text = droppedDirectiveRe.ReplaceAllString(text, "")
+	for i, b := range blocks {
+		text = strings.Replace(text, fmt.Sprintf("\x00BLOCK%d\x00", i), b, 1)
 	}
-	dst := filepath.Join(configDir(), activeConfigName)
-	if err := os.WriteFile(dst, []byte(rewritten), 0600); err != nil {
-		return "", fmt.Errorf("write active config: %w", err)
+	text = strings.TrimRight(text, "\n") + "\n"
+	ours := "\n# --- tundler ---\ndev " + tunnelInterface + "\ndev-type tun\n" + ovpn.Directives(socket)
+	if viaWarp {
+		ours += "socks-proxy " + warpproxy.Addr + "\n"
 	}
-	return dst, nil
+	return []byte(text + ours), nil
 }
 
 // ----------------------------------------------------------------------
 // OpenVPN process
 // ----------------------------------------------------------------------
 
-// isOpenVPNConnected returns true once openvpn's pushed
-// redirect-gateway has taken effect — a route lookup for an
-// arbitrary public address resolves via a tun interface. Same
-// default-route gating as the other openvpn-direct providers.
+// isOpenVPNConnected reports whether the tunnel is the path packets
+// take RIGHT NOW: a route lookup for a public address resolves via the
+// tunnel interface (the pushed redirect-gateway has landed).
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return tunRouteRe.MatchString(out)
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
 }
 
-func openVPNRunning(ctx context.Context) bool {
-	_, err := shared.RunCmdSilent(ctx, "pgrep", "-x", "openvpn")
-	return err == nil
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
-// stopOpenVPN terminates every openvpn process and waits for the
-// tunnel route to go away. Also used when a Connect attempt times
-// out: a half-connected openvpn left behind keeps its tunN, the next
-// attempt comes up on tunN+1, and the stale route keeps winning.
-func stopOpenVPN(ctx context.Context) {
-	if !openVPNRunning(ctx) {
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
 		return
 	}
-	_, _ = shared.RunCmdSilent(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 30; j++ {
-		if !openVPNRunning(ctx) {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	_, _ = shared.RunCmdSilent(ctx, "pkill", "-SIGKILL", "openvpn")
-	for j := 0; j < 10 && openVPNRunning(ctx); j++ {
-		time.Sleep(100 * time.Millisecond)
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("FastVPN: %v", err)
 	}
 }
 
@@ -342,22 +379,24 @@ func stopOpenVPN(ctx context.Context) {
 // ----------------------------------------------------------------------
 
 func (f FastVPN) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
 	user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("FastVPN: %v", err)
 		return provider.Status{Connected: false, Provider: name}
 	}
 
-	if transport() == transportWarp {
+	viaWarp := transport() == transportWarp
+	if viaWarp {
 		// The SOCKS proxy must forward before openvpn dials through
 		// it, and WARP's own packets must never be routed into the
 		// tunnel openvpn is about to bring up.
@@ -380,49 +419,49 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 	matches := findServers(servers, location)
 	if len(matches) == 0 {
 		shared.Debugf("FastVPN: no servers found for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
-
 	server := pickRandomServer(matches)
-	credFile, err := writeCredentials(user, pass)
+	vendor, err := os.ReadFile(filepath.Join(configDir(), server.Filename))
 	if err != nil {
-		shared.Debugf("FastVPN: failed to write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-	if _, err := writeActiveConfig(server, credFile); err != nil {
-		shared.Debugf("FastVPN: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		shared.Debugf("FastVPN: read %s: %v", server.Filename, err)
+		return failed
 	}
 
-	// Never stack a second openvpn on a leftover one.
-	stopOpenVPN(ctx)
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
 
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir(),
-		"--config", activeConfigName,
-		"--daemon"); err != nil {
-		shared.Debugf("FastVPN: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+	tunnel, err := startTunnel(ctx, ovpn.Options{Name: "FastVPN", RunDir: runDir(), CD: configDir(), User: user, Pass: pass, Timeout: connectTimeout},
+		func(socket string) ([]byte, error) { return openVPNConfig(vendor, socket, viaWarp) })
+	if errors.Is(err, ovpn.ErrAuthFailed) {
+		// The credential is shared by every pod; when one edge refuses
+		// it the runtime skips this location and connects elsewhere.
+		shared.Debugf("FastVPN: %s/%s: %v", server.Country, server.City, err)
+		failed.AuthFailed = true
+		return failed
 	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			activeMu.Lock()
-			activeLocation = location
-			activeMu.Unlock()
-			return f.Status(ctx)
-		}
+	if err != nil {
+		shared.Debugf("FastVPN: %s/%s: %v", server.Country, server.City, err)
+		return failed
 	}
-
-	shared.Debugf("FastVPN: connection timeout for %s/%s", server.Country, server.City)
-	stopOpenVPN(ctx)
-	return provider.Status{Connected: false, Provider: name, Location: location}
+	if !waitForRoute(ctx, tunnel) {
+		shared.Debugf("FastVPN: %s/%s: connected but the default route never moved to %s", server.Country, server.City, tunnelInterface)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+		_ = tunnel.Stop(stopCtx)
+		cancel()
+		return failed
+	}
+	activeMu.Lock()
+	current = &active{tunnel: tunnel, server: server, location: location}
+	activeMu.Unlock()
+	return f.Status(ctx)
 }
 
 func (f FastVPN) Connected(ctx context.Context) bool {
-	return isOpenVPNConnected()
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
 }
 
 // Disconnect stops openvpn only. WARP stays up — it is transport,
@@ -430,11 +469,7 @@ func (f FastVPN) Connected(ctx context.Context) bool {
 // to its own egress, which the crawler never uses (the proxy answers
 // 502 until the next Connect).
 func (f FastVPN) Disconnect(ctx context.Context) error {
-	stopOpenVPN(ctx)
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
 
@@ -517,13 +552,15 @@ func publicIP(ctx context.Context) string {
 }
 
 func activeRegion() string {
-	if activeServer == nil {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if current == nil || current.server == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
+	if current.server.City != "" {
+		return current.server.Country + " - " + current.server.City
 	}
-	return activeServer.Country
+	return current.server.Country
 }
 
 func (f FastVPN) Version(ctx context.Context) (string, error) {
