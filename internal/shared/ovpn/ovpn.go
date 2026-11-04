@@ -88,6 +88,7 @@ type Tunnel struct {
 	up         bool
 	failed     bool
 	authFailed bool
+	degraded   bool // CONNECTED,ERROR: up, but a setup step failed
 	ready      bool // Launch returned it connected
 	stopping   bool // Stop was called: an exit is expected
 }
@@ -168,14 +169,22 @@ func (t *Tunnel) monitor(user, pass string) {
 			return
 		case strings.HasPrefix(line, ">STATE:"):
 			fields := strings.Split(strings.TrimPrefix(line, ">STATE:"), ",")
+			// CONNECTED,ERROR is "Initialization Sequence Completed With
+			// Errors": the session is up and has its address, but a
+			// setup step (typically one route or a pushed option) failed.
+			// It counts as up: every caller verifies the default route
+			// before trusting the tunnel, and the failure is logged with
+			// the openvpn output so it can be read.
 			var vip string
-			if len(fields) >= 4 && fields[1] == "CONNECTED" && fields[2] == "SUCCESS" {
+			degraded := false
+			if len(fields) >= 4 && fields[1] == "CONNECTED" && (fields[2] == "SUCCESS" || fields[2] == "ERROR") {
 				if ip := net.ParseIP(fields[3]); ip != nil && ip.To4() != nil && !ip.IsUnspecified() && !ip.IsLoopback() {
 					vip = ip.String()
+					degraded = fields[2] == "ERROR"
 				}
 			}
 			t.mu.Lock()
-			t.vip, t.up = vip, vip != ""
+			t.vip, t.up, t.degraded = vip, vip != "", degraded
 			t.mu.Unlock()
 			t.notify()
 		}
@@ -254,7 +263,11 @@ func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel
 			ready = true
 			t.mu.Lock()
 			t.ready = true
+			degraded := t.degraded
 			t.mu.Unlock()
+			if degraded {
+				logTail(opts.Name, t.output, "connected with errors (CONNECTED,ERROR); accepted, the caller's route check decides")
+			}
 			return t, nil
 		}
 		t.mu.RLock()
