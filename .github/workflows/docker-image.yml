@@ -61,9 +61,10 @@ jobs:
       # 14.2.0 bump, so the pin stays. The other providers are unaffected,
       # so keep them on 24.04 to avoid a fleet-wide LTS jump.
       BASE_IMAGE: ${{ matrix.provider == 'expressvpn' && 'ubuntu:26.04' || 'ubuntu:24.04' }}
-      IMAGE_TAGS: |
-        ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:latest
-        ghcr.io/${{ github.repository_owner }}/tundler-${{ matrix.provider }}:${{ github.sha }}
+      # :latest only from main. A manual run on another branch publishes
+      # the commit tag alone, so a change can go to one pod (StatefulSet
+      # partition) before every pod that restarts pulls it.
+      IMAGE_TAGS: ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/tundler-{1}:latest,ghcr.io/{0}/tundler-{1}:{2}', github.repository_owner, matrix.provider, github.sha) || format('ghcr.io/{0}/tundler-{1}:{2}', github.repository_owner, matrix.provider, github.sha) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
