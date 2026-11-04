@@ -10,8 +10,10 @@
 //
 // The account password travels over the management socket
 // (management-query-passwords), never through a file or the
-// environment. Neither OpenVPN output nor management messages are
-// forwarded to logs: both can carry the credentials.
+// environment. Management messages are never logged. OpenVPN's own
+// output is kept as a short redacted tail (see tail.go) and logged
+// only when an attempt fails or an up tunnel drops, so a failure
+// explains itself.
 //
 // The provider renders the config (it knows its vendor's directives);
 // this package owns the lifecycle. A config must carry the management
@@ -74,6 +76,8 @@ func ValidSocket(socket string) bool {
 
 // Tunnel is one owned openvpn child.
 type Tunnel struct {
+	name       string
+	output     *tail
 	cmd        *exec.Cmd
 	done       chan struct{}
 	events     chan struct{}
@@ -84,6 +88,8 @@ type Tunnel struct {
 	up         bool
 	failed     bool
 	authFailed bool
+	ready      bool // Launch returned it connected
+	stopping   bool // Stop was called: an exit is expected
 }
 
 func (t *Tunnel) notify() {
@@ -179,27 +185,40 @@ func (t *Tunnel) monitor(user, pass string) {
 // Launch starts openvpn on config, drives the management handshake over
 // socket and waits for CONNECTED. The context bounds the attempt only,
 // never the tunnel's lifetime.
-func Launch(ctx context.Context, opts Options, config, socket string) (*Tunnel, error) {
-	t := &Tunnel{done: make(chan struct{}), events: make(chan struct{}, 1)}
+func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel, err error) {
+	t := &Tunnel{name: opts.Name, output: newTail(opts.User, opts.Pass), done: make(chan struct{}), events: make(chan struct{}, 1)}
 	args := []string{"--config", config}
 	if opts.CD != "" {
 		args = append([]string{"--cd", opts.CD}, args...)
 	}
 	t.cmd = exec.Command("openvpn", args...)
 	configureChild(t.cmd)
-	t.cmd.Stdout, t.cmd.Stderr = io.Discard, io.Discard
+	t.cmd.Stdout, t.cmd.Stderr = t.output, t.output
 	// The transport needs no account, vault or cloud environment.
 	t.cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "LANG=C"}
 	if err := t.cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s OpenVPN transport", opts.Name)
 	}
-	go func() { _ = t.cmd.Wait(); close(t.done); t.notify() }()
+	go func() {
+		_ = t.cmd.Wait()
+		t.mu.RLock()
+		dropped := t.ready && !t.stopping
+		t.mu.RUnlock()
+		close(t.done)
+		t.notify()
+		if dropped {
+			logTail(t.name, t.output, "tunnel dropped: openvpn exited")
+		}
+	}()
 	ready := false
 	defer func() {
 		if !ready {
 			cleanup, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 			defer cancel()
 			_ = t.Stop(cleanup)
+			if err != nil {
+				logTail(opts.Name, t.output, "connect attempt failed: "+err.Error())
+			}
 		}
 	}()
 	timeout := opts.Timeout
@@ -233,6 +252,9 @@ func Launch(ctx context.Context, opts Options, config, socket string) (*Tunnel, 
 	for {
 		if t.Address() != "" {
 			ready = true
+			t.mu.Lock()
+			t.ready = true
+			t.mu.Unlock()
 			return t, nil
 		}
 		t.mu.RLock()
@@ -265,6 +287,9 @@ func (t *Tunnel) Stop(ctx context.Context) error {
 	if t == nil {
 		return nil
 	}
+	t.mu.Lock()
+	t.stopping = true
+	t.mu.Unlock()
 	_ = t.cmd.Process.Signal(syscall.SIGTERM)
 	defer func() {
 		if t.control != nil {
