@@ -16,6 +16,10 @@ import (
 )
 
 const bin = "piactl"
+
+// connectTimeout bounds how long Connect waits for the daemon to report
+// both the Connected state and a VPN IP.
+const connectTimeout = 60 * time.Second
 const name = "pia"
 
 // daemonService is the systemd unit running the PIA daemon (piavpn-daemon)
@@ -239,7 +243,7 @@ func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	// for fast first-success detection; the LOG runs at most once per
 	// 5 s so journals stay readable. The state values we'd log
 	// rarely change between sub-second polls anyway.
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(connectTimeout)
 	lastLog := time.Time{}
 	for time.Now().Before(deadline) {
 		status := p.Status(ctx)
@@ -259,7 +263,28 @@ func (p PIA) Connect(ctx context.Context, location string) provider.Status {
 	}
 
 	shared.Debugf("PIA: Connect() - timeout waiting for VPN IP")
-	return p.Status(ctx)
+	status, noIP := withoutVPNIPFailed(p.Status(ctx))
+	if noIP {
+		// piactl fetches the VPN IP through the tunnel, so "Connected"
+		// with no IP after a minute is a tunnel that passes no traffic
+		// (observed 2026-11-05: the exit probe got connection refused
+		// and the pod sat Ready with no exit until its next rotation,
+		// 7 h later). Fail the connect so the caller tries another
+		// location.
+		log.Printf("PIA: %s: connected but no VPN IP after %s; counting the connect as failed", location, connectTimeout)
+		_ = p.Disconnect(ctx)
+	}
+	return status
+}
+
+// withoutVPNIPFailed turns a "connected" status with no VPN IP into a
+// failed one, and reports whether it did.
+func withoutVPNIPFailed(s provider.Status) (provider.Status, bool) {
+	if !s.Connected || s.IP != "" {
+		return s, false
+	}
+	s.Connected = false
+	return s, true
 }
 
 // Connected reports whether the VPN tunnel is up.
