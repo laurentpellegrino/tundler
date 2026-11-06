@@ -1,4 +1,10 @@
 // Package cyberghost is an OpenVPN-direct provider for CyberGhost VPN.
+// One owned openvpn child per connection, supervised over a management
+// socket (internal/shared/ovpn, as windscribe / ipvanish / protonvpn):
+// the password travels over the socket, a server that refuses the
+// device credentials is reported as such (Status.AuthFailed) instead of
+// timing out like a dead server, the tunnel comes up on a fixed
+// tun-cyberghost and Disconnect stops exactly that process.
 //
 // Why OpenVPN-direct (not the official `cyberghostvpn` CLI):
 // CyberGhost's Linux CLI requires an INTERACTIVE `cyberghostvpn --setup`
@@ -41,6 +47,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -53,16 +60,22 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
-	name             = "cyberghost"
-	defaultConfigDir = "/etc/cyberghost/openvpn"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
-	clientCertName   = "client.crt"
-	clientKeyName    = "client.key"
-	caCertName       = "ca.crt"
+	name          = "cyberghost"
+	defaultRunDir = "/run/cyberghost"
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-cyberghost"
+	// connectTimeout bounds one attempt: management startup, TLS
+	// handshake, the 5 s route-delay and the CONNECTED state (the old
+	// route poll gave up 30 s after the daemon started).
+	connectTimeout = 35 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
 )
 
 //go:embed ca.crt
@@ -94,13 +107,22 @@ type cyberghostServer struct {
 }
 
 var (
-	serverCache    []cyberghostServer
-	serverCacheMu  sync.RWMutex
-	activeServer   *cyberghostServer
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	serverCache   []cyberghostServer
+	serverCacheMu sync.RWMutex
+	activeMu      sync.RWMutex
+	current       *active
+	loggedIn      bool
 )
+
+// startTunnel launches the owned openvpn; tests replace it.
+var startTunnel = ovpn.Start
+
+// active is the owned tunnel and where it goes.
+type active struct {
+	tunnel   *ovpn.Tunnel
+	server   cyberghostServer
+	location string
+}
 
 func init() {
 	provider.Registry[name] = CyberGhost{}
@@ -115,11 +137,11 @@ func init() {
 	})
 }
 
-func configDir() string {
-	if dir := os.Getenv("CYBERGHOST_CONFIG_DIR"); dir != "" {
+func runDir() string {
+	if dir := os.Getenv("CYBERGHOST_RUN_DIR"); dir != "" {
 		return dir
 	}
-	return defaultConfigDir
+	return defaultRunDir
 }
 
 // credsDir is where the pre-accounts StatefulSet projected the
@@ -253,61 +275,45 @@ func pickRandomServer(servers []cyberghostServer) *cyberghostServer {
 	return &s
 }
 
-// ensurePEMTerminator appends a trailing newline if the input doesn't
-// already end with one. OpenSSL's PEM parser rejects a block whose
-// END line isn't terminated ("bad end line" error) — and the
-// OpenBao web UI silently strips the trailing newline when a user
-// pastes a multi-line value into the form. Belt-and-braces fix here.
-func ensurePEMTerminator(s string) string {
-	if strings.HasSuffix(s, "\n") {
-		return s
+// pemBlock trims a PEM value for an inline config block and rejects
+// one that could close the block early.
+func pemBlock(field, v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.Contains(v, "<") {
+		return "", fmt.Errorf("CyberGhost %s is not a usable PEM block", field)
 	}
-	return s + "\n"
+	return v, nil
 }
 
-// writeAuthArtifacts writes the per-pod cert / key / auth file (plus
-// the embedded CA) into the config directory at known names. The
-// generated .ovpn references them via `ca <file>`, `cert <file>`,
-// `key <file>`, `auth-user-pass <file>`. All files are 0600 except
-// ca.crt (0644) — the cert+key pair is the per-device secret.
-func writeAuthArtifacts(dir, cert, key, user, pass string) (caPath, certPath, keyPath, authPath string, err error) {
-	if err = os.MkdirAll(dir, 0700); err != nil {
-		return
+// buildOpenVPNConfig renders the config for one server. Shape mirrors
+// the bundle CyberGhost's dashboard generates (extracted from a real
+// Configure Device download: same data-ciphers, ping, etc.). The
+// transport and data-channel directives are the ones the --daemon
+// version ran with; the credential, interface, MTU clamp (formerly
+// command-line flags) and lifecycle lines changed with the move to the
+// owned process. The per-device cert and key are inline: the config
+// lives in the private connection directory, removed when the process
+// ends. socket is the management socket the owned openvpn answers on.
+func buildOpenVPNConfig(server *cyberghostServer, cert, key, socket string) (string, error) {
+	if !ovpn.ValidSocket(socket) {
+		return "", errors.New("invalid CyberGhost management socket path")
 	}
-	caPath = filepath.Join(dir, caCertName)
-	if err = os.WriteFile(caPath, embeddedCACert, 0644); err != nil {
-		err = fmt.Errorf("write ca.crt: %w", err)
-		return
+	cert, err := pemBlock("certificate", cert)
+	if err != nil {
+		return "", err
 	}
-	certPath = filepath.Join(dir, clientCertName)
-	if err = os.WriteFile(certPath, []byte(ensurePEMTerminator(cert)), 0600); err != nil {
-		err = fmt.Errorf("write client.crt: %w", err)
-		return
+	key, err = pemBlock("key", key)
+	if err != nil {
+		return "", err
 	}
-	keyPath = filepath.Join(dir, clientKeyName)
-	if err = os.WriteFile(keyPath, []byte(ensurePEMTerminator(key)), 0600); err != nil {
-		err = fmt.Errorf("write client.key: %w", err)
-		return
-	}
-	authPath = filepath.Join(dir, credentialsName)
-	if err = os.WriteFile(authPath, []byte(user+"\n"+pass+"\n"), 0600); err != nil {
-		err = fmt.Errorf("write auth.txt: %w", err)
-		return
-	}
-	return
-}
-
-// buildOpenVPNConfig produces the .ovpn content for one server. Shape
-// mirrors the bundle CyberGhost's dashboard generates (extracted from
-// a real Configure Device download — same data-ciphers, ping, etc.).
-// We strip nothing: their config is already OpenSSL 3 / OpenVPN 2.6
-// clean (unlike ipvanish's legacy tls-cipher pinning).
-func buildOpenVPNConfig(server *cyberghostServer, caPath, certPath, keyPath, authPath string) string {
+	// --tun-mtu / --mssfix clamp below the k8s pod MTU (1370 on
+	// Talos/Cilium); default 1500-byte payloads get PMTU-dropped on
+	// the encapsulated path.
 	return fmt.Sprintf(`client
 remote %s 443
-dev tun
+dev %s
+dev-type tun
 proto udp
-auth-user-pass %s
 resolv-retry infinite
 redirect-gateway def1
 persist-key
@@ -322,59 +328,79 @@ script-security 2
 remote-cert-tls server
 route-delay 5
 verb 3
-ca %s
-cert %s
-key %s
-`, server.Hostname, authPath, caPath, certPath, keyPath)
-}
-
-func writeActiveConfig(dir string, server *cyberghostServer, caPath, certPath, keyPath, authPath string) (string, error) {
-	dst := filepath.Join(dir, activeConfigName)
-	if err := os.WriteFile(dst, []byte(buildOpenVPNConfig(server, caPath, certPath, keyPath, authPath)), 0600); err != nil {
-		return "", fmt.Errorf("write active config: %w", err)
-	}
-	return dst, nil
+tun-mtu 1320
+mssfix 1280
+connect-retry-max 1
+%s<ca>
+%s
+</ca>
+<cert>
+%s
+</cert>
+<key>
+%s
+</key>
+`, server.Hostname, tunnelInterface, ovpn.Directives(socket),
+		strings.TrimSpace(string(embeddedCACert)), cert, key), nil
 }
 
 // isOpenVPNConnected returns true once the tunnel's redirect-gateway
-// push has actually taken effect — i.e. a route LOOKUP for an
-// arbitrary public address resolves via tun0, not via eth0. The
-// looser "any route on tun0 exists" variant we use elsewhere
-// returns true too early: openvpn installs the per-pod link-local
-// route (e.g. 10.2.4.0/24 dev tun0) BEFORE the redirect-gateway
-// default-eclipsing routes are pushed, so the exit-IP contract
-// probe in cmd/tundler-tunnel/egress.go would fire while the main-
-// ns default route is still via eth0 and flag a leak that doesn't
-// actually exist.
+// push has actually taken effect, i.e. a route LOOKUP for an arbitrary
+// public address resolves via the tunnel interface, not via eth0. The
+// looser "any route on the tun exists" check returns true too early:
+// openvpn installs the per-pod link-local route BEFORE the
+// redirect-gateway default-eclipsing routes, so the exit-IP contract
+// probe in cmd/tundler-tunnel/egress.go would fire while the main-ns
+// default route is still via eth0 and flag a leak that doesn't exist.
 //
-// `ip route get 8.8.8.8` returns the route the kernel would pick
-// for that dst RIGHT NOW; checking for " dev tun0 " in the output
-// confirms the tunnel is genuinely the path packets are taking.
-//
-// The same fix is mirrored in protonvpn.go and surfshark.go's
-// OpenVPN branch (the WireGuard branch doesn't have this race —
-// wg-quick is synchronous, routes are installed before it returns).
-//
-// 8.8.8.8 is a stable public-IPv4 destination; we don't actually
-// send a packet to it, this is purely a kernel route-table lookup.
+// 8.8.8.8 is a stable public-IPv4 destination; we don't actually send
+// a packet to it, this is purely a kernel route-table lookup.
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+func waitForRoute(ctx context.Context, tunnel *ovpn.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("CyberGhost: %v", err)
+	}
 }
 
 func (c CyberGhost) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (c CyberGhost) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
 	cert, key, user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("CyberGhost: %v", err)
@@ -390,69 +416,57 @@ func (c CyberGhost) Connect(ctx context.Context, location string) provider.Statu
 	matches := findServers(servers, location)
 	if len(matches) == 0 {
 		shared.Debugf("CyberGhost: no servers found for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
-
 	server := pickRandomServer(matches)
-	dir := configDir()
-	caPath, certPath, keyPath, authPath, err := writeAuthArtifacts(dir, cert, key, user, pass)
+
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
+
+	tunnel, err := startTunnel(ctx, ovpn.Options{Name: "CyberGhost", RunDir: runDir(), User: user, Pass: pass, Timeout: connectTimeout},
+		func(socket string) ([]byte, error) {
+			cfg, err := buildOpenVPNConfig(server, cert, key, socket)
+			return []byte(cfg), err
+		})
+	if errors.Is(err, ovpn.ErrAuthFailed) {
+		// This pod's device profile was refused by one server; the
+		// runtime skips this location and connects elsewhere.
+		shared.Debugf("CyberGhost: %s: %v", server.Hostname, err)
+		failed.AuthFailed = true
+		return failed
+	}
 	if err != nil {
-		shared.Debugf("CyberGhost: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		shared.Debugf("CyberGhost: %s: %v", server.Hostname, err)
+		return failed
 	}
-	if _, err := writeActiveConfig(dir, server, caPath, certPath, keyPath, authPath); err != nil {
-		shared.Debugf("CyberGhost: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+	if !waitForRoute(ctx, tunnel) {
+		shared.Debugf("CyberGhost: %s: connected but the default route never moved to %s", server.Hostname, tunnelInterface)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+		_ = tunnel.Stop(stopCtx)
+		cancel()
+		return failed
 	}
-
-	// --tun-mtu / --mssfix clamp below the k8s pod MTU (1370 on
-	// Talos/Cilium); default 1500-byte payloads get PMTU-dropped on
-	// the encapsulated path. RunCmd (the post-bb88d29 default —
-	// main netns, not vpnns) so openvpn + tun0 land in the same
-	// namespace as the CONNECT proxy.
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", dir,
-		"--config", activeConfigName,
-		"--tun-mtu", "1320",
-		"--mssfix", "1280",
-		"--daemon"); err != nil {
-		shared.Debugf("CyberGhost: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	for j := 0; j < 60; j++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			activeMu.Lock()
-			activeLocation = location
-			activeMu.Unlock()
-			return c.Status(ctx)
-		}
-	}
-
-	shared.Debugf("CyberGhost: connection timeout for %s", server.Hostname)
-	return provider.Status{Connected: false, Provider: name, Location: location}
+	activeMu.Lock()
+	current = &active{tunnel: tunnel, server: *server, location: location}
+	activeMu.Unlock()
+	return c.Status(ctx)
 }
 
 func (c CyberGhost) Connected(ctx context.Context) bool {
-	return isOpenVPNConnected()
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
 }
 
 func (c CyberGhost) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for j := 0; j < 20; j++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
+
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (CyberGhost) Daemonless() {}
 
 func (c CyberGhost) Locations(ctx context.Context) []string {
 	servers, err := loadServers()
@@ -472,7 +486,11 @@ func (c CyberGhost) Locations(ctx context.Context) []string {
 	return locations
 }
 
-func (c CyberGhost) LoggedIn(ctx context.Context) bool { return loggedIn }
+func (c CyberGhost) LoggedIn(ctx context.Context) bool {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	return loggedIn
+}
 
 func (c CyberGhost) Login(ctx context.Context) error {
 	if _, _, _, _, err := getCredentials(); err != nil {
@@ -481,12 +499,16 @@ func (c CyberGhost) Login(ctx context.Context) error {
 	if _, err := loadServers(); err != nil {
 		return err
 	}
+	activeMu.Lock()
 	loggedIn = true
+	activeMu.Unlock()
 	return nil
 }
 
 func (c CyberGhost) Logout(ctx context.Context) error {
+	activeMu.Lock()
 	loggedIn = false
+	activeMu.Unlock()
 	return nil
 }
 
@@ -525,13 +547,15 @@ func publicIP(ctx context.Context) string {
 }
 
 func activeRegion() string {
-	if activeServer == nil {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if current == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
+	if current.server.City != "" {
+		return current.server.Country + " - " + current.server.City
 	}
-	return activeServer.Country
+	return current.server.Country
 }
 
 func (c CyberGhost) Version(ctx context.Context) (string, error) {
