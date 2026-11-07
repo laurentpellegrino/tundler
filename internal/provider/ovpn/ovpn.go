@@ -1,5 +1,10 @@
-// Package ovpn drives OVPN.com over OpenVPN directly (no provider daemon),
-// the same OpenVPN-direct shape as cyberghost / fastvpn / ipvanish.
+// Package ovpn drives OVPN.com over OpenVPN directly (no provider daemon).
+// One owned openvpn child per connection, supervised over a management
+// socket (internal/shared/ovpn, as windscribe / cyberghost / ipvanish):
+// the password travels over the socket, a server that refuses the
+// credentials is reported as such (Status.AuthFailed) instead of timing
+// out like a dead server, the tunnel comes up on a fixed tun-ovpn and
+// Disconnect stops exactly that process.
 //
 // Auth is a single shared username/password (OVPN_USERNAME/OVPN_PASSWORD
 // from OpenBao vpn/ovpn) — OVPN allows up to 7 simultaneous connections on
@@ -14,10 +19,10 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -26,14 +31,23 @@ import (
 	"github.com/laurentpellegrino/tundler/internal/accounts"
 	"github.com/laurentpellegrino/tundler/internal/provider"
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	ovpnrun "github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
-	name             = "ovpn"
-	serversFile      = "/etc/ovpn/servers.json"
-	configDir        = "/etc/ovpn/openvpn"
-	activeConfigName = "active.ovpn"
-	credentialsName  = "auth.txt"
+	name          = "ovpn"
+	serversFile   = "/etc/ovpn/servers.json"
+	defaultRunDir = "/run/ovpn"
+	// tunnelInterface is the fixed tun name the tunnel comes up on
+	// (15 characters is the kernel limit).
+	tunnelInterface = "tun-ovpn"
+	// connectTimeout bounds one attempt: management startup, TLS
+	// handshake and the CONNECTED state (the old route poll gave up
+	// after 30 s).
+	connectTimeout = 30 * time.Second
+	// routeTimeout bounds the wait for the pushed redirect-gateway to
+	// become the main-namespace default route after CONNECTED.
+	routeTimeout = 10 * time.Second
 )
 
 //go:embed ca.crt
@@ -60,13 +74,29 @@ func (s Server) hostname() string {
 }
 
 var (
-	serverCache    []Server
-	serverCacheMu  sync.RWMutex
-	activeServer   *Server
-	activeLocation string
-	activeMu       sync.RWMutex
-	loggedIn       bool
+	serverCache   []Server
+	serverCacheMu sync.RWMutex
+	activeMu      sync.RWMutex
+	current       *active
+	loggedIn      bool
 )
+
+// startTunnel launches the owned openvpn; tests replace it.
+var startTunnel = ovpnrun.Start
+
+// active is the owned tunnel and where it goes.
+type active struct {
+	tunnel   *ovpnrun.Tunnel
+	server   Server
+	location string
+}
+
+func runDir() string {
+	if d := os.Getenv("OVPN_RUN_DIR"); d != "" {
+		return d
+	}
+	return defaultRunDir
+}
 
 func init() {
 	provider.Registry[name] = OVPN{}
@@ -158,17 +188,24 @@ func pickRandomServer(servers []Server) *Server {
 	return &s
 }
 
-func writeCredentials(user, pass string) (string, error) {
-	return shared.WriteUserPassFile(configDir, credentialsName, user, pass)
-}
-
-// writeConfig builds the .ovpn from OVPN's directives (taken verbatim from
-// a downloaded config) with the embedded CA + tls-auth and the chosen
-// server's two UDP remotes (1194/1195, remote-random).
-func writeConfig(server *Server, credFile string) (string, error) {
+// buildOpenVPNConfig renders the config from OVPN's directives (taken
+// verbatim from a downloaded config) with the embedded CA + tls-auth and
+// the chosen server's two UDP remotes (1194/1195, remote-random). The
+// transport and data-channel directives are the ones the --daemon version
+// ran with; the credential, interface, MTU clamp (formerly command-line
+// flags) and lifecycle lines changed with the move to the owned process.
+// socket is the management socket the owned openvpn answers on.
+func buildOpenVPNConfig(server *Server, socket string) (string, error) {
+	if !ovpnrun.ValidSocket(socket) {
+		return "", errors.New("invalid OVPN management socket path")
+	}
 	host := server.hostname()
-	config := fmt.Sprintf(`client
-dev tun
+	// --tun-mtu / --mssfix clamp packet size below the k8s pod MTU so
+	// the TLS handshake's UDP packets aren't dropped (same values
+	// ipvanish uses). connect-retry-max 1 tries each remote once.
+	return fmt.Sprintf(`client
+dev %s
+dev-type tun
 tls-version-min 1.0
 cipher CHACHA20-POLY1305
 data-ciphers CHACHA20-POLY1305:AES-256-GCM:AES-256-CBC:AES-128-GCM
@@ -186,48 +223,72 @@ proto udp
 mute-replay-warnings
 replay-window 256
 allow-compression asym
-auth-user-pass %s
 key-direction 1
-<ca>
-%s</ca>
+tun-mtu 1320
+mssfix 1280
+connect-retry-max 1
+%s<ca>
+%s
+</ca>
 <tls-auth>
-%s</tls-auth>
-`, host, host, credFile, embeddedCACert, embeddedTLSAuth)
-
-	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(configDir, activeConfigName)
-	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
-		return "", fmt.Errorf("write config: %w", err)
-	}
-	return path, nil
+%s
+</tls-auth>
+`, tunnelInterface, host, host, ovpnrun.Directives(socket),
+		strings.TrimSpace(embeddedCACert), strings.TrimSpace(embeddedTLSAuth)), nil
 }
 
 // isOpenVPNConnected returns true once the redirect-gateway push has taken
-// effect — a route lookup for an arbitrary public address resolves via
-// tun0, not eth0. The looser "any tun0 route exists" check trips too early
-// (before the default-eclipsing routes), false-positiving the exit-IP
-// contract probe. Same gate as cyberghost / ipvanish. Runs in the MAIN
-// namespace (openvpn is launched via RunCmd, the main-ns default).
+// effect: a route lookup for an arbitrary public address resolves via the
+// tunnel interface, not eth0. The looser "any route on the tun exists"
+// check trips too early (before the default-eclipsing routes),
+// false-positiving the exit-IP contract probe. Runs in the MAIN namespace,
+// where the in-process CONNECT proxy dials with a plain net.DialTimeout.
 func isOpenVPNConnected() bool {
 	out, err := shared.RunCmdSilent(context.Background(), "ip", "route", "get", "8.8.8.8")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(out, " dev tun0 ")
+	return strings.Contains(out, " dev "+tunnelInterface+" ")
+}
+
+func waitForRoute(ctx context.Context, tunnel *ovpnrun.Tunnel) bool {
+	deadline := time.Now().Add(routeTimeout)
+	for time.Now().Before(deadline) && ctx.Err() == nil && tunnel.Address() != "" {
+		if isOpenVPNConnected() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// disconnect stops the owned tunnel, if any, and forgets it.
+func disconnect(ctx context.Context) {
+	activeMu.Lock()
+	a := current
+	current = nil
+	activeMu.Unlock()
+	if a == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+	defer cancel()
+	if err := a.tunnel.Stop(stopCtx); err != nil {
+		shared.Debugf("OVPN: %v", err)
+	}
 }
 
 func (o OVPN) ActiveLocation(ctx context.Context) string {
-	if activeServer == nil {
-		return ""
-	}
 	activeMu.RLock()
 	defer activeMu.RUnlock()
-	return activeLocation
+	if current == nil {
+		return ""
+	}
+	return current.location
 }
 
 func (o OVPN) Connect(ctx context.Context, location string) provider.Status {
+	failed := provider.Status{Connected: false, Provider: name, Location: location}
 	user, pass, err := getCredentials()
 	if err != nil {
 		shared.Debugf("OVPN: %v", err)
@@ -241,66 +302,58 @@ func (o OVPN) Connect(ctx context.Context, location string) provider.Status {
 	matches := findServers(servers, location)
 	if len(matches) == 0 {
 		shared.Debugf("OVPN: no servers for location: %s", location)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		return failed
 	}
 	server := pickRandomServer(matches)
 
-	credFile, err := writeCredentials(user, pass)
+	// One tunnel at a time: drop whatever we own before dialing.
+	disconnect(ctx)
+
+	tunnel, err := startTunnel(ctx, ovpnrun.Options{Name: "OVPN", RunDir: runDir(), User: user, Pass: pass, Timeout: connectTimeout},
+		func(socket string) ([]byte, error) {
+			cfg, err := buildOpenVPNConfig(server, socket)
+			return []byte(cfg), err
+		})
+	if errors.Is(err, ovpnrun.ErrAuthFailed) {
+		// The credential is shared by every pod; when one server
+		// refuses it the runtime skips this location and connects
+		// elsewhere.
+		shared.Debugf("OVPN: %s: %v", server.hostname(), err)
+		failed.AuthFailed = true
+		return failed
+	}
 	if err != nil {
-		shared.Debugf("OVPN: write credentials: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+		shared.Debugf("OVPN: %s: %v", server.hostname(), err)
+		return failed
 	}
-	if _, err := writeConfig(server, credFile); err != nil {
-		shared.Debugf("OVPN: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
+	if !waitForRoute(ctx, tunnel) {
+		shared.Debugf("OVPN: %s: connected but the default route never moved to %s", server.hostname(), tunnelInterface)
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)
+		_ = tunnel.Stop(stopCtx)
+		cancel()
+		return failed
 	}
-
-	// RunCmd (main ns, NOT a netns variant) so openvpn + tun0 land in the
-	// pod's MAIN namespace where the in-process CONNECT proxy lives — the
-	// proxy dials with a plain net.DialTimeout (no fwmark), so tun0 must be
-	// the main-ns default route. --tun-mtu/--mssfix clamp packet size below
-	// the k8s pod MTU so the TLS handshake's UDP packets aren't dropped
-	// (same values ipvanish uses).
-	if _, err := shared.RunCmd(ctx, "openvpn",
-		"--cd", configDir,
-		"--config", activeConfigName,
-		"--tun-mtu", "1320",
-		"--mssfix", "1280",
-		"--daemon"); err != nil {
-		shared.Debugf("OVPN: failed to start openvpn: %v", err)
-		return provider.Status{Connected: false, Provider: name, Location: location}
-	}
-
-	for i := 0; i < 60; i++ {
-		time.Sleep(500 * time.Millisecond)
-		if isOpenVPNConnected() {
-			activeServer = server
-			activeMu.Lock()
-			activeLocation = location
-			activeMu.Unlock()
-			return o.Status(ctx)
-		}
-	}
-	shared.Debugf("OVPN: connection timeout for %s", server.hostname())
-	return provider.Status{Connected: false, Provider: name, Location: location}
+	activeMu.Lock()
+	current = &active{tunnel: tunnel, server: *server, location: location}
+	activeMu.Unlock()
+	return o.Status(ctx)
 }
 
-func (o OVPN) Connected(ctx context.Context) bool { return isOpenVPNConnected() }
+func (o OVPN) Connected(ctx context.Context) bool {
+	activeMu.RLock()
+	a := current
+	activeMu.RUnlock()
+	return a != nil && a.tunnel.Address() != "" && isOpenVPNConnected()
+}
 
 func (o OVPN) Disconnect(ctx context.Context) error {
-	_, _ = shared.RunCmd(ctx, "pkill", "-SIGTERM", "openvpn")
-	for i := 0; i < 20; i++ {
-		if !isOpenVPNConnected() {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	activeServer = nil
-	activeMu.Lock()
-	activeLocation = ""
-	activeMu.Unlock()
+	disconnect(ctx)
 	return nil
 }
+
+// Daemonless marks the tunnel as an owned openvpn child (see
+// provider.Daemonless).
+func (OVPN) Daemonless() {}
 
 func (o OVPN) Locations(ctx context.Context) []string {
 	servers, err := loadServers()
@@ -320,7 +373,11 @@ func (o OVPN) Locations(ctx context.Context) []string {
 	return locations
 }
 
-func (o OVPN) LoggedIn(ctx context.Context) bool { return loggedIn }
+func (o OVPN) LoggedIn(ctx context.Context) bool {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	return loggedIn
+}
 
 func (o OVPN) Login(ctx context.Context) error {
 	if _, _, err := getCredentials(); err != nil {
@@ -329,17 +386,21 @@ func (o OVPN) Login(ctx context.Context) error {
 	if _, err := loadServers(); err != nil {
 		return err
 	}
+	activeMu.Lock()
 	loggedIn = true
+	activeMu.Unlock()
 	return nil
 }
 
 func (o OVPN) Logout(ctx context.Context) error {
+	activeMu.Lock()
 	loggedIn = false
+	activeMu.Unlock()
 	return nil
 }
 
 func (o OVPN) Status(ctx context.Context) provider.Status {
-	if !isOpenVPNConnected() {
+	if !o.Connected(ctx) {
 		return provider.Status{Connected: false, Provider: name}
 	}
 	status := provider.Status{
@@ -355,13 +416,15 @@ func (o OVPN) Status(ctx context.Context) provider.Status {
 }
 
 func activeRegion() string {
-	if activeServer == nil {
+	activeMu.RLock()
+	defer activeMu.RUnlock()
+	if current == nil {
 		return ""
 	}
-	if activeServer.City != "" {
-		return activeServer.Country + " - " + activeServer.City
+	if current.server.City != "" {
+		return current.server.Country + " - " + current.server.City
 	}
-	return activeServer.Country
+	return current.server.Country
 }
 
 func (o OVPN) Version(ctx context.Context) (string, error) {
