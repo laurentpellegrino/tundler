@@ -210,6 +210,10 @@ the exit IP (the probe timed out and the contract soft-passed), a
 background lookup keeps probing (15 s, 30 s, 60 s, then every 2 min)
 until it gets one or the tunnel is replaced. The late exit then lands
 in `/status`, the `x-tundler-exit-ip` header and a `tunnel_up` event.
+A tunnel still without an exit after seven probes (9 min 45 s), or one
+whose probe returns the pre-VPN address, is marked `Failed` so the
+watchdog replaces it; a repeat at the same location holds it like a
+failed connect.
 
 ## Environment knobs
 

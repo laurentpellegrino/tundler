@@ -162,7 +162,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	state.SetAuthHold(time.Time{})
 	state.RecordTunnelUp(location, exitIP)
 	if exitIP == "" {
-		startExitIPBackfill(ctx, state, baselineEgressIP)
+		startExitIPBackfill(ctx, state, providerName, baselineEgressIP)
 	}
 	state.RecordCountry(preferredCountry, currentCountry(location))
 	state.Set(StateReady)
@@ -501,7 +501,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			state.SetAuthHold(time.Time{})
 			state.RecordTunnelUp(location, exitIP)
 			if exitIP == "" {
-				startExitIPBackfill(ctx, state, baselineEgressIP)
+				startExitIPBackfill(ctx, state, providerName, baselineEgressIP)
 			}
 			state.RecordCountry(preferredCountry, currentCountry(location))
 			state.Set(StateReady)

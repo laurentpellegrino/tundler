@@ -231,6 +231,20 @@ func (s *StateTracker) BackfillExitIP(gen uint64, ip string) bool {
 	return true
 }
 
+// MarkTunnelDead moves tunnel number gen from Ready to Failed when it is
+// still the current tunnel and its exit is still unknown, so the
+// watchdog replaces it. Reports the tunnel's location and whether the
+// state changed; a rotation or reconnect in flight is left alone.
+func (s *StateTracker) MarkTunnelDead(gen uint64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tunnelUps != gen || s.currentExitIP != "" || s.state != StateReady {
+		return "", false
+	}
+	s.state = StateFailed
+	return s.currentLocation, true
+}
+
 // SetTunnelUpListener registers a callback fired on every RecordTunnelUp
 // (initial connect, watchdog reconnect, rotation success). Production
 // wires this to proxy.Server.SetExitIP so the in-process CONNECT proxy
