@@ -22,6 +22,11 @@ package main
 // backfillGiveUpAfter, the tunnel is marked Failed and the watchdog
 // replaces it. A probe that returns the pre-VPN baseline is a leak,
 // not an exit, and fails the tunnel the same way.
+//
+// A connect without an exit is not a success at its location until the
+// lookup finds one: counting it as one cleared the location's earlier
+// failure, so a location whose tunnels never carried traffic was never
+// held (one pod went back to the same dead location three times in 8 h).
 
 import (
 	"context"
@@ -94,7 +99,8 @@ func backfillExitIP(ctx context.Context, state *StateTracker, gen uint64, provid
 				fmt.Sprintf("late exit-ip lookup saw the pre-VPN baseline %s, traffic is not tunneled", ip))
 			return
 		}
-		if state.BackfillExitIP(gen, ip) {
+		if location, ok := state.BackfillExitIP(gen, ip); ok {
+			failing.succeeded(location)
 			exits.remember(ip)
 			log.Printf("tundler-tunnel: exit ip %s found %s after the tunnel came up (probe %d)",
 				ip, time.Since(start).Round(time.Second), attempt+1)

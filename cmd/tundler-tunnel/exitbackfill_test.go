@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -184,13 +185,75 @@ func TestBackfillExitIPRejectsAStaleGeneration(t *testing.T) {
 	st.RecordTunnelUp("br", "")
 	old := st.TunnelUpCount()
 	st.RecordTunnelUp("de", "")
-	if st.BackfillExitIP(old, "198.51.100.9") {
+	if _, ok := st.BackfillExitIP(old, "198.51.100.9"); ok {
 		t.Fatal("an exit found for a previous tunnel must be dropped")
 	}
-	if !st.BackfillExitIP(st.TunnelUpCount(), "198.51.100.9") || st.SnapshotCurrentExitIP() != "198.51.100.9" {
-		t.Fatal("the current tunnel's exit must be recorded")
+	if loc, ok := st.BackfillExitIP(st.TunnelUpCount(), "198.51.100.9"); !ok || loc != "de" || st.SnapshotCurrentExitIP() != "198.51.100.9" {
+		t.Fatalf("BackfillExitIP = %q, %v; the current tunnel's exit must be recorded with its location de", loc, ok)
 	}
-	if st.BackfillExitIP(st.TunnelUpCount(), "198.51.100.10") {
+	if _, ok := st.BackfillExitIP(st.TunnelUpCount(), "198.51.100.10"); ok {
 		t.Fatal("a known exit must not be overwritten")
+	}
+}
+
+// failAtThenSucceedElsewhere records one failed connect at location and
+// a later success somewhere else, so the next failure there holds it.
+func failAtThenSucceedElsewhere(c *testClock, location string) {
+	failing.connectFailed(location)
+	c.advance(time.Minute)
+	failing.succeeded("elsewhere")
+	c.advance(time.Minute)
+}
+
+func TestBackfillThatGivesUpHoldsALocationThatFailedBefore(t *testing.T) {
+	c := withFailing(t)
+	withBackfillProbe(t, func(context.Context) (string, error) { return "", errors.New("timeout") })
+	failAtThenSucceedElsewhere(c, "th")
+	st := NewStateTracker("fake")
+	st.RecordTunnelUp("th", "")
+	st.Set(StateReady)
+	backfillExitIP(context.Background(), st, st.TunnelUpCount(), "fake", "", (&noWait{}).wait)
+	if !slices.Equal(failing.held(), []string{"th"}) {
+		t.Fatalf("held = %v, want [th]: a second dead tunnel there after a success elsewhere", failing.held())
+	}
+}
+
+func TestBackfillThatFindsTheExitForgetsTheLocationsFailure(t *testing.T) {
+	c := withFailing(t)
+	withBackfillProbe(t, func(context.Context) (string, error) { return "198.51.100.9", nil })
+	failAtThenSucceedElsewhere(c, "th")
+	st := NewStateTracker("fake")
+	st.RecordTunnelUp("th", "")
+	backfillExitIP(context.Background(), st, st.TunnelUpCount(), "fake", "", (&noWait{}).wait)
+	if d := failing.connectFailed("th"); d != 0 {
+		t.Fatalf("hold = %s; th carried traffic, so its earlier failure is forgotten", d)
+	}
+}
+
+func TestAConnectWithoutAnExitKeepsTheLocationsEarlierFailure(t *testing.T) {
+	c := withFailing(t)
+	failAtThenSucceedElsewhere(c, "th")
+	fp := &fakeProvider{locations: []string{"th"}, connectOK: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stops the late lookup the exit-less connect starts
+	if _, err := connectTunnelAt(ctx, fp, NewStateTracker("fake"), "fake", nil, ""); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if d := failing.connectFailed("th"); d == 0 {
+		t.Fatal("an exit-less connect is not a success: the next failure at th must hold it")
+	}
+}
+
+func TestRotationWithoutAnExitKeepsTheLocationsEarlierFailure(t *testing.T) {
+	c := withFailing(t)
+	failAtThenSucceedElsewhere(c, "th")
+	fp := &fakeProvider{locations: []string{"th"}, connectOK: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := connectWithRetry(ctx, fp, NewStateTracker("fake"), "fake", nil, 1, (&noSleep{}).sleep, ""); err != nil {
+		t.Fatalf("rotation: %v", err)
+	}
+	if d := failing.connectFailed("th"); d == 0 {
+		t.Fatal("an exit-less rotation is not a success: the next failure at th must hold it")
 	}
 }

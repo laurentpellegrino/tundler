@@ -18,7 +18,9 @@ package main
 //     a second time, with the pod connecting fine elsewhere since the
 //     first failure there. A single failure is often the pod or the
 //     network, not the location, and failures with no success anywhere
-//     in between (an outage, a throttled account) hold nothing.
+//     in between (an outage, a throttled account) hold nothing. A
+//     tunnel that comes up without an exit IP is neither until the late
+//     exit lookup (exitbackfill.go) finds one or gives up on it.
 //
 // The hold starts at TUNDLER_FAILING_LOCATION_HOLD (default 24h) and
 // doubles each time the location fails again after its hold ended, up

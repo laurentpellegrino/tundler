@@ -214,21 +214,23 @@ func (s *StateTracker) TunnelUpCount() uint64 {
 // BackfillExitIP records ip as the exit of tunnel number gen when that
 // tunnel is still the current one and its exit is still unknown, then
 // fires the tunnel-up listener with it like RecordTunnelUp does (proxy
-// header, tunnel_up event). Reports whether ip was recorded.
-func (s *StateTracker) BackfillExitIP(gen uint64, ip string) bool {
+// header, tunnel_up event). Reports the tunnel's location and whether ip
+// was recorded.
+func (s *StateTracker) BackfillExitIP(gen uint64, ip string) (string, bool) {
 	s.mu.Lock()
 	if s.tunnelUps != gen || s.currentExitIP != "" || ip == "" {
 		s.mu.Unlock()
-		return false
+		return "", false
 	}
 	s.currentExitIP = ip
+	location := s.currentLocation
 	listener := s.tunnelUpListener
 	s.mu.Unlock()
 
 	if listener != nil {
 		listener(ip)
 	}
-	return true
+	return location, true
 }
 
 // MarkTunnelDead moves tunnel number gen from Ready to Failed when it is

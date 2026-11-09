@@ -152,8 +152,13 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 		noteFailingLocation(providerName, location, "connected without a working exit again", failing.connectFailed(location))
 		return location, fmt.Errorf("connect succeeded but %w (provider=%s location=%s)", err, providerName, location)
 	}
-	failing.succeeded(location)
 	exitIP := exitIPOrProbe(status.IP, observed)
+	if exitIP != "" {
+		// Without an exit the late lookup decides: it forgets the
+		// location's failures once it finds one, and counts a failure
+		// there when it gives up.
+		failing.succeeded(location)
+	}
 	// Boot and watchdog reconnects only record the exit: a reconnect
 	// to the same server legitimately repeats it, so no pool verdict.
 	exits.remember(exitIP)
@@ -482,8 +487,10 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 				}
 				continue
 			}
-			failing.succeeded(location)
 			exitIP := exitIPOrProbe(status.IP, observed)
+			if exitIP != "" {
+				failing.succeeded(location)
+			}
 			if noteRotationExit(location, preferredCountry, exitIP) && attempt < maxAttempts {
 				// A burnt prefix would sit at the crawler's 429 floor
 				// for two minutes before it asks for another rotation;
