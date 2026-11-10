@@ -393,3 +393,107 @@ func TestConnectWithRetryAvoidsARefusedPrefix(t *testing.T) {
 		t.Fatalf("attempts = %d, want 3 (first rotation, refused landing, retry)", sp.attemptCount())
 	}
 }
+
+func TestExitMemoryKnowsWhetherALocationsLastPrefixIsSpent(t *testing.T) {
+	now := time.Unix(1_770_000_000, 0)
+	m := newExitMemoryWithRefused(time.Hour, 24*time.Hour)
+	m.now = func() time.Time { return now }
+	if m.spent("de-berlin") {
+		t.Fatal("a location never connected to is not spent")
+	}
+	m.rememberAt("de-berlin", "1.1.1.1")
+	if !m.spent("de-berlin") || m.spent("de-frankfurt") {
+		t.Fatal("only the location whose last exit is remembered is spent")
+	}
+	if got := m.spentLocations(); len(got) != 1 || got[0] != "de-berlin" {
+		t.Fatalf("spentLocations = %v", got)
+	}
+	// The used memory forgets the prefix after its ttl, and the location with it.
+	now = now.Add(time.Hour)
+	if m.spent("de-berlin") || len(m.spentLocations()) != 0 {
+		t.Fatal("a location is no longer spent once its prefix is forgotten")
+	}
+	// A refused prefix keeps its location spent for the refused memory.
+	m.rememberAt("fr-paris", "2.2.2.2")
+	m.refuse("2.2.2.2")
+	now = now.Add(2 * time.Hour)
+	if !m.spent("fr-paris") {
+		t.Fatal("a refused prefix keeps its location spent")
+	}
+	now = now.Add(24 * time.Hour)
+	if m.spent("fr-paris") {
+		t.Fatal("the refused memory expires too")
+	}
+	// remember without a location records no location.
+	m.remember("3.3.3.3")
+	if len(m.spentLocations()) != 0 {
+		t.Fatal("remember must not record a location")
+	}
+	var none *exitMemory
+	if none.spent("de-berlin") || none.spentLocations() != nil {
+		t.Fatal("nil memory has no spent location")
+	}
+}
+
+func TestRegionWalkSkipsALocationWhoseLastPrefixIsSpent(t *testing.T) {
+	p := newStridedPref(0, 1)
+	p.dwellCap = 10
+	p.exits = newExitMemory(time.Hour)
+	catalog := []string{"de-berlin", "de-frankfurt", "de-munich"}
+	p.exits.rememberAt("de-berlin", "1.1.1.1")
+	for i := 0; i < 30; i++ {
+		if loc, _, _ := p.pick(catalog, nil); loc == "de-berlin" {
+			t.Fatal("pick returned a location whose last exit's prefix is still remembered")
+		}
+	}
+	// Every location of the country spent: the walk looks at its next
+	// country instead.
+	p.exits.rememberAt("de-frankfurt", "1.1.2.1")
+	p.exits.rememberAt("de-munich", "1.1.3.1")
+	if loc, cc, ok := p.pick(append(catalog, "fr-paris"), nil); !ok || loc != "fr-paris" || cc != "FR" {
+		t.Fatalf("pick = (%q, %q, %v), want fr-paris", loc, cc, ok)
+	}
+	// Nothing left anywhere: a spent location beats no location.
+	if loc, _, ok := p.pick(catalog, nil); !ok || loc == "" {
+		t.Fatalf("all-spent pick = (%q, %v)", loc, ok)
+	}
+}
+
+func TestFallbackPickSkipsSpentLocations(t *testing.T) {
+	prevB, prevE := blocked, exits
+	t.Cleanup(func() { blocked, exits = prevB, prevE })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	exits.rememberAt("Toronto", "4.4.4.4")
+	for i := 0; i < 50; i++ {
+		loc, _, err := pickPreferredLocation(nil, []string{"Toronto", "Vancouver"}, nil)
+		if err != nil || loc != "Vancouver" {
+			t.Fatalf("pick = (%q, %v), want Vancouver", loc, err)
+		}
+	}
+	exits.rememberAt("Vancouver", "5.5.5.5")
+	if loc, _, err := pickPreferredLocation(nil, []string{"Toronto", "Vancouver"}, nil); err != nil || loc == "" {
+		t.Fatalf("all-spent pick = (%q, %v)", loc, err)
+	}
+}
+
+func TestRotationDoesNotSpendALoginOnALocationsSpentPrefix(t *testing.T) {
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	pref = nil
+
+	sp := newScriptedProvider([]string{"USA", "Canada"}, []bool{true, true}, []string{"2.2.2.2", "3.3.3.3"})
+	st := NewStateTracker("scripted")
+	ns := &noSleep{}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", []string{"Canada"}, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("first rotation: %v", err)
+	}
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 3, ns.sleep, ""); err != nil {
+		t.Fatalf("second rotation: %v", err)
+	}
+	if sp.attemptCount() != 2 || sp.callsByLocation["Canada"] != 1 {
+		t.Fatalf("the second rotation must go straight to Canada: attempts=%d calls=%v", sp.attemptCount(), sp.callsByLocation)
+	}
+}

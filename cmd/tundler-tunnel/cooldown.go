@@ -170,6 +170,18 @@ func (c *locationCooldown) purgeLocked() {
 // reason=banned; the prefix is then kept for TUNDLER_REFUSED_MEMORY
 // (default 24h) and a rotation that lands in it is treated exactly like
 // a repeat: cool the location and country, retry elsewhere.
+//
+// The memory also keeps, per location, the prefix of the last exit the
+// pod got there, so a pick can skip a location before connecting when
+// that prefix is still remembered. Most locations hand out a single
+// prefix: on 2026-11-10, 44 % of a 15-provider fleet's rotations landed
+// on a prefix the pod had used within the hour, and 3 in 4 of those
+// went back to a location whose last exit was in that very prefix
+// (the country dwell re-picks among a country's two or three
+// locations). Each one cost a login for an exit that served nothing.
+// A location that does have more prefixes is skipped for an hour too;
+// on the same data the skip passed over 284 fresh exits for 973 spent
+// ones avoided, and the pick lands elsewhere, fresh 3 times in 4.
 const (
 	envExitMemory        = "TUNDLER_EXIT_MEMORY"
 	defaultExitMemory    = time.Hour
@@ -184,6 +196,7 @@ type exitMemory struct {
 	now        func() time.Time
 	seen       map[string]time.Time // exit prefix → last seen
 	refused    map[string]time.Time // exit prefix → when the upstream refused it
+	at         map[string]string    // location → prefix of the last exit there
 }
 
 // exitKey reduces an exit address to the prefix the upstream meters:
@@ -218,6 +231,7 @@ func newExitMemoryWithRefused(ttl, refusedTTL time.Duration) *exitMemory {
 		now:        time.Now,
 		seen:       map[string]time.Time{},
 		refused:    map[string]time.Time{},
+		at:         map[string]string{},
 	}
 }
 
@@ -248,6 +262,12 @@ func durationFromEnv(name string, def time.Duration) time.Duration {
 // refusedTTL. "" is never a repeat. A ttl of 0 disables the used-exit
 // memory; the refused memory keeps working on its own.
 func (m *exitMemory) remember(ip string) bool {
+	return m.rememberAt("", ip)
+}
+
+// rememberAt is remember for an exit the pod got at location, which it
+// also records as that location's last prefix (see spent).
+func (m *exitMemory) rememberAt(location, ip string) bool {
 	if m == nil || strings.TrimSpace(ip) == "" {
 		return false
 	}
@@ -256,6 +276,9 @@ func (m *exitMemory) remember(ip string) bool {
 	defer m.mu.Unlock()
 	now := m.now()
 	m.purgeLocked(now)
+	if location = strings.TrimSpace(location); location != "" {
+		m.at[location] = key
+	}
 	_, refused := m.refused[key]
 	if m.ttl <= 0 {
 		return refused
@@ -291,6 +314,37 @@ func (m *exitMemory) isRefused(ip string) bool {
 	return ok
 }
 
+// spent reports whether the prefix of the last exit the pod got at
+// location is still remembered as used or refused: connecting there
+// again would most likely land in it.
+func (m *exitMemory) spent(location string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.purgeLocked(m.now())
+	_, ok := m.at[strings.TrimSpace(location)]
+	return ok
+}
+
+// spentLocations lists every location spent reports true for.
+func (m *exitMemory) spentLocations() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.purgeLocked(m.now())
+	out := make([]string, 0, len(m.at))
+	for loc := range m.at {
+		out = append(out, loc)
+	}
+	return out
+}
+
+// purgeLocked drops expired prefixes, and the locations whose last
+// prefix is no longer remembered.
 func (m *exitMemory) purgeLocked(now time.Time) {
 	for k, at := range m.seen {
 		if now.Sub(at) >= m.ttl {
@@ -300,6 +354,13 @@ func (m *exitMemory) purgeLocked(now time.Time) {
 	for k, at := range m.refused {
 		if now.Sub(at) >= m.refusedTTL {
 			delete(m.refused, k)
+		}
+	}
+	for loc, key := range m.at {
+		_, used := m.seen[key]
+		_, refused := m.refused[key]
+		if !used && !refused {
+			delete(m.at, loc)
 		}
 	}
 }

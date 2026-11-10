@@ -161,7 +161,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	}
 	// Boot and watchdog reconnects only record the exit: a reconnect
 	// to the same server legitimately repeats it, so no pool verdict.
-	exits.remember(exitIP)
+	exits.rememberAt(location, exitIP)
 	hold.clear()
 	throttle.clear()
 	state.SetAuthHold(time.Time{})
@@ -183,7 +183,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 // moves on, so the caller's retry (or the next rotation) picks a
 // different country.
 func noteRotationExit(location, country, exitIP string) bool {
-	if !exits.remember(exitIP) {
+	if !exits.rememberAt(location, exitIP) {
 		return false
 	}
 	if country == "" {

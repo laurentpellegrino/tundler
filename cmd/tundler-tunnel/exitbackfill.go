@@ -101,7 +101,7 @@ func backfillExitIP(ctx context.Context, state *StateTracker, gen uint64, provid
 		}
 		if location, ok := state.BackfillExitIP(gen, ip); ok {
 			failing.succeeded(location)
-			exits.remember(ip)
+			exits.rememberAt(location, ip)
 			log.Printf("tundler-tunnel: exit ip %s found %s after the tunnel came up (probe %d)",
 				ip, time.Since(start).Round(time.Second), attempt+1)
 		}

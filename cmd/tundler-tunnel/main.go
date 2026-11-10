@@ -298,6 +298,7 @@ func main() {
 	pref = newLocationPreference(providerName)
 	if pref != nil {
 		pref.cooldown = blocked
+		pref.exits = exits
 		pref.onSlot = state.SetFleetSlot
 		slot, slots, replicas := pref.position()
 		state.SetFleetSlot(slot)

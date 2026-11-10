@@ -85,6 +85,9 @@ type locationPreference struct {
 	onSlot     func(slot int)
 	// cooldown is the blocked-exit memory consulted by pick (nil = none).
 	cooldown *locationCooldown
+	// exits is the exit memory: a location whose last exit's prefix it
+	// still holds is skipped like a cooling one (nil = none).
+	exits *exitMemory
 	// dwell counts rotations spent at the current position; dwellCap is
 	// how many a pod spends in one country before moving on regardless
 	// of pool evidence (0 = advance on every rotation).
@@ -323,10 +326,11 @@ func (p *locationPreference) choose(offered []string, byCountry map[string][]str
 	return cc, byCountry[cc]
 }
 
-// warm returns the locations of cc that are not cooling, or nil when
-// the country itself is cooling.
+// warm returns the locations of cc that are neither cooling nor spent
+// (their last exit's prefix still in the exit memory), or nil when the
+// country itself is cooling.
 func (p *locationPreference) warm(cc string, locations []string) []string {
-	if p.cooldown == nil {
+	if p.cooldown == nil && p.exits == nil {
 		return locations
 	}
 	if p.cooldown.cooledCountry(cc) {
@@ -334,7 +338,7 @@ func (p *locationPreference) warm(cc string, locations []string) []string {
 	}
 	out := make([]string, 0, len(locations))
 	for _, loc := range locations {
-		if !p.cooldown.cooledLocation(loc) {
+		if !p.cooldown.cooledLocation(loc) && !p.exits.spent(loc) {
 			out = append(out, loc)
 		}
 	}
