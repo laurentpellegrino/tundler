@@ -14,7 +14,7 @@ import (
 
 func TestParseNameservers(t *testing.T) {
 	in := `# kubelet-written
-search example-production.svc.cluster.local svc.cluster.local cluster.local
+search tunnels.svc.cluster.local svc.cluster.local cluster.local
 nameserver 10.0.96.10
 nameserver 10.0.96.10 ; duplicate
 nameserver fd00::53

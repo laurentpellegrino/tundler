@@ -46,7 +46,7 @@ func (r *recorder) run(_ context.Context, name string, args ...string) error {
 }
 
 func TestParseNameservers(t *testing.T) {
-	in := "search example-production.svc.cluster.local\nnameserver 10.0.96.10 # cluster\nnameserver 10.0.96.10\nnameserver fd00::53\nnameserver not-an-ip\noptions ndots:5\n"
+	in := "search tunnels.svc.cluster.local\nnameserver 10.0.96.10 # cluster\nnameserver 10.0.96.10\nnameserver fd00::53\nnameserver not-an-ip\noptions ndots:5\n"
 	got := ParseNameservers(strings.NewReader(in))
 	if len(got) != 2 || got[0].String() != "10.0.96.10" || got[1].String() != "fd00::53" {
 		t.Fatalf("got %v", got)

@@ -11,7 +11,7 @@ For local development, use the already authenticated Bao CLI:
 
 ```sh
 export BAO_ADDR=https://bao.elaunira.com
-export BAO_NAMESPACE=example/production
+export BAO_NAMESPACE=<namespace>
 export TUNDLER_ACCOUNT_USERNAME="$(bao kv get -field=username kv/vpn/hidemyass)"
 export TUNDLER_ACCOUNT_PASSWORD="$(bao kv get -field=password kv/vpn/hidemyass)"
 ```

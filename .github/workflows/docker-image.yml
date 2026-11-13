@@ -38,9 +38,8 @@ jobs:
 
   # Per-provider tunnel images. One image per VPN provider, each
   # containing only that provider's CLI + the tundler-tunnel binary.
-  # Consumed by the per-provider StatefulSets in
-  # example-kubernetes/clusters/production/example-crawl/
-  # statefulset-tundler-tunnel-<provider>.yaml.
+  # Consumed by the per-provider StatefulSets of the deployment
+  # manifests (statefulset-tundler-tunnel-<provider>.yaml).
   build-tundler-tunnel:
     needs: test
     runs-on: ubuntu-latest
