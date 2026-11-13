@@ -88,6 +88,9 @@ type locationPreference struct {
 	// exits is the exit memory: a location whose last exit's prefix it
 	// still holds is skipped like a cooling one (nil = none).
 	exits *exitMemory
+	// advised is the list of locations the last rotation request named
+	// to skip (advice.go, nil = none).
+	advised *advisedLocations
 	// dwell counts rotations spent at the current position; dwellCap is
 	// how many a pod spends in one country before moving on regardless
 	// of pool evidence (0 = advance on every rotation).
@@ -326,11 +329,11 @@ func (p *locationPreference) choose(offered []string, byCountry map[string][]str
 	return cc, byCountry[cc]
 }
 
-// warm returns the locations of cc that are neither cooling nor spent
-// (their last exit's prefix still in the exit memory), or nil when the
-// country itself is cooling.
+// warm returns the locations of cc that are neither cooling, spent
+// (their last exit's prefix still in the exit memory) nor named by the
+// rotation request, or nil when the country itself is cooling.
 func (p *locationPreference) warm(cc string, locations []string) []string {
-	if p.cooldown == nil && p.exits == nil {
+	if p.cooldown == nil && p.exits == nil && p.advised == nil {
 		return locations
 	}
 	if p.cooldown.cooledCountry(cc) {
@@ -338,7 +341,7 @@ func (p *locationPreference) warm(cc string, locations []string) []string {
 	}
 	out := make([]string, 0, len(locations))
 	for _, loc := range locations {
-		if !p.cooldown.cooledLocation(loc) && !p.exits.spent(loc) {
+		if !p.cooldown.cooledLocation(loc) && !p.exits.spent(loc) && !p.advised.skip(loc) {
 			out = append(out, loc)
 		}
 	}

@@ -84,6 +84,9 @@ func pickPreferredLocation(pref *locationPreference, locations, excluded []strin
 	if spent := exits.spentLocations(); len(spent) > 0 {
 		log.Printf("tundler-tunnel: skipping %d location(s) whose last exit prefix is still in the exit memory", len(spent))
 	}
+	if n := advised.count(); n > 0 {
+		log.Printf("tundler-tunnel: skipping %d location(s) named by the rotation request", n)
+	}
 	withHeld := append(append([]string{}, excluded...), held...)
 	if len(unsettled) > 0 {
 		avoid := append(append([]string{}, withHeld...), unsettled...)
@@ -109,10 +112,10 @@ func pickUnheldLocation(pref *locationPreference, locations, excluded []string) 
 			return loc, country, nil
 		}
 	}
-	// The random fallback skips cooling and spent locations too; when
-	// that leaves nothing they are ignored rather than failing the
-	// connect.
-	if cooled := append(blocked.cooledLocations(), exits.spentLocations()...); len(cooled) > 0 {
+	// The random fallback skips cooling, spent and advised locations
+	// too; when that leaves nothing they are ignored rather than
+	// failing the connect.
+	if cooled := append(append(blocked.cooledLocations(), exits.spentLocations()...), advised.list()...); len(cooled) > 0 {
 		if loc, err := pickLocation(locations, append(append([]string{}, excluded...), cooled...)); err == nil {
 			return loc, "", nil
 		}

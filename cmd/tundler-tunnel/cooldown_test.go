@@ -84,7 +84,7 @@ func TestRotateHandlerReasonIsLoggedNotActedOn(t *testing.T) {
 	if blocked.cooledLocation("Belgium") || blocked.cooledCountry("BE") {
 		t.Fatal("reason=blocked must not cool the location or country")
 	}
-	if got := rotateReason(httptest.NewRequest(http.MethodPost, "/rotate?reason=Blocked", nil)); got != "blocked" {
+	if got := readRotateRequest(httptest.NewRequest(http.MethodPost, "/rotate?reason=Blocked", nil)).Reason; got != "blocked" {
 		t.Fatalf("query reason = %q", got)
 	}
 }

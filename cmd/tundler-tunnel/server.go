@@ -139,8 +139,12 @@ func statusHandler(state *StateTracker, tunnelID, nodeIP string, imp BrowserIden
 			CooledLocations      int    `json:"cooled_locations"`
 			CooledCountries      int    `json:"cooled_countries"`
 			HeldLocations        int    `json:"held_locations"`
+			// AdvisedLocations is always present: it tells a caller
+			// that this pod reads avoid_locations on POST /rotate.
+			AdvisedLocations int `json:"advised_locations"`
 		}{snap, tunnelID, nodeIP, imp.Profile, imp.UserAgent,
-			exits.size(), exits.refusedSize(), cooledLocations, cooledCountries, failing.heldCount()}
+			exits.size(), exits.refusedSize(), cooledLocations, cooledCountries, failing.heldCount(),
+			advised.count()}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
@@ -198,7 +202,8 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 		// the prefix goes into the refused memory and its location and
 		// country are cooled (noteRefusedExit) before the rotation
 		// re-picks.
-		if reason := rotateReason(r); reason != "" {
+		req := readRotateRequest(r)
+		if reason := req.Reason; reason != "" {
 			log.Printf("tundler-tunnel: /rotate reason=%s (location=%s country=%s exit_ip=%s)",
 				reason, snap.CurrentLocation, snap.CurrentCountry, snap.CurrentExitIP)
 			if reason == rotateReasonBanned {
@@ -228,6 +233,12 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 						since.Round(time.Second), minTimeBetweenRotations),
 				})
 				return
+			}
+			// The caller may name locations to skip for this pick (see
+			// advice.go). Stored only here, where a rotation starts: a
+			// held or debounced request picks nothing.
+			if n := advised.set(req.Avoid); n > 0 {
+				log.Printf("tundler-tunnel: /rotate names %d location(s) to skip for this pick", n)
 			}
 			go trigger()
 			w.Header().Set("Content-Type", "application/json")
@@ -264,23 +275,34 @@ func rotateHandler(state *StateTracker, trigger RotateTrigger) http.HandlerFunc 
 	}
 }
 
-// rotateReason reads the optional reason from the JSON body
-// ({"reason": "..."}) or the `reason` query parameter. Malformed or
-// empty bodies yield "".
-func rotateReason(r *http.Request) string {
+// maxRotateBody bounds the POST /rotate body: a reason and up to
+// maxAdvisedLocations names.
+const maxRotateBody = 64 << 10
+
+// rotateRequest is the optional JSON body of POST /rotate.
+type rotateRequest struct {
+	// Reason is why the caller wants another exit ("blocked",
+	// "banned", ...); the `reason` query parameter overrides it.
+	Reason string `json:"reason"`
+	// Avoid names locations to skip for this pick (see advice.go).
+	Avoid []string `json:"avoid_locations"`
+}
+
+// readRotateRequest reads the optional body ({"reason": "...",
+// "avoid_locations": [...]}) and the `reason` query parameter. A
+// malformed, oversize or empty body yields no reason and no list.
+func readRotateRequest(r *http.Request) rotateRequest {
+	var req rotateRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxRotateBody)).Decode(&req); err != nil {
+			req = rotateRequest{}
+		}
+	}
 	if q := strings.TrimSpace(r.URL.Query().Get("reason")); q != "" {
-		return strings.ToLower(q)
+		req.Reason = q
 	}
-	if r.Body == nil {
-		return ""
-	}
-	var body struct {
-		Reason string `json:"reason"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(body.Reason))
+	req.Reason = strings.ToLower(strings.TrimSpace(req.Reason))
+	return req
 }
 
 // problemDetails is the RFC 9457 "Problem Details for HTTP APIs" shape.

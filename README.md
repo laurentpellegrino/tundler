@@ -171,9 +171,16 @@ it; `reason=banned` (the exit answered 406/403, an IP-level refusal
 that was still in force a day later on 2026-10-25) puts the exit's
 prefix into a separate refused memory for `TUNDLER_REFUSED_MEMORY`
 (default 24h), cools its location and country, and makes any later
-rotation that lands in that prefix retry elsewhere. `/status` reports
-`used_exit_prefixes`, `refused_exit_prefixes`, `cooled_locations` and
-`cooled_countries`.
+rotation that lands in that prefix retry elsewhere. The body may also
+carry `avoid_locations`, a list of location names as `/status` reports
+them in `current_location`: a caller that sees every pod's exits names
+the locations that would hand this pod a prefix a sibling used within
+the quota window, and the pick for that one rotation skips them. The
+list is dropped once a tunnel comes up and ignored when nothing else is
+left. `/status` reports `used_exit_prefixes`, `refused_exit_prefixes`,
+`cooled_locations`, `cooled_countries` and `advised_locations` (the
+size of the list in force; the field's presence tells a caller the pod
+reads `avoid_locations`).
 
 ## Build & run
 

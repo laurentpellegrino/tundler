@@ -286,6 +286,7 @@ func main() {
 	// BEFORE any goroutine can connect, so every pick goes through it.
 	blocked = newLocationCooldownFromEnv()
 	exits = newExitMemoryFromEnv()
+	advised = newAdvisedLocations()
 	log.Printf("tundler-tunnel: exhausted-pool cool-down %s (%s), exit memory %s (%s), refused-exit memory %s (%s)",
 		blocked.ttl, envBlockedCooldown, exits.ttl, envExitMemory, exits.refusedTTL, envRefusedMemory)
 	hold = newAuthHoldFromEnv()
@@ -299,6 +300,7 @@ func main() {
 	if pref != nil {
 		pref.cooldown = blocked
 		pref.exits = exits
+		pref.advised = advised
 		pref.onSlot = state.SetFleetSlot
 		slot, slots, replicas := pref.position()
 		state.SetFleetSlot(slot)

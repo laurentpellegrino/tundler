@@ -186,7 +186,7 @@ by the recent rotation.
 | GET    | `/livez`  | `200` (always)                                                          |
 | GET    | `/readyz` | `200` iff `state == Ready`, else `503`                                  |
 | GET    | `/status` | JSON snapshot (state, current_location, current_exit_ip, last_rotation) |
-| POST   | `/rotate` | `202` accepted, `200` debounced/idempotent, `409` problem-details; optional `{"reason":"blocked"}` body cools the current location |
+| POST   | `/rotate` | `202` accepted, `200` debounced/idempotent, `409` problem-details; optional JSON body: `"reason"` (logged; `"banned"` refuses the exit's prefix) and `"avoid_locations"` (names to skip for this pick) |
 
 ## CONNECT proxy (`:8485`)
 
@@ -278,4 +278,7 @@ the next country while it has attempts left (the last attempt keeps
 what it got), the preferred walk skips cooled entries by moving
 further along the pod's own positions, the random fallback excludes
 cooled locations, and a fully cooled catalog ignores the cool-down. `POST /rotate` with `{"reason":"..."}` (or `?reason=`) is
-logged only.
+logged only. `{"avoid_locations":["..."]}` in the same body names
+locations to skip for that one pick (`advice.go`): the walk and the
+fallback treat them like cooled ones, the list is dropped when a tunnel
+comes up, and a fully named catalog ignores it.

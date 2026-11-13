@@ -169,6 +169,7 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	hold.clear()
 	throttle.clear()
 	state.SetAuthHold(time.Time{})
+	advised.clear()
 	state.RecordTunnelUp(location, exitIP)
 	if exitIP == "" {
 		startExitIPBackfill(ctx, state, providerName, baselineEgressIP)
@@ -520,6 +521,7 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			hold.clear()
 			throttle.clear()
 			state.SetAuthHold(time.Time{})
+			advised.clear()
 			state.RecordTunnelUp(location, exitIP)
 			if exitIP == "" {
 				startExitIPBackfill(ctx, state, providerName, baselineEgressIP)
