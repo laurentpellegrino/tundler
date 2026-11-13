@@ -331,7 +331,16 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 			break
 		}
 		server := &matches[idx]
-		tunnel, err := startTunnel(ctx, server, user, pass)
+		dial := func() (*ovpn.Tunnel, error) { return startTunnel(ctx, server, user, pass) }
+		var tunnel *ovpn.Tunnel
+		var err error
+		if transport() == transportWarp {
+			// A WARP session that lost the provider's servers is
+			// replaced and the server dialed once more.
+			tunnel, err = warpproxy.DialThrough(ctx, dial)
+		} else {
+			tunnel, err = dial()
+		}
 		if errors.Is(err, ovpn.ErrAuthFailed) {
 			// Account-wide: another server would be one more login
 			// against the rate rule. Report it so the runtime holds.

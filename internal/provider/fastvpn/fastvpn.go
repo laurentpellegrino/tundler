@@ -92,6 +92,10 @@ const (
 	// handshake and the CONNECTED state (the old route poll gave up
 	// after 30 s).
 	connectTimeout = 30 * time.Second
+	// proxyErrorLimit: a city config lists several remotes and openvpn
+	// tries the next one every 5 s; two in a row stopped by the proxy
+	// say it is the proxy, not one remote.
+	proxyErrorLimit = 2
 	// routeTimeout bounds the wait for the pushed redirect-gateway to
 	// become the main-namespace default route after CONNECTED.
 	routeTimeout = 10 * time.Second
@@ -431,8 +435,18 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 	// One tunnel at a time: drop whatever we own before dialing.
 	disconnect(ctx)
 
-	tunnel, err := startTunnel(ctx, ovpn.Options{Name: "FastVPN", RunDir: runDir(), CD: configDir(), User: user, Pass: pass, Timeout: connectTimeout},
-		func(socket string) ([]byte, error) { return openVPNConfig(vendor, socket, viaWarp) })
+	dial := func() (*ovpn.Tunnel, error) {
+		return startTunnel(ctx, ovpn.Options{Name: "FastVPN", RunDir: runDir(), CD: configDir(), User: user, Pass: pass, Timeout: connectTimeout, ProxyErrorLimit: proxyErrorLimit},
+			func(socket string) ([]byte, error) { return openVPNConfig(vendor, socket, viaWarp) })
+	}
+	var tunnel *ovpn.Tunnel
+	if viaWarp {
+		// A WARP session that lost the provider's servers is replaced
+		// and the city dialed once more.
+		tunnel, err = warpproxy.DialThrough(ctx, dial)
+	} else {
+		tunnel, err = dial()
+	}
 	if errors.Is(err, ovpn.ErrAuthFailed) {
 		// The credential is shared by every pod; when one edge refuses
 		// it the runtime skips this location and connects elsewhere.

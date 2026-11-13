@@ -66,6 +66,10 @@ type Options struct {
 	// Timeout bounds the attempt: management startup, handshake and
 	// the CONNECTED state (default 35 s).
 	Timeout time.Duration
+	// ProxyErrorLimit ends the attempt with ErrProxyFailed after this
+	// many SOCKS proxy errors in a row, instead of letting openvpn try
+	// its remotes through the same proxy until Timeout (0 = no limit).
+	ProxyErrorLimit int
 }
 
 // Directives is the management block a config must contain, with the
@@ -97,8 +101,10 @@ type Tunnel struct {
 	failed     bool
 	authFailed bool
 	// proxyFailed: the last connection attempt ended on a SOCKS proxy
-	// error. A later attempt that gets further clears it.
+	// error; proxyErrors counts them in a row. A later attempt that
+	// gets further clears both.
 	proxyFailed bool
+	proxyErrors int
 	degraded    bool // CONNECTED,ERROR: up, but a setup step failed
 	ready       bool // Launch returned it connected
 	stopping    bool // Stop was called: an exit is expected
@@ -204,8 +210,13 @@ func (t *Tunnel) monitor(user, pass string) {
 				switch fields[1] {
 				case "RECONNECTING":
 					t.proxyFailed = fields[2] == "socks-error"
+					if t.proxyFailed {
+						t.proxyErrors++
+					} else {
+						t.proxyErrors = 0
+					}
 				case "WAIT", "AUTH", "GET_CONFIG", "ASSIGN_IP", "ADD_ROUTES", "CONNECTED":
-					t.proxyFailed = false
+					t.proxyFailed, t.proxyErrors = false, 0
 				}
 			}
 			t.mu.Unlock()
@@ -305,13 +316,16 @@ func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel
 			return t, nil
 		}
 		t.mu.RLock()
-		failed, authFailed := t.failed, t.authFailed
+		failed, authFailed, proxyErrors := t.failed, t.authFailed, t.proxyErrors
 		t.mu.RUnlock()
 		if authFailed {
 			return nil, ErrAuthFailed
 		}
 		if failed {
 			return nil, failure("management failed before connecting")
+		}
+		if opts.ProxyErrorLimit > 0 && proxyErrors >= opts.ProxyErrorLimit {
+			return nil, failure(fmt.Sprintf("gave up after %d proxy errors in a row", proxyErrors))
 		}
 		select {
 		case <-deadline.Done():

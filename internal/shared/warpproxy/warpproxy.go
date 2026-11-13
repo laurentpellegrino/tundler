@@ -22,11 +22,14 @@ package warpproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
 	"github.com/laurentpellegrino/tundler/internal/shared"
+	"github.com/laurentpellegrino/tundler/internal/shared/ovpn"
 )
 
 const (
@@ -88,13 +91,87 @@ func Up(ctx context.Context) error {
 	if _, err := run(ctx, "connect"); err != nil {
 		return fmt.Errorf("warp connect: %w", err)
 	}
+	return waitOn(ctx)
+}
+
+// waitOn polls until the proxy forwards, for at most 30 s.
+func waitOn(ctx context.Context) error {
 	for i := 0; i < 60; i++ {
 		if On(ctx) {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("warp proxy did not reach warp=on within 30s")
+}
+
+// reconnectPause is how long the session stays down between the
+// disconnect and the connect of Reconnect.
+const reconnectPause = 2 * time.Second
+
+// Reconnect ends the WARP session and starts a new one on the same
+// registration.
+//
+// A session can lose the provider's servers while everything else
+// still forwards, so On keeps saying yes. Measured on a stuck pod on
+// 2026-11-13: warp-cli reported "Connected, Network: healthy" and an
+// unrelated site answered through the proxy in 35 ms, while three
+// provider servers each got SOCKS reply 4 (host unreachable) after 5 s;
+// a sibling pod reached the same three servers at the same moment.
+// After a disconnect and connect the session came back in 2 s on
+// another egress and reached all three. Left alone, such a session
+// stayed that way for 2 to 45 minutes.
+func Reconnect(ctx context.Context) error {
+	if _, err := run(ctx, "disconnect"); err != nil {
+		return fmt.Errorf("warp disconnect: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(reconnectPause):
+	}
+	if _, err := run(ctx, "connect"); err != nil {
+		return fmt.Errorf("warp connect: %w", err)
+	}
+	return waitOn(ctx)
+}
+
+// DialThrough runs dial, which starts an OpenVPN tunnel through the
+// proxy. When the proxy could not reach the server
+// (ovpn.ErrProxyFailed) it starts a new WARP session and runs dial once
+// more, so a session that lost the provider costs one slower connect
+// instead of a failed one.
+//
+// The error is still ovpn.ErrProxyFailed when no new session could be
+// started. When the new session cannot reach the server either, the
+// session is no longer the suspect and the error is a plain one, which
+// callers count against the location.
+func DialThrough(ctx context.Context, dial func() (*ovpn.Tunnel, error)) (*ovpn.Tunnel, error) {
+	return dialThrough(ctx, dial, Reconnect)
+}
+
+func dialThrough(ctx context.Context, dial func() (*ovpn.Tunnel, error), reconnect func(context.Context) error) (*ovpn.Tunnel, error) {
+	tunnel, err := dial()
+	if !errors.Is(err, ovpn.ErrProxyFailed) {
+		return tunnel, err
+	}
+	log.Printf("warpproxy: %v; starting a new WARP session and dialing once more", err)
+	if rerr := reconnect(ctx); rerr != nil {
+		log.Printf("warpproxy: no new WARP session: %v", rerr)
+		return nil, err
+	}
+	tunnel, err = dial()
+	switch {
+	case err == nil:
+		log.Printf("warpproxy: connected on the new WARP session")
+	case errors.Is(err, ovpn.ErrProxyFailed):
+		return nil, fmt.Errorf("%v, on a new WARP session too", err)
+	}
+	return tunnel, err
 }
 
 // origDefaultGateway returns the eth0 next-hop from the main table's

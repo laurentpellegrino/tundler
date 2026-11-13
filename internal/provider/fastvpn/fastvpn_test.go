@@ -3,6 +3,7 @@ package fastvpn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,6 +136,20 @@ func TestConnectReportsOtherFailuresAsPlainFailures(t *testing.T) {
 	})
 	if st := (FastVPN{}).Connect(context.Background(), "Ecuador"); st.Connected || st.AuthFailed {
 		t.Fatalf("status = %+v, want a plain failure", st)
+	}
+}
+
+func TestConnectReportsAConnectTheProxyStopped(t *testing.T) {
+	var opts ovpn.Options
+	withCity(t, func(_ context.Context, o ovpn.Options, _ func(string) ([]byte, error)) (*ovpn.Tunnel, error) {
+		opts = o
+		return nil, fmt.Errorf("FastVPN OpenVPN gave up: %w", ovpn.ErrProxyFailed)
+	})
+	if st := (FastVPN{}).Connect(context.Background(), "Ecuador"); st.Connected || st.AuthFailed || !st.ProxyFailed {
+		t.Fatalf("status = %+v, want ProxyFailed", st)
+	}
+	if opts.ProxyErrorLimit != proxyErrorLimit {
+		t.Fatalf("ProxyErrorLimit = %d, want %d: a dead proxy must not cost the whole connect timeout", opts.ProxyErrorLimit, proxyErrorLimit)
 	}
 }
 

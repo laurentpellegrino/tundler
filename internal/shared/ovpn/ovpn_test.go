@@ -279,3 +279,39 @@ func TestLaunchFailureAfterTheProxyForwardedIsNotAProxyFailure(t *testing.T) {
 		t.Fatalf("a tls-error restart was blamed on the proxy: tunnel=%v err=%v", tunnel, err)
 	}
 }
+
+func TestLaunchGivesUpAtTheProxyErrorLimit(t *testing.T) {
+	socket, peer := managementFixture(t, "u", "p", false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		conn := <-peer
+		_, _ = io.WriteString(conn, ">STATE:1,RECONNECTING,socks-error,,,,,\n>STATE:2,TCP_CONNECT,,,,,,\n>STATE:3,RECONNECTING,socks-error,,,,,\n")
+	}()
+	started := time.Now()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u", Pass: "p", Timeout: 4 * time.Second, ProxyErrorLimit: 2}, "client.ovpn", socket)
+	if tunnel != nil || !errors.Is(err, ErrProxyFailed) {
+		t.Fatalf("two proxy errors in a row must end the attempt as a proxy failure: tunnel=%v err=%v", tunnel, err)
+	}
+	if took := time.Since(started); took > 2*time.Second {
+		t.Fatalf("the attempt waited %s instead of giving up at the limit", took)
+	}
+}
+
+func TestProxyErrorLimitCountsOnlyErrorsInARow(t *testing.T) {
+	socket, peer := managementFixture(t, "u", "p", false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		conn := <-peer
+		// One remote stopped by the proxy, the next one reached, then
+		// one more proxy error: never two in a row, and the tunnel
+		// comes up in the end.
+		_, _ = io.WriteString(conn, ">STATE:1,RECONNECTING,socks-error,,,,,\n>STATE:2,WAIT,,,,,,\n>STATE:3,RECONNECTING,socks-error,,,,,\n>STATE:4,CONNECTED,SUCCESS,10.20.30.40,192.0.2.10,1194\n")
+	}()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u", Pass: "p", Timeout: 2 * time.Second, ProxyErrorLimit: 2}, "client.ovpn", socket)
+	if err != nil || tunnel == nil {
+		t.Fatalf("proxy errors that are not in a row must not end the attempt: err=%v", err)
+	}
+	_ = tunnel.Stop(ctx)
+}
