@@ -222,3 +222,60 @@ func TestConnectedWithErrorsCountsAsUpAndIsLogged(t *testing.T) {
 		t.Fatalf("the degraded connect was not logged:\n%s", logs.String())
 	}
 }
+
+func TestLaunchClassifiesAProxyThatCannotReachTheServer(t *testing.T) {
+	socket, peer := managementFixture(t, "u", "p", false)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		conn := <-peer
+		// The proxy accepted the connection, then answered that it
+		// could not open one to the server; openvpn gives up.
+		_, _ = io.WriteString(conn, ">STATE:1,TCP_CONNECT,,,,,,\n>STATE:2,RECONNECTING,socks-error,,,,,\n>FATAL:All connections have been connect-retry-max (1) times unsuccessful, exiting\n")
+	}()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u", Pass: "p"}, "client.ovpn", socket)
+	if tunnel != nil || !errors.Is(err, ErrProxyFailed) {
+		t.Fatalf("a socks-error was not classified: tunnel=%v err=%v", tunnel, err)
+	}
+}
+
+func TestLaunchTimeoutAfterProxyErrorsIsAProxyFailure(t *testing.T) {
+	socket, peer := managementFixture(t, "u", "p", false)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		conn := <-peer
+		// Several remotes, each stopped by the proxy, until the attempt times out.
+		_, _ = io.WriteString(conn, ">STATE:1,RECONNECTING,socks-error,,,,,\n>STATE:2,TCP_CONNECT,,,,,,\n>STATE:3,RECONNECTING,socks-error,,,,,\n>STATE:4,TCP_CONNECT,,,,,,\n")
+	}()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u", Pass: "p", Timeout: 300 * time.Millisecond}, "client.ovpn", socket)
+	if tunnel != nil || !errors.Is(err, ErrProxyFailed) {
+		t.Fatalf("a timeout on proxy errors was not classified: tunnel=%v err=%v", tunnel, err)
+	}
+}
+
+func TestLaunchFailureAfterTheProxyForwardedIsNotAProxyFailure(t *testing.T) {
+	socket, peer := managementFixture(t, "u", "p", false)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		conn := <-peer
+		// One remote stopped by the proxy, the next one reached (WAIT:
+		// the server is being talked to) and then timed out on its own.
+		_, _ = io.WriteString(conn, ">STATE:1,RECONNECTING,socks-error,,,,,\n>STATE:2,TCP_CONNECT,,,,,,\n>STATE:3,WAIT,,,,,,\n")
+	}()
+	tunnel, err := Launch(ctx, Options{Name: "Test", User: "u", Pass: "p", Timeout: 300 * time.Millisecond}, "client.ovpn", socket)
+	if tunnel != nil || err == nil || errors.Is(err, ErrProxyFailed) {
+		t.Fatalf("a server-side timeout was blamed on the proxy: tunnel=%v err=%v", tunnel, err)
+	}
+	// A restart for another reason is not a proxy failure either.
+	socket, peer = managementFixture(t, "u", "p", false)
+	go func() {
+		conn := <-peer
+		_, _ = io.WriteString(conn, ">STATE:1,RECONNECTING,socks-error,,,,,\n>STATE:2,RECONNECTING,tls-error,,,,,\n")
+	}()
+	tunnel, err = Launch(ctx, Options{Name: "Test", User: "u", Pass: "p", Timeout: 300 * time.Millisecond}, "client.ovpn", socket)
+	if tunnel != nil || err == nil || errors.Is(err, ErrProxyFailed) {
+		t.Fatalf("a tls-error restart was blamed on the proxy: tunnel=%v err=%v", tunnel, err)
+	}
+}

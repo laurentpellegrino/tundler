@@ -442,6 +442,7 @@ func (f FastVPN) Connect(ctx context.Context, location string) provider.Status {
 	}
 	if err != nil {
 		shared.Debugf("FastVPN: %s/%s: %v", server.Country, server.City, err)
+		failed.ProxyFailed = errors.Is(err, ovpn.ErrProxyFailed)
 		return failed
 	}
 	if !waitForRoute(ctx, tunnel) {

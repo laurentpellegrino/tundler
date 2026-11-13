@@ -341,8 +341,11 @@ func (i IPVanish) Connect(ctx context.Context, location string) provider.Status 
 		}
 		if err != nil {
 			shared.Debugf("IPVanish: %s: %v", server.Hostname, err)
+			// The proxy is at fault only when it stopped every server tried.
+			failed.ProxyFailed = errors.Is(err, ovpn.ErrProxyFailed) && (idx == 0 || failed.ProxyFailed)
 			continue
 		}
+		failed.ProxyFailed = false
 		if !waitForRoute(ctx, tunnel) {
 			shared.Debugf("IPVanish: %s: connected but the default route never moved to %s", server.Hostname, tunnelInterface)
 			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 7*time.Second)

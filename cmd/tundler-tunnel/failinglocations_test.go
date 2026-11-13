@@ -235,3 +235,36 @@ func TestEveryLocationFailedSinceTheLastSuccessIsTriedAgain(t *testing.T) {
 		t.Fatalf("an outage must not leave the pod without a pick: %q, %v", loc, err)
 	}
 }
+
+func TestAConnectStoppedByTheOuterProxyIsNotHeldAgainstTheLocation(t *testing.T) {
+	c := withFailing(t)
+	prevB, prevE, prevP := blocked, exits, pref
+	t.Cleanup(func() { blocked, exits, pref = prevB, prevE, prevP })
+	blocked, _ = newTestCooldown(time.Hour)
+	exits = newExitMemory(time.Hour)
+	pref = nil
+
+	// USA failed once and the pod connected elsewhere since: its next
+	// failure holds it. The proxy then stops two connects there, one
+	// on the rotation path and one on the boot and watchdog path.
+	failAtThenSucceedElsewhere(c, "USA")
+	sp := newScriptedProvider([]string{"USA"}, nil, nil)
+	sp.proxyFailures = map[int]bool{1: true, 2: true}
+	st := NewStateTracker("scripted")
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 1, (&noSleep{}).sleep, ""); err == nil {
+		t.Fatal("a rotation stopped by the proxy is still a failed rotation")
+	}
+	if _, err := connectTunnelAt(context.Background(), sp, st, "scripted", nil, ""); err == nil {
+		t.Fatal("a connect stopped by the proxy is still a failed connect")
+	}
+	if got := failing.held(); len(got) != 0 {
+		t.Fatalf("proxy failures held %v", got)
+	}
+	// The same failure at the location itself does hold it.
+	if err := connectWithRetry(context.Background(), sp, st, "scripted", nil, 1, (&noSleep{}).sleep, ""); err == nil {
+		t.Fatal("attempt 3 fails at the location")
+	}
+	if !slices.Equal(failing.held(), []string{"USA"}) {
+		t.Fatalf("held = %v, want [USA]", failing.held())
+	}
+}

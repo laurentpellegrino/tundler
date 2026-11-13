@@ -19,6 +19,7 @@ type scriptedProvider struct {
 	mu             sync.Mutex
 	attempt        int
 	connectOutcomes []bool   // index by attempt-1: true=success, false=fail
+	proxyFailures   map[int]bool // attempts (1-based) that fail at the outer proxy
 	callsByLocation map[string]int
 	exitIPs         []string // exit IP per attempt
 }
@@ -38,6 +39,9 @@ func (s *scriptedProvider) Connect(_ context.Context, location string) provider.
 	s.attempt++
 	s.callsByLocation[location]++
 	i := s.attempt - 1
+	if s.proxyFailures[s.attempt] {
+		return provider.Status{Connected: false, Location: location, ProxyFailed: true}
+	}
 	if i >= len(s.connectOutcomes) {
 		return provider.Status{Connected: false}
 	}

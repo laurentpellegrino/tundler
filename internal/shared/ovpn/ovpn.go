@@ -42,6 +42,14 @@ import (
 // (provider.Status.AuthFailed) rather than retrying elsewhere.
 var ErrAuthFailed = errors.New("OpenVPN rejected the account credentials (AUTH_FAILED)")
 
+// ErrProxyFailed is a connect that never reached the server: the SOCKS
+// proxy the config dials through answered that it could not open the
+// connection (OpenVPN restarts with the reason "socks-error"). The
+// server and the account were never asked anything, so callers report
+// it as a transport failure (provider.Status.ProxyFailed) rather than
+// as a fault of the location.
+var ErrProxyFailed = errors.New("the SOCKS proxy could not reach the OpenVPN server")
+
 // Options describe one connection attempt.
 type Options struct {
 	// Name labels errors ("IPVanish", "ProtonVPN").
@@ -88,9 +96,12 @@ type Tunnel struct {
 	up         bool
 	failed     bool
 	authFailed bool
-	degraded   bool // CONNECTED,ERROR: up, but a setup step failed
-	ready      bool // Launch returned it connected
-	stopping   bool // Stop was called: an exit is expected
+	// proxyFailed: the last connection attempt ended on a SOCKS proxy
+	// error. A later attempt that gets further clears it.
+	proxyFailed bool
+	degraded    bool // CONNECTED,ERROR: up, but a setup step failed
+	ready       bool // Launch returned it connected
+	stopping    bool // Stop was called: an exit is expected
 }
 
 func (t *Tunnel) notify() {
@@ -185,6 +196,18 @@ func (t *Tunnel) monitor(user, pass string) {
 			}
 			t.mu.Lock()
 			t.vip, t.up, t.degraded = vip, vip != "", degraded
+			// RECONNECTING carries why the attempt ended; the states of
+			// the next attempt (TCP_CONNECT to the proxy itself, RESOLVE)
+			// say nothing yet, anything past them means the proxy
+			// forwarded.
+			if len(fields) >= 3 {
+				switch fields[1] {
+				case "RECONNECTING":
+					t.proxyFailed = fields[2] == "socks-error"
+				case "WAIT", "AUTH", "GET_CONFIG", "ASSIGN_IP", "ADD_ROUTES", "CONNECTED":
+					t.proxyFailed = false
+				}
+			}
 			t.mu.Unlock()
 			t.notify()
 		}
@@ -258,6 +281,17 @@ func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel
 			return nil, fmt.Errorf("initialize %s OpenVPN management", opts.Name)
 		}
 	}
+	// failure names why the attempt ended: on the proxy when that is
+	// what stopped the last connection, else on what was observed.
+	failure := func(observed string) error {
+		t.mu.RLock()
+		proxyFailed := t.proxyFailed
+		t.mu.RUnlock()
+		if proxyFailed {
+			return fmt.Errorf("%s OpenVPN %s: %w", opts.Name, observed, ErrProxyFailed)
+		}
+		return fmt.Errorf("%s OpenVPN %s", opts.Name, observed)
+	}
 	for {
 		if t.Address() != "" {
 			ready = true
@@ -277,11 +311,11 @@ func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel
 			return nil, ErrAuthFailed
 		}
 		if failed {
-			return nil, fmt.Errorf("%s OpenVPN management failed before connecting", opts.Name)
+			return nil, failure("management failed before connecting")
 		}
 		select {
 		case <-deadline.Done():
-			return nil, fmt.Errorf("%s OpenVPN connection timed out", opts.Name)
+			return nil, failure("connection timed out")
 		case <-t.done:
 			t.mu.RLock()
 			authFailed := t.authFailed
@@ -289,7 +323,7 @@ func Launch(ctx context.Context, opts Options, config, socket string) (_ *Tunnel
 			if authFailed {
 				return nil, ErrAuthFailed
 			}
-			return nil, fmt.Errorf("%s OpenVPN exited before connecting", opts.Name)
+			return nil, failure("exited before connecting")
 		case <-t.events:
 		}
 	}

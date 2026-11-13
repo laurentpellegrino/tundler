@@ -28,6 +28,12 @@ type Status struct {
 	// connection attempts"). Retrying soon extends the refusal, so the
 	// caller holds all connects for a few minutes.
 	Throttled bool `json:"throttled,omitempty"`
+	// ProxyFailed marks a failed Connect that never reached the
+	// provider: the outer proxy the tunnel is dialed through could not
+	// open the connection to the server. Neither the location nor the
+	// account is at fault, so the caller does not count the failure
+	// against the location.
+	ProxyFailed bool `json:"proxy_failed,omitempty"`
 }
 
 // VPNProvider is the contract every CLI wrapper (ExpressVPN, NordVPN, …)

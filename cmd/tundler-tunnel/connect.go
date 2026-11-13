@@ -137,7 +137,11 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 			noteThrottled(providerName, location)
 			return location, fmt.Errorf("%w (provider=%s location=%s)", errThrottled, providerName, location)
 		}
-		noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
+		if status.ProxyFailed {
+			noteProxyFailure(providerName, location)
+		} else {
+			noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
+		}
 		return location, fmt.Errorf("connect failed for provider=%s location=%s status=%+v",
 			providerName, location, status)
 	}
@@ -174,6 +178,16 @@ func connectTunnelAt(ctx context.Context, prov provider.VPNProvider, state *Stat
 	log.Printf("tundler-tunnel: provider=%s tunnel up location=%s exit_ip=%s",
 		providerName, location, exitIP)
 	return location, nil
+}
+
+// noteProxyFailure logs a connect that the outer proxy stopped before
+// it reached the provider's server. The location was never tried, so
+// it is not counted as failing there: on 2026-11-13 one pod's proxy
+// refused every server for 21 minutes and ten healthy locations were
+// one failure away from, or already on, a 24 h hold.
+func noteProxyFailure(providerName, location string) {
+	log.Printf("tundler-tunnel: provider=%s location=%s the outer proxy could not reach the server; not counted against the location",
+		providerName, location)
 }
 
 // noteRotationExit records the exit a rotation landed on and reports
@@ -517,7 +531,11 @@ func connectWithRetry(ctx context.Context, prov provider.VPNProvider, state *Sta
 			return nil
 		}
 		recentlyFailed = append(recentlyFailed, location)
-		noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
+		if status.ProxyFailed {
+			noteProxyFailure(providerName, location)
+		} else {
+			noteFailingLocation(providerName, location, "failed to connect again", failing.connectFailed(location))
+		}
 		log.Printf("tundler-tunnel: rotation attempt %d/%d failed (location=%s); will try another",
 			attempt, maxAttempts, location)
 		if attempt < maxAttempts {
