@@ -62,7 +62,7 @@ RUN if [ -z "${PROVIDER}" ]; then \
         echo "ERROR: --build-arg PROVIDER=<name> is required" >&2; exit 1; \
     fi && \
     case "${PROVIDER}" in \
-        cyberghost|expressvpn|fastvpn|hidemyass|ipvanish|mullvad|nordvpn|ovpn|pia|protonvpn|psiphon|purevpn|surfshark|tunnelbear|veepn|warp|windscribe) ;; \
+        cyberghost|expressvpn|fastvpn|hidemyass|hideme|ipvanish|mullvad|nordvpn|ovpn|pia|protonvpn|psiphon|purevpn|surfshark|tunnelbear|veepn|warp|windscribe) ;; \
         *) echo "ERROR: PROVIDER=${PROVIDER} not in allow-list" >&2; exit 1 ;; \
     esac
 
@@ -133,6 +133,10 @@ RUN chmod +x /usr/local/bin/setup-netns.sh /usr/local/bin/tundler-entrypoint.sh 
 # warp-svc running just like the standalone warp provider. The Go
 # providers put WARP in proxy mode and connect it at Login/Connect via
 # warp-cli (internal/shared/warpproxy), which needs the daemon.
+#
+# hideme runs the official hide.me client in service mode
+# (docker/providers/hideme/hideme.service); the Go provider drives it
+# over its control socket.
 RUN case "${PROVIDER}" in \
         expressvpn) systemctl enable expressvpn-service.service ;; \
         nordvpn)    systemctl enable nordvpnd.service || true ;; \
@@ -140,6 +144,7 @@ RUN case "${PROVIDER}" in \
         warp)       systemctl enable warp-svc.service || true ;; \
         fastvpn)    systemctl enable warp-svc.service || true ;; \
         ipvanish)   systemctl enable warp-svc.service || true ;; \
+        hideme)     systemctl enable hideme.service ;; \
         *)          : ;; \
     esac
 

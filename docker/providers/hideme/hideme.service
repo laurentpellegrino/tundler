@@ -1,0 +1,14 @@
+[Unit]
+Description=hide.me client in service mode (driven by tundler-tunnel)
+Before=tundler-tunnel.service
+
+[Service]
+ExecStart=/usr/local/bin/hideme-service.sh
+WorkingDirectory=/opt/hide.me
+Restart=always
+RestartSec=2
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

@@ -45,7 +45,7 @@ Each pod is a single container running `systemd` → `tundler-tunnel`, which:
 
 ## Providers
 
-One image per provider (`tundler-<provider>`), selected at build time. Five
+One image per provider (`tundler-<provider>`), selected at build time. Six
 integration shapes:
 
 | Shape | Providers | How it connects |
@@ -54,6 +54,7 @@ integration shapes:
 | **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs; `ipvanish` owns its openvpn child over a management socket, passes the password through it, reports `AUTH_FAILED` as an auth failure so the runtime holds instead of re-logging in because IPVanish suspends accounts that log in too often, and like `fastvpn` dials TCP/443 through WARP's SOCKS5 proxy by default because IPVanish drops datacenter source IPs; `protonvpn` uses the same owned-child runner, `internal/shared/ovpn`, against Proton's logical-server catalog, `PROTON_FEATURE_FILTER` narrows the pool to a tier such as `securecore`; `veepn` runs on it too, from the vendor's self-contained per-location configs with this pod's device credential, and so do `windscribe` and `fastvpn`, whose shared credential a single server sometimes refuses, `cyberghost`, with this pod's device certificate and key inline in the owned config, `ovpn` and `purevpn`) |
 | **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
 | **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
+| **WireGuard (vendor service)** | `hideme` | runs the official hide.me client in service mode and drives it over its control socket; the client does the key exchange and sets up the interface (leak protection off, IPv4 only, `TUNDLER_CLUSTER_BYPASS_CIDR` outside the tunnel) |
 | **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
 
 Vendor clients are installed by `docker/providers/<provider>/install.sh`:
@@ -108,6 +109,7 @@ Field names per provider (also the OpenBao property names):
 | expressvpn | `activation_code` |
 | nordvpn | `token` |
 | pia, ipvanish, ovpn, purevpn, fastvpn, veepn, tunnelbear | `username`, `password` |
+| hideme | `username`, `password` (the hide.me account login, exchanged for an Access-Token at each container start) |
 | hidemyass | `username`, `password` (HMA account email/password; native device credentials are obtained automatically, see [HMA configuration](internal/provider/hidemyass/PROTOCOL.md)) |
 | protonvpn | `username`, `password` (the OpenVPN pair, not the Proton login) |
 | windscribe | `username`, `password` (the OpenVPN credential, not the account login) |
