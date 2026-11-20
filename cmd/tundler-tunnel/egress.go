@@ -78,6 +78,42 @@ func probeEgressIP(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
+// baselineProbeAttempts and baselineProbeWait bound the pre-VPN
+// baseline probe at boot. One slow answer from the egress endpoint
+// used to leave the exit-ip contract check off for the whole life of
+// the container, so a failed probe is tried again a few times before
+// the check is given up. Worst case adds about half a minute to the
+// boot of a pod that has no pre-VPN egress at all.
+const (
+	baselineProbeAttempts = 3
+	baselineProbeWait     = 3 * time.Second
+)
+
+// probeBaselineEgressIP runs probe up to attempts times, waiting wait
+// between tries, and returns the first answer. The error is the last
+// one seen, or the context's when it ends first.
+func probeBaselineEgressIP(ctx context.Context, probe func(context.Context) (string, error), attempts int, wait func(context.Context, time.Duration) bool) (string, error) {
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		ip, err := probe(ctx)
+		if err == nil && ip != "" {
+			return ip, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("egress probe: empty answer")
+		}
+		lastErr = err
+		if i == attempts {
+			break
+		}
+		log.Printf("tundler-tunnel: pre-VPN baseline egress probe attempt %d/%d failed: %v; trying again", i, attempts, err)
+		if !wait(ctx, baselineProbeWait) {
+			return "", ctx.Err()
+		}
+	}
+	return "", lastErr
+}
+
 // probeContractEgressIP is probeEgressIP for the post-connect contract
 // check. When a proxy-chain dialer is installed (contractProbeDialer
 // non-nil and the proxy has a custom dialer) the probe is tunneled

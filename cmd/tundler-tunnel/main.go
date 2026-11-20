@@ -266,8 +266,10 @@ func main() {
 	// is up, "what's our egress IP" is what we're trying to verify,
 	// not the baseline). A failed baseline probe is non-fatal: the
 	// contract check degrades to a no-op with a logged warning, so a
-	// cluster with strict pre-VPN egress restrictions still boots.
-	baselineEgressIP, err := probeEgressIP(ctx)
+	// cluster with strict pre-VPN egress restrictions still boots. A
+	// failed probe is tried again a few times first (see
+	// probeBaselineEgressIP).
+	baselineEgressIP, err := probeBaselineEgressIP(ctx, probeEgressIP, baselineProbeAttempts, sleepCtx)
 	if err != nil {
 		log.Printf("tundler-tunnel: pre-VPN baseline egress probe failed: %v — exit-ip contract test disabled", err)
 		baselineEgressIP = ""
