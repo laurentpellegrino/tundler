@@ -21,6 +21,8 @@ while ip rule del table 55555 2>/dev/null; do :; done
 while ip -6 rule del table 55555 2>/dev/null; do :; done
 ip link del vpn 2>/dev/null || true
 
+mkdir -p /run/hide.me
+
 args=(--caddr /run/hide.me/hide.me.sock
       --ca /opt/hide.me/CA.pem
       --tokenFile /var/lib/hideme/accessToken.txt
