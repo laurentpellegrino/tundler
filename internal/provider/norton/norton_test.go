@@ -15,7 +15,7 @@ import (
 var marseille = Server{IP: "138.199.14.130", Country: "FR", City: "Marseille", LocationKey: "FR-B8-MARSEILLE"}
 
 func TestBuildConfig(t *testing.T) {
-	cfg, err := buildOpenVPNConfig(&marseille, "/run/norton/openvpn-1/management.sock")
+	cfg, err := buildOpenVPNConfig(&marseille, "/run/norton/openvpn-1/management.sock", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,8 +36,68 @@ func TestBuildConfig(t *testing.T) {
 	if strings.Contains(cfg, "auth-user-pass /") {
 		t.Error("the password must come over the management socket, not from a file")
 	}
-	if _, err := buildOpenVPNConfig(&marseille, "/bad\"quote.sock"); err == nil {
+	if _, err := buildOpenVPNConfig(&marseille, "/bad\"quote.sock", ""); err == nil {
 		t.Error("a socket path that breaks quoting must be rejected")
+	}
+}
+
+func TestBuildConfigUsesProvisionedCA(t *testing.T) {
+	const minted = "-----BEGIN CERTIFICATE-----\nMINTEDCAPLACEHOLDER\n-----END CERTIFICATE-----"
+	cfg, err := buildOpenVPNConfig(&marseille, "/run/norton/openvpn-1/management.sock", minted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cfg, "MINTEDCAPLACEHOLDER") {
+		t.Error("a provisioned CA must be used in place of the embedded one")
+	}
+	if strings.Contains(cfg, strings.TrimSpace(embeddedCACert)) {
+		t.Error("the embedded CA must not appear when a provisioned CA is given")
+	}
+}
+
+func TestMachineIdentityStableAndWellFormed(t *testing.T) {
+	t.Setenv("NORTON_MACHINE_ID", "")
+	a := machineIdentityFor("tundler-tunnel-norton-0")
+	b := machineIdentityFor("tundler-tunnel-norton-0")
+	if a != b {
+		t.Fatalf("identity not stable for a seed: %+v vs %+v", a, b)
+	}
+	if c := machineIdentityFor("tundler-tunnel-norton-1"); c == a {
+		t.Fatal("different seeds must yield different identities")
+	}
+	if len(a.endpointID) != 36 || strings.Count(a.endpointID, "-") != 4 {
+		t.Errorf("endpoint id not UUID-shaped: %q", a.endpointID)
+	}
+	if len(a.fingerprint) != 16 {
+		t.Errorf("fingerprint not 16 hex chars: %q", a.fingerprint)
+	}
+	t.Setenv("NORTON_MACHINE_ID", "pinned-seed")
+	if machineIdentityFor("ignored") != machineIdentityFor("also-ignored") {
+		t.Error("NORTON_MACHINE_ID must pin the identity regardless of seed")
+	}
+}
+
+func TestExtractVPNPassage(t *testing.T) {
+	body := []byte(`{"data":[[
+		{"Job":"APPLYPRODUCTINSTANCE","Data":{"productInstance":"x"}},
+		{"Job":"OXYGENBIND","Data":{"ConnectToken":"1"}},
+		{"Job":"APPLYSERVICERESPONSE","Data":{"vpn_passage":{"http_code":200,"response":{"status":{"code":0},"data":{
+			"token":{"access_token":"a","refresh_token":"b"},
+			"credentials":{"device_udid":"U1.tenant.nlk401.deadbeef","device_password":"pw","openvpn_ca_certificate":"  -----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----  "}
+		}}}}}
+	]],"error":null,"success":true}`)
+	cred, err := extractVPNPassage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.Username != "U1.tenant.nlk401.deadbeef" || cred.Password != "pw" {
+		t.Fatalf("credential = %+v", cred)
+	}
+	if !strings.HasPrefix(cred.CA, "-----BEGIN") || strings.HasSuffix(cred.CA, " ") {
+		t.Errorf("CA not trimmed: %q", cred.CA)
+	}
+	if _, err := extractVPNPassage([]byte(`{"data":[[{"Job":"X","Data":{"y":1}}]]}`)); err == nil {
+		t.Error("a response without vpn_passage must error")
 	}
 }
 

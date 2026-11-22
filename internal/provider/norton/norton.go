@@ -7,11 +7,17 @@
 // tun-norton and Disconnect stops exactly that process.
 //
 // Auth is a per-device OpenVPN username/password minted by the backend when the
-// subscription is activated on a device (NORTON_USERNAME / NORTON_PASSWORD from
-// OpenBao vpn/norton); the username carries the account's tenant id. The CA
-// chain is the backend's static, shared, non-secret material and is embedded
-// here; the exit servers are the embedded snapshot in servers.json (IP, country
-// and city per entry), and the exit IP is the chosen server's IP. The cipher is
+// subscription is activated on a device; the username carries the account's
+// tenant id. Credentials come one of two ways:
+//
+//   - stored: NORTON_USERNAME / NORTON_PASSWORD (a device pair harvested once);
+//   - self-provisioned: NORTON_PRODUCT_KEY alone, from which the provider
+//     activates a device and mints the pair headlessly (see onboard.go). The
+//     result is cached in the run dir so a restart reuses the seat.
+//
+// The CA chain comes with the minted credential (or the embedded fallback); the
+// exit servers are the embedded snapshot in servers.json (IP, country and city
+// per entry), and the exit IP is the chosen server's IP. The cipher is
 // AES-256-GCM, taken from the client's resolved profile.
 package norton
 
@@ -23,6 +29,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -92,28 +99,103 @@ func runDir() string {
 	return defaultRunDir
 }
 
+// fieldProductKey is the account field holding the subscription's product key.
+// When it is the only credential supplied, the provider self-provisions a device
+// OpenVPN username/password from it (see onboard.go), so a pod can run on the key
+// alone with no per-device credential harvested up front.
+const fieldProductKey = "product_key"
+
+var (
+	provisionMu sync.Mutex
+	provisioned *deviceCredential
+)
+
 func init() {
 	provider.Registry[name] = Norton{}
 	accounts.RegisterLegacyShim(name, accounts.LegacyEnvFields(map[string]string{
 		accounts.FieldUsername: "NORTON_USERNAME",
 		accounts.FieldPassword: "NORTON_PASSWORD",
+		fieldProductKey:        "NORTON_PRODUCT_KEY",
 	}))
 }
 
-func getCredentials() (string, string, error) {
+// getCredentials resolves the OpenVPN username/password and (optionally) the CA.
+// An explicit username/password wins (a pre-minted device credential); otherwise
+// the provider self-provisions from the product key and caches the result.
+func getCredentials(ctx context.Context) (user, pass, ca string, err error) {
 	acct, err := accounts.Current(name)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	user, err := acct.Require(accounts.FieldUsername)
+	u, okU := acct.Line(accounts.FieldUsername)
+	p, okP := acct.Line(accounts.FieldPassword)
+	if okU && okP {
+		return u, p, "", nil
+	}
+	key, okK := acct.Line(fieldProductKey)
+	if !okK {
+		// No explicit creds and no key: surface the field the operator should set.
+		_, rerr := acct.Require(fieldProductKey)
+		return "", "", "", rerr
+	}
+	cred, err := provisionFromProductKey(ctx, key)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	pass, err := acct.Require(accounts.FieldPassword)
+	return cred.Username, cred.Password, cred.CA, nil
+}
+
+// credentialCachePath is where a self-provisioned credential is stored so a
+// restart reuses it rather than re-activating the key.
+func credentialCachePath() string {
+	return filepath.Join(runDir(), "credential.json")
+}
+
+// provisionFromProductKey returns a device credential minted from the product
+// key, reusing an in-memory or on-disk cache before performing a live activation.
+func provisionFromProductKey(ctx context.Context, key string) (deviceCredential, error) {
+	provisionMu.Lock()
+	defer provisionMu.Unlock()
+	if provisioned != nil && provisioned.valid() {
+		return *provisioned, nil
+	}
+	if c, ok := loadCachedCredential(); ok {
+		provisioned = &c
+		return c, nil
+	}
+	c, err := onboardWithProductKey(ctx, key, machineIdentityFor(defaultMachineSeed()))
 	if err != nil {
-		return "", "", err
+		return deviceCredential{}, err
 	}
-	return user, pass, nil
+	provisioned = &c
+	saveCachedCredential(c)
+	return c, nil
+}
+
+func loadCachedCredential() (deviceCredential, bool) {
+	raw, err := os.ReadFile(credentialCachePath())
+	if err != nil {
+		return deviceCredential{}, false
+	}
+	var c deviceCredential
+	if err := json.Unmarshal(raw, &c); err != nil || !c.valid() {
+		return deviceCredential{}, false
+	}
+	return c, true
+}
+
+func saveCachedCredential(c deviceCredential) {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(runDir(), 0o700); err != nil {
+		shared.Debugf("norton: cache credential: %v", err)
+		return
+	}
+	if err := os.WriteFile(credentialCachePath(), raw, 0o600); err != nil {
+		shared.Debugf("norton: cache credential: %v", err)
+	}
 }
 
 // loadServers parses the embedded exit snapshot, cached for the process
@@ -185,9 +267,13 @@ func pickRandomServer(servers []Server) *Server {
 // written), the dev is a fixed name so Disconnect and the route probe can find
 // it, and tun-mtu / mssfix clamp packet size below the pod MTU. socket is that
 // management socket.
-func buildOpenVPNConfig(server *Server, socket string) (string, error) {
+func buildOpenVPNConfig(server *Server, socket, ca string) (string, error) {
 	if !ovpnrun.ValidSocket(socket) {
 		return "", errors.New("invalid norton management socket path")
+	}
+	ca = strings.TrimSpace(ca)
+	if ca == "" {
+		ca = strings.TrimSpace(embeddedCACert)
 	}
 	return fmt.Sprintf(`client
 tls-client
@@ -214,8 +300,7 @@ mssfix 1280
 %s<ca>
 %s
 </ca>
-`, tunnelInterface, server.IP, openvpnPort, ovpnrun.Directives(socket),
-		strings.TrimSpace(embeddedCACert)), nil
+`, tunnelInterface, server.IP, openvpnPort, ovpnrun.Directives(socket), ca), nil
 }
 
 // isOpenVPNConnected returns true once the redirect-gateway push has taken
@@ -267,7 +352,7 @@ func (n Norton) ActiveLocation(ctx context.Context) string {
 
 func (n Norton) Connect(ctx context.Context, location string) provider.Status {
 	failed := provider.Status{Connected: false, Provider: name, Location: location}
-	user, pass, err := getCredentials()
+	user, pass, ca, err := getCredentials(ctx)
 	if err != nil {
 		shared.Debugf("norton: %v", err)
 		return provider.Status{Connected: false, Provider: name}
@@ -289,7 +374,7 @@ func (n Norton) Connect(ctx context.Context, location string) provider.Status {
 
 	tunnel, err := startTunnel(ctx, ovpnrun.Options{Name: "norton", RunDir: runDir(), User: user, Pass: pass, Timeout: connectTimeout},
 		func(socket string) ([]byte, error) {
-			cfg, err := buildOpenVPNConfig(server, socket)
+			cfg, err := buildOpenVPNConfig(server, socket, ca)
 			return []byte(cfg), err
 		})
 	if errors.Is(err, ovpnrun.ErrAuthFailed) {
@@ -355,7 +440,7 @@ func (n Norton) LoggedIn(ctx context.Context) bool {
 }
 
 func (n Norton) Login(ctx context.Context) error {
-	if _, _, err := getCredentials(); err != nil {
+	if _, _, _, err := getCredentials(ctx); err != nil {
 		return err
 	}
 	if _, err := loadServers(); err != nil {
