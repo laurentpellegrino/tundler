@@ -1,0 +1,26 @@
+[
+  {
+    "ip": "138.199.14.130",
+    "country": "FR",
+    "city": "Marseille",
+    "location_key": "FR-B8-MARSEILLE",
+    "tcp_ports": [
+      443
+    ],
+    "udp_ports": [
+      1194
+    ]
+  },
+  {
+    "ip": "79.127.138.86",
+    "country": "FR",
+    "city": "Marseille",
+    "location_key": "FR-B8-MARSEILLE",
+    "tcp_ports": [
+      443
+    ],
+    "udp_ports": [
+      1194
+    ]
+  }
+]
