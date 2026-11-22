@@ -2,191 +2,143 @@
 
 Tundler ("tunnel bundler") turns a commercial VPN subscription into
 **single-purpose tunnel pods**. One Docker image per provider runs the
-`tundler-tunnel` binary, which logs in, brings the VPN up, keeps it healthy,
-rotates the exit IP on a schedule, and exposes the tunnel as an in-process
-HTTP **CONNECT proxy**. A Kubernetes crawler fleet points each of its slots at
-a tunnel pod's proxy and gets a large, diverse pool of rotating egress IPs.
+`tundler-tunnel` binary, which signs in, brings the VPN up, keeps it healthy,
+changes the exit IP on a schedule, and exposes the tunnel as a local HTTP
+**proxy**. Point many clients at many pods and you get a large, constantly
+rotating pool of egress IP addresses.
 
-Images are built by CI for every provider and published to the GitHub
-Container Registry as `ghcr.io/laurentpellegrino/tundler-<provider>`
-(`:latest` plus one `:<commit-sha>` tag), on every push to `main` and once a
-day to pick up base-image and server-list updates. The runtime design (pod
-state machine, probes, failure layers, rotation and drain) is in
-[`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md).
+CI builds an image for every provider and publishes it to the GitHub Container
+Registry as `ghcr.io/laurentpellegrino/tundler-<provider>` (`:latest` plus a
+`:<commit-sha>` tag), on every push to `main` and once a day to pick up
+base-image and server-list updates.
 
-## What a tunnel pod does
+The deep runtime design (state machine, health probes, self-healing, rotation)
+lives in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md). This
+page is the overview and the configuration reference.
 
-Each pod is a single container running `systemd` → `tundler-tunnel`, which:
+## What a pod does
 
-1. **Logs in** to the provider with its pod's account (see
-   [Accounts](#accounts)) and **connects** a tunnel to a randomly chosen
-   allowed location.
-2. Verifies the tunnel actually routes traffic out a different IP than the
-   node (the **exit-IP contract test**) before reporting ready.
-3. Serves an in-process **CONNECT proxy on `:8485`** — crawler traffic dialed
-   through it egresses via the VPN — and a browser-impersonating forward
-   proxy on `:8486`: `GET /<path>` with `X-Tundler-Target-Host: <host>` is
-   fetched upstream over https with a real browser ClientHello (uTLS + h2;
-   one preset per pod, picked from the pod name). Send
-   `X-Tundler-User-Agent: profile` to have the request carry the User-Agent
-   that matches that preset (a client cannot know the pod's browser, and a
-   UA that contradicts the hello is itself a bot signal); without the hint
-   the client's UA is kept. `/status` reports the pair as
-   `impersonate_profile` / `impersonate_user_agent`. The preset is picked
-   per pod from its name; `TUNDLER_IMPERSONATE_PROFILE` pins one instead
-   (`Chrome-133`, `Firefox-120`, `Safari-16-0`, or `golang` for the stock
-   Go hello, which has no browser UA so the client's is kept).
-4. Serves an **HTTP control API on `:4242`** (`/livez`, `/readyz`, `/status`,
-   `/rotate`) used by k8s probes and by clients triggering a rotation.
-5. **Rotates** to a fresh exit on a time window (or on demand), draining
-   in-flight connections first.
-6. Self-heals via an in-process **watchdog** (reconnects when upstream dials
-   start failing) and **wedge guard** (force-reconnect if stuck).
+Each pod is one container running `systemd` → `tundler-tunnel`, which:
+
+1. **Signs in** with the pod's account (see [Accounts](#accounts)) and
+   **connects** to a random allowed location.
+2. **Checks the exit** really routes out a different IP than the node before
+   reporting ready.
+3. **Serves two proxies**: a plain CONNECT proxy on `:8485` (traffic sent
+   through it leaves via the VPN) and a browser-impersonating forward proxy on
+   `:8486` (fetches a URL upstream with a real browser TLS fingerprint; one
+   preset per pod).
+4. **Answers a control API** on `:4242` (`/livez`, `/readyz`, `/status`,
+   `/rotate`).
+5. **Rotates** to a fresh exit on a timer or on demand, draining open
+   connections first.
+6. **Self-heals**: reconnects when traffic starts failing, and force-reconnects
+   if it gets stuck.
 
 ## Providers
 
-One image per provider (`tundler-<provider>`), selected at build time. Six
-integration shapes:
+One image per provider, chosen at build time. Providers fall into six
+connection shapes:
 
-| Shape | Providers | How it connects |
-|-------|-----------|-----------------|
-| **Vendor CLI daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` | drives the official Linux client/daemon |
-| **OpenVPN-direct** | `cyberghost`, `fastvpn`, `ipvanish`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` | spawns `openvpn` from a baked/fetched config + credential (`fastvpn` dials its TCP edge through Cloudflare WARP's local SOCKS5 proxy by default, because WLVPN rejects datacenter source IPs; `ipvanish` owns its openvpn child over a management socket, passes the password through it, reports `AUTH_FAILED` as an auth failure so the runtime holds instead of re-logging in because IPVanish suspends accounts that log in too often, and like `fastvpn` dials TCP/443 through WARP's SOCKS5 proxy by default because IPVanish drops datacenter source IPs; `protonvpn` uses the same owned-child runner, `internal/shared/ovpn`, against Proton's logical-server catalog, `PROTON_FEATURE_FILTER` narrows the pool to a tier such as `securecore`; `veepn` runs on it too, from the vendor's self-contained per-location configs with this pod's device credential, and so do `windscribe` and `fastvpn`, whose shared credential a single server sometimes refuses, `cyberghost`, with this pod's device certificate and key inline in the owned config, `ovpn` and `purevpn`) |
-| **OpenVPN with native API** | `hidemyass` | native HMA account/device APIs and live server discovery; an owned OpenVPN process receives device credentials through a private management socket |
-| **WireGuard (wg-quick)** | `mullvad` | per-pod key + assigned address, `wg-quick up` |
-| **WireGuard (vendor service)** | `hideme` | runs the official hide.me client in service mode and drives it over its control socket; the client does the key exchange and sets up the interface (leak protection off, IPv4 only, `TUNDLER_CLUSTER_BYPASS_CIDR` outside the tunnel) |
-| **Proxy-chain** | `tunnelbear`, `psiphon` | forwards through an upstream HTTPS/local proxy instead of a kernel tunnel (the proxy's dial-func seam) |
+| Shape | Providers |
+|-------|-----------|
+| **Vendor CLI / daemon** | `expressvpn`, `nordvpn`, `pia`, `warp` |
+| **OpenVPN (direct)** | `cyberghost`, `fastvpn`, `ipvanish`, `norton`, `ovpn`, `protonvpn`, `purevpn`, `surfshark`, `veepn`, `windscribe` |
+| **OpenVPN + native API** | `hidemyass` |
+| **WireGuard (`wg-quick`)** | `mullvad` |
+| **WireGuard (vendor service)** | `hideme` |
+| **Proxy chain** | `psiphon`, `tunnelbear` |
 
-Vendor clients are installed by `docker/providers/<provider>/install.sh`:
-ExpressVPN is pinned there (14.2.0), PIA resolves the newest Linux build
-from its changelog at image build time (3.8 fallback), NordVPN and
-Cloudflare WARP come from the vendors' package repositories, and the
-OpenVPN/WireGuard tools come from Ubuntu. Server lists and OpenVPN configs
-are refreshed daily by the `update-*` workflows and baked at build time
-from GitHub release assets.
+Provider notes (only where it matters):
+
+- **fastvpn**, **ipvanish** — dial through Cloudflare WARP by default
+  (`*_TRANSPORT=warp`), because the vendor rejects datacenter source IPs; set
+  `*_TRANSPORT=direct` on residential hosts.
+- **norton** — the Norton VPN / SurfEasy (Gen Digital) backend; a per-device
+  OpenVPN username and password, the static CA baked in.
+- **protonvpn** — connects against Proton's server catalog; `PROTON_FEATURE_FILTER`
+  narrows the pool to a tier such as `securecore`.
+
+Vendor clients are installed by `docker/providers/<provider>/install.sh`
+(ExpressVPN pinned to 14.2.0; PIA resolved at build time; NordVPN and WARP from
+the vendor repositories; OpenVPN/WireGuard from Ubuntu). Server lists and
+configs are refreshed daily by the `update-*` workflows and baked at build
+time.
 
 ## Accounts
 
-Every provider supports **multiple accounts**. An account is a named bag of
-credential fields plus an explicit `slots` capacity (how many pods it can
-serve concurrently — the provider's device/session cap made enforceable).
-Pod ordinals are block-partitioned over accounts in order: accounts
-`main` (slots 5) + `backup` (slots 3) serve ordinals 0-4 and 5-7. An
-ordinal beyond the declared capacity is a loud boot error surfaced on
-`/status` — not a login storm.
+Every provider supports **multiple accounts**. An account is a named set of
+credential fields plus a `slots` number — how many pods it may serve at once
+(the provider's device limit, made enforceable). Pods are assigned to accounts
+by ordinal: `main:5,backup:3` gives ordinals 0-4 to `main` and 5-7 to `backup`.
+A pod past the last slot fails loudly at boot instead of starting a login
+storm.
 
-Accounts arrive as a **directory** (in the fleet: a projected Secret, kept
-in sync from OpenBao via ExternalSecret):
+Accounts are read from a **directory** (one subdirectory per account, one file
+per field):
 
 ```
 /etc/tundler/accounts/
   main/
-    username        # one file per field
+    username
     password
   backup/
     username
     password
 ```
 
-- `TUNDLER_ACCOUNTS` (env, e.g. `main:5,backup:3`) pins account ordering +
-  slots in production; without it, lexicographic directory order + an
-  optional `slots` file per account (default 1) apply — name dirs
-  `00-main`, `01-backup` to make order visible. Slots `0` marks a sole
-  UNCAPPED account (`main:0`): it serves every ordinal, so the value
-  never changes when the fleet scales.
-- Local dev shortcut: `TUNDLER_ACCOUNT_<FIELD>` env vars (e.g.
-  `TUNDLER_ACCOUNT_USERNAME`) synthesize a single account.
-- Files, not env, on purpose: the entrypoint's line-oriented env filter
-  truncates multi-line PEMs, and a projected Secret updates in place —
-  credential fixes heal pods without restarts or re-logins.
-- `/status` reports `account_id` and `account_source` (`dir`, `env` or
-  `legacy`), so mid-migration pods are visible at a glance.
+In the fleet this directory is a projected Secret kept in sync from OpenBao, so
+a credential fix heals pods in place with no restart. For local development,
+`TUNDLER_ACCOUNT_<FIELD>` (e.g. `TUNDLER_ACCOUNT_USERNAME`) synthesizes a single
+account. `/status` shows the chosen `account_id` and `account_source`.
 
-Field names per provider (also the OpenBao property names):
+**Account fields per provider** (also the OpenBao property names), sorted by
+provider:
 
-| Provider | Account fields |
-|----------|----------------|
-| expressvpn | `activation_code` |
-| nordvpn | `token` |
-| pia, ipvanish, ovpn, purevpn, fastvpn, veepn, tunnelbear | `username`, `password` |
-| hideme | `username`, `password` (the hide.me account login, exchanged for an Access-Token at each container start) |
-| hidemyass | `username`, `password` (HMA account email/password; native device credentials are obtained automatically, see [HMA configuration](internal/provider/hidemyass/PROTOCOL.md)) |
-| protonvpn | `username`, `password` (the OpenVPN pair, not the Proton login) |
-| windscribe | `username`, `password` (the OpenVPN credential, not the account login) |
-| surfshark | `username`, `password` (OpenVPN) or `private_key` (WireGuard, one key pinned per pod) |
-| mullvad | `private_key`, `address` (`address6` reserved) — one device identity per Slots=1 account |
-| cyberghost | `certificate`, `key`, `username`, `password` — one device profile per Slots=1 account |
-| warp | none (anonymous/mdm registration) |
-| psiphon | none (embedded network config) |
+| Provider | Fields |
+|----------|--------|
+| `cyberghost` | `certificate`, `key`, `username`, `password` (one device per `slots=1` account) |
+| `expressvpn` | `activation_code` |
+| `fastvpn` | `username`, `password` |
+| `hideme` | `username`, `password` (account login; exchanged for a token at each start) |
+| `hidemyass` | `username`, `password` (account email/password; device credentials fetched automatically) |
+| `ipvanish` | `username`, `password` |
+| `mullvad` | `private_key`, `address` (one device per `slots=1` account) |
+| `nordvpn` | `token` |
+| `norton` | `username`, `password` (the per-device OpenVPN credential, not the Norton account login) |
+| `ovpn` | `username`, `password` |
+| `pia` | `username`, `password` |
+| `protonvpn` | `username`, `password` (the OpenVPN pair, not the Proton login) |
+| `psiphon` | none (embedded config) |
+| `purevpn` | `username`, `password` |
+| `surfshark` | `username`, `password` (OpenVPN) or `private_key` (WireGuard) |
+| `tunnelbear` | `username`, `password` |
+| `veepn` | `username`, `password` |
+| `warp` | none (anonymous registration) |
+| `windscribe` | `username`, `password` (the OpenVPN credential, not the account login) |
 
-**Legacy env vars keep working** (deprecated, one log line at boot): the
-pre-accounts variables — `PRIVATEINTERNETACCESS_USERNAME/_PASSWORD`,
-`EXPRESSVPN_ACTIVATION_CODE`, `NORDVPN_TOKEN`,
-`SURFSHARK_WIREGUARD_PRIVATE_KEYS` (comma pool, random pick),
-per-pod `POD_<n>_MULLVAD_*` / `POD_<n>_VEEPN_*` and cyberghost's
-`/etc/cyberghost/creds/POD_<n>_*` files — are synthesized into an
-equivalent account pool when the accounts directory is absent, so images
-and deployment manifests can roll independently: roll the image first,
-then switch each provider's manifest to the accounts directory.
+Older single-account environment variables (`NORDVPN_TOKEN`,
+`EXPRESSVPN_ACTIVATION_CODE`, …) still work and log a one-line deprecation at
+boot, so images and manifests can be rolled independently.
 
 ## Region spread (soft)
 
-When the pod can see the fleet topology — the deployment's
-`vpn-providers.yaml` mounted at `/etc/tundler/fleet/vpn-providers.yaml`
-(`TUNDLER_FLEET_LAYOUT` overrides the path), or failing that the static
-`TUNDLER_FLEET_SLOT_BASE` + `TUNDLER_FLEET_SLOTS` env — every pod
-computes the same epoch-seeded country ordering. From the file, each
-provider's block is `max_tunnels` consecutive slots, providers in sorted
-name order; the file is re-read at every pick, so a topology edit (a
-provider enabled or resized) lands at each pod's next rotation without a
-pod roll. The provider's block start (`base / slots` of the way around
-that ring) picks where the provider begins, and its pods take
-consecutive countries from the ring-ordered list of countries the
-provider actually offers (ordinal 0 the first, ordinal 1 the next, …),
-so siblings land on distinct countries with **zero coordination** (no
-peer traffic, no extra RBAC) for as long as the catalog has one to
-spare. Each rotation advances a pod by the provider's pod count
-(`max_tunnels` from the file, `TUNDLER_FLEET_REPLICAS` with the static
-env) along that list, so a pod only ever visits its own positions and
-siblings with different rotation histories never meet (without a pod
-count the stride is one). It is a preference,
-never a guarantee: any miss falls back to the classic uniform-random
-pick, and providers with unmappable location vocabularies (city names,
-`auto`) simply ignore it. `/status` exposes `fleet_slot`,
-`preferred_country` and `current_country`. No file and no env = feature
-off.
+When a pod can see the fleet layout (the `vpn-providers.yaml` mounted at
+`/etc/tundler/fleet/`, or the `TUNDLER_FLEET_*` env fallback), every pod
+computes the same country ordering and each sibling takes a different country —
+with no coordination between pods. It is a **preference, not a guarantee**: any
+gap falls back to a uniform random pick.
 
-A rotation re-picks in the same country (another location when the
-country has one) for up to `TUNDLER_COUNTRY_DWELL` rotations (default
-4), so a big pool keeps yielding fresh exits. Upstreams meter by
-prefix, so a rotation that lands in a /24 (IPv6: /48) this pod already
-used within `TUNDLER_EXIT_MEMORY` (default 1h) is the spent-quota
-signal: the location and its country are cooled for
-`TUNDLER_BLOCKED_COOLDOWN` (default 1h), skipped by every pick,
-preferred or random, the walk moves on and the rotation retries
-elsewhere while it has attempts left. A pod whose whole catalog is
-cooling ignores the cool-down rather than staying down. `POST /rotate`
-accepts a reason from the crawler: `{"reason":"blocked"}` (or
-`?reason=blocked`, the exit still 429s at the crawler's rate floor) is
-logged only, a throttled IP alone says nothing about the pool behind
-it; `reason=banned` (the exit answered 406/403, an IP-level refusal
-that was still in force a day later on 2026-10-25) puts the exit's
-prefix into a separate refused memory for `TUNDLER_REFUSED_MEMORY`
-(default 24h), cools its location and country, and makes any later
-rotation that lands in that prefix retry elsewhere. The body may also
-carry `avoid_locations`, a list of location names as `/status` reports
-them in `current_location`: a caller that sees every pod's exits names
-the locations that would hand this pod a prefix a sibling used within
-the quota window, and the pick for that one rotation skips them. The
-list is dropped once a tunnel comes up and ignored when nothing else is
-left. `/status` reports `used_exit_prefixes`, `refused_exit_prefixes`,
-`cooled_locations`, `cooled_countries` and `advised_locations` (the
-size of the list in force; the field's presence tells a caller the pod
-reads `avoid_locations`).
+On top of that, each pod avoids reusing an exit it recently used: a rotation
+landing in a /24 (or IPv6 /48) seen within `TUNDLER_EXIT_MEMORY` is treated as
+spent, so that location is cooled and the rotation retries elsewhere. A crawler
+can also tell a pod which exits to steer clear of via `POST /rotate` (see the
+[control API](#http-control-api-4242) and the detailed README). With no fleet
+file and no env, the feature is simply off.
 
 ## Build & run
 
-Pull a prebuilt image, or build one provider's image locally:
+Pull a prebuilt image, or build one provider locally:
 
 ```bash
 docker pull ghcr.io/laurentpellegrino/tundler-windscribe:latest
@@ -196,15 +148,13 @@ docker build -f docker/Dockerfile.tunnel \
     -t ghcr.io/laurentpellegrino/tundler-windscribe:latest .
 ```
 
-The `PROVIDER` build-arg both selects the provider's `install.sh`
-(`docker/providers/<provider>/`) and compiles the binary with
-`-tags provider_<provider>` so only that provider's code + embedded data is
-linked. ExpressVPN builds on `ubuntu:26.04` (`--build-arg
-BASE_IMAGE=ubuntu:26.04`, see the CI workflow for why); everything else on
-the default `ubuntu:24.04`.
+The `PROVIDER` build-arg picks the provider's `install.sh` and compiles only
+that provider's code (`-tags provider_<provider>`). ExpressVPN needs
+`--build-arg BASE_IMAGE=ubuntu:26.04`; everything else uses the default
+`ubuntu:24.04`.
 
-Run it. The container boots `systemd`, so it needs the cgroup tree, and
-the kernel-tunnel providers need `NET_ADMIN` plus `/dev/net/tun`:
+Run it. The container boots `systemd` (so it needs the cgroup tree), and
+kernel-tunnel providers need `NET_ADMIN` and `/dev/net/tun`:
 
 ```bash
 docker run --rm -d --name tundler-windscribe \
@@ -216,65 +166,68 @@ docker run --rm -d --name tundler-windscribe \
   -p 8485:8485 -p 4242:4242 \
   ghcr.io/laurentpellegrino/tundler-windscribe:latest
 
-# multi-account: mount a directory instead (one subdir per account,
-# one file per field — see "Accounts" above) and pin the partition:
-#   -v ./accounts:/etc/tundler/accounts:ro -e TUNDLER_ACCOUNTS=main:5,backup:3
-#   -e POD_NAME=tundler-tunnel-windscribe-6   # ordinal 6 → backup
-
 # crawl through the tunnel:
 curl -x http://localhost:8485 https://www.cloudflare.com/cdn-cgi/trace
 # check health / current exit / selected account:
 curl http://localhost:4242/status
 ```
 
-### Useful env knobs
+For multiple accounts, mount a directory instead of the `TUNDLER_ACCOUNT_*`
+shortcuts (`-v ./accounts:/etc/tundler/accounts:ro -e
+TUNDLER_ACCOUNTS=main:5,backup:3`) and set `POD_NAME` so the ordinal picks the
+account.
 
-| Variable | Description |
-|----------|-------------|
-| `TUNDLER_TUNNEL_PROVIDER` | which compiled-in provider to run (one per image) |
-| `EXCLUDED_LOCATIONS` | comma-separated locations the random picker must never choose |
-| `MIN_ROTATION_SECONDS` / `MAX_ROTATION_SECONDS` | rotation interval window (each interval is a fresh uniform pick; both `0` disables scheduled rotation) |
-| `BOOT_LOGIN_JITTER_SECONDS` | spread simultaneous boot logins to avoid bursting the auth API |
-| `TUNDLER_PROXY_PORT` | CONNECT proxy port (default `8485`) |
-| `POD_NAME` / `POD_NAMESPACE` | downward-API identity; the pod's ordinal (from `POD_NAME`) selects its account |
-| `TUNDLER_ACCOUNTS_DIR` | accounts directory override (default `/etc/tundler/accounts`) |
-| `TUNDLER_ACCOUNTS` | ordered `<id>:<slots>` CSV pinning the ordinal→account partition (`0` = sole uncapped account) |
-| `TUNDLER_AUTH_FAILURE_BACKOFF_SECONDS` | hold on every connect once the credentials were rejected (`Status.AuthFailed`, e.g. OpenVPN `AUTH_FAILED`) `TUNDLER_AUTH_FAILURES_BEFORE_HOLD` times in a row; doubles per further rejection up to 24 h, cleared by the next successful connect (default 3600) |
-| `TUNDLER_AUTH_FAILURES_BEFORE_HOLD` | credential rejections in a row, with no successful connect between them, that start the hold above; a rejection below it holds only that location and the pod connects elsewhere, since one server refusing what the others accept is the usual case (default 3, `1` holds on the first rejection) |
-| `TUNDLER_THROTTLE_BACKOFF_SECONDS` | hold on every connect after the provider refuses one for too many connection attempts (`Status.Throttled`, NordVPN's "Too many connection attempts"); `/rotate` answers 200 and keeps the current tunnel meanwhile; doubles per consecutive refusal up to 30 min, cleared by the next successful connect (default 300) |
-| `TUNDLER_FLEET_LAYOUT` | fleet topology file for the soft region-spread preference (default `/etc/tundler/fleet/vpn-providers.yaml`, re-read at every pick) |
-| `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | static fallback for the region-spread preference when no topology file is mounted |
-| `TUNDLER_FLEET_REPLICAS` | with the static fallback: this provider's pod count, the rotation stride of the region walk (default 1) |
-| `TUNDLER_COUNTRY_DWELL` | rotations a pod spends in one country before the region walk moves on (default 4, `0` = every rotation) |
-| `TUNDLER_EXIT_MEMORY` | how long an exit prefix (/24, IPv6 /48) is remembered; a rotation landing in a remembered prefix cools its location and country and retries elsewhere (default `1h`, `0` disables) |
-| `TUNDLER_BLOCKED_COOLDOWN` | how long a spent location and country stay skipped (default `1h`, `0` disables) |
-| `TUNDLER_FAILING_LOCATION_HOLD` | how long a failing location is skipped: one that rejects the credentials, or fails to connect again after the pod connected elsewhere since its first failure; doubles each time it fails again after its hold, up to 7 days, and the first successful connect there forgets it; when every location is held the holds are ignored. A location that failed since the pod's last successful connect is avoided by the next pick, watchdog reconnects and boot retries included (default `24h`, `0` disables) |
-| `TUNDLER_REFUSED_MEMORY` | how long an exit prefix the upstream refused (`POST /rotate` with `reason=banned`) is avoided by later rotations (default `24h`, `0` disables) |
-| `FASTVPN_TRANSPORT` | fastvpn only: `warp` (default) runs openvpn over TCP/443 through WARP's SOCKS5 proxy; `direct` runs plain UDP/1194 openvpn for hosts whose source IP WLVPN accepts |
-| `IPVANISH_TRANSPORT` | `warp` (default: OpenVPN TCP/443 through Cloudflare WARP's local SOCKS5 proxy, IPVanish drops datacenter source IPs) or `direct` (vendor UDP config as is, for residential source IPs) |
-| `TUNDLER_CLUSTER_BYPASS_CIDR` | route this CIDR around the tunnel so in-cluster traffic keeps working |
-| `TUNDLER_CLUSTER_RESOLV_CONF` | resolv.conf the entrypoint saved before any VPN client could rewrite the live one (default `/run/tundler/resolv.conf`); event sinks resolve through its nameservers, so in-tunnel DNS can't break delivery; DNS over eth0 towards `TUNDLER_CLUSTER_BYPASS_CIDR` (or those nameservers when no CIDR is set) is also kept allowed at the head of the pod's OUTPUT chain (entrypoint, after every connect, and ExpressVPN's prestart), because ExpressVPN's firewall rejects port 53 to anything but its own resolver even with network lock off |
+## Environment variables
 
-The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md#environment-knobs).
+The common knobs, sorted by name. The full list is in
+[`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.md#environment-knobs).
+Durations accept Go syntax (`1h`, `30m`); `0` disables where noted.
+
+| Variable | What it does |
+|----------|--------------|
+| `BOOT_LOGIN_JITTER_SECONDS` | Spread simultaneous boot logins so they don't burst the auth API. |
+| `EXCLUDED_LOCATIONS` | Comma-separated locations the picker must never choose. |
+| `FASTVPN_TRANSPORT` | `warp` (default, OpenVPN over WARP) or `direct` (plain UDP); fastvpn only. |
+| `IPVANISH_TRANSPORT` | `warp` (default, OpenVPN over WARP) or `direct` (plain vendor config); ipvanish only. |
+| `MIN_ROTATION_SECONDS` / `MAX_ROTATION_SECONDS` | Rotation interval window; both `0` turns scheduled rotation off. |
+| `POD_NAME` / `POD_NAMESPACE` | Pod identity; the ordinal in `POD_NAME` selects the account. |
+| `PROTON_FEATURE_FILTER` | Narrow Proton's server pool to a tier (e.g. `securecore`); protonvpn only. |
+| `TUNDLER_ACCOUNTS` | Ordered `<id>:<slots>` list pinning the ordinal → account mapping (`0` = one uncapped account). |
+| `TUNDLER_ACCOUNTS_DIR` | Accounts directory (default `/etc/tundler/accounts`). |
+| `TUNDLER_AUTH_FAILURE_BACKOFF_SECONDS` | How long to hold all connects once credentials are rejected repeatedly; doubles up to 24 h, cleared by a success (default `3600`). |
+| `TUNDLER_AUTH_FAILURES_BEFORE_HOLD` | Credential rejections in a row that trigger that hold (default `3`); fewer just skips the offending server. |
+| `TUNDLER_BLOCKED_COOLDOWN` | How long a spent location/country stays skipped (default `1h`). |
+| `TUNDLER_CLUSTER_BYPASS_CIDR` | Keep traffic to this CIDR off the tunnel so in-cluster calls still work. |
+| `TUNDLER_CLUSTER_RESOLV_CONF` | Saved resolv.conf used for event delivery and DNS kept allowed around the tunnel (default `/run/tundler/resolv.conf`). |
+| `TUNDLER_COUNTRY_DWELL` | Rotations spent in one country before the region walk moves on (default `4`). |
+| `TUNDLER_EXIT_MEMORY` | How long a used exit prefix is remembered and avoided (default `1h`). |
+| `TUNDLER_FAILING_LOCATION_HOLD` | How long a failing location is skipped; doubles up to 7 days, forgotten on a success (default `24h`). |
+| `TUNDLER_FLEET_LAYOUT` | Fleet topology file for region spread (default `/etc/tundler/fleet/vpn-providers.yaml`). |
+| `TUNDLER_FLEET_REPLICAS` | With the static fallback: this provider's pod count (the region-walk stride). |
+| `TUNDLER_FLEET_SLOT_BASE` / `TUNDLER_FLEET_SLOTS` | Static fallback for region spread when no topology file is mounted. |
+| `TUNDLER_IMPERSONATE_PROFILE` | Pin the browser fingerprint for the `:8486` proxy (`Chrome-133`, `Firefox-120`, `Safari-16-0`, `golang`); default is per-pod. |
+| `TUNDLER_PROXY_PORT` | CONNECT proxy port (default `8485`). |
+| `TUNDLER_REFUSED_MEMORY` | How long an exit prefix the upstream refused (`/rotate` `reason=banned`) is avoided (default `24h`). |
+| `TUNDLER_THROTTLE_BACKOFF_SECONDS` | How long to hold connects after a "too many attempts" refusal; doubles up to 30 min (default `300`). |
+| `TUNDLER_TUNNEL_PROVIDER` | Which compiled-in provider to run (one per image). |
 
 ## HTTP control API (`:4242`)
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/livez` | GET | process is up |
-| `/readyz` | GET | `200` only when a tunnel is connected and the exit-IP contract passed; `503` while connecting/draining/failed |
-| `/status` | GET | JSON: state, current location, exit IP, tunnel age, next-rotation countdown, rotation/auth-failure counts, selected account, region preference |
-| `/rotate` | POST | drain in-flight connections, disconnect, reconnect to a fresh exit |
+| Endpoint | Method | What it returns |
+|----------|--------|-----------------|
+| `/livez` | GET | `200` while the process is up. |
+| `/readyz` | GET | `200` only when the tunnel is connected and the exit check passed; `503` otherwise. |
+| `/rotate` | POST | Drains, disconnects and reconnects to a fresh exit. |
+| `/status` | GET | JSON: state, location, exit IP, tunnel age, next-rotation countdown, counts, account, region preference. |
 
-## Extending: add a provider
+## Add a provider
 
 1. `internal/provider/<name>/<name>.go` — implement the `provider.VPNProvider`
    interface (`Login`/`Logout`/`LoggedIn`, `Connect`/`Disconnect`/`Connected`,
-   `Locations`, `ActiveLocation`, `Status`, `Version`). Rotation is just the
-   binary calling `Disconnect` then `Connect` again. Proxy-chain providers also
-   take the in-process proxy via an `AttachProxy(*proxy.Server)` method and
-   install a dialer with `SetDialer`.
-2. `internal/provider/register/register_<name>.go` — build-tagged blank import:
+   `Locations`, `ActiveLocation`, `Status`, `Version`). Rotation is just
+   `Disconnect` then `Connect`.
+2. `internal/provider/register/register_<name>.go` — a build-tagged blank
+   import:
 
    ```go
    //go:build provider_<name>
@@ -284,15 +237,13 @@ The full list is in [`cmd/tundler-tunnel/README.md`](cmd/tundler-tunnel/README.m
    import _ "github.com/laurentpellegrino/tundler/internal/provider/<name>"
    ```
 
-3. `docker/providers/<name>/install.sh` (+ `configure.sh`) — install the VPN
-   client / bake any config; keep it self-contained.
+3. `docker/providers/<name>/install.sh` (+ `configure.sh`) — install the client
+   / bake any config.
 4. Add `<name>` to the allow-list in `docker/Dockerfile.tunnel`, the matrix in
-   `.github/workflows/docker-image.yml`, and the env-passthrough regex in
+   `.github/workflows/docker-image.yml`, and the env regex in
    `docker/services/tundler-entrypoint.sh`.
-5. Resolve credentials through the accounts package — `accounts.Current(name)`
-   + `acct.Require(accounts.Field…)` — and add the provider's field names to
-   the "Account fields" table above. Only providers that predate the accounts
-   model register a legacy env shim; a new provider doesn't need one.
+5. Resolve credentials with `accounts.Current(name)` + `acct.Require(...)`, and
+   add the provider to the **Providers** and **Account fields** tables above.
 
 ## Contributing
 
