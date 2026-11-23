@@ -198,8 +198,21 @@ func saveCachedCredential(c deviceCredential) {
 	}
 }
 
-// loadServers parses the embedded exit snapshot, cached for the process
-// lifetime (the list is static — refreshed only by an image rebuild).
+const defaultServersFile = "/etc/norton/servers.json"
+
+// serversFilePath is the refreshable exit snapshot — the `norton-servers`
+// release asset baked into the image by update-norton-servers, mirroring
+// proton/cyberghost. NORTON_SERVERS_FILE overrides it; the embedded snapshot is
+// the fallback when the file is absent.
+func serversFilePath() string {
+	if p := strings.TrimSpace(os.Getenv("NORTON_SERVERS_FILE")); p != "" {
+		return p
+	}
+	return defaultServersFile
+}
+
+// loadServers parses the exit snapshot (the refreshable file if present, else
+// the embedded fallback), cached for the process lifetime.
 func loadServers() ([]Server, error) {
 	serverCacheMu.RLock()
 	if len(serverCache) > 0 {
@@ -215,9 +228,13 @@ func loadServers() ([]Server, error) {
 		return append([]Server(nil), serverCache...), nil
 	}
 
+	data := embeddedServers
+	if fileData, err := os.ReadFile(serversFilePath()); err == nil && len(fileData) > 0 {
+		data = fileData
+	}
 	var raw []Server
-	if err := json.Unmarshal(embeddedServers, &raw); err != nil {
-		return nil, fmt.Errorf("parse embedded servers: %w", err)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse servers: %w", err)
 	}
 	var servers []Server
 	for _, s := range raw {

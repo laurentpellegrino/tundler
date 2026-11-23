@@ -1,0 +1,96 @@
+name: Update Norton servers
+
+# Refreshes the `norton-servers` GH release asset (servers.json) from the
+# SurfEasy discovery API that Norton VPN is built on, via cmd/norton-updater.
+# The tundler-norton image build downloads the asset to /etc/norton/servers.json
+# (read by the runtime provider, which needs no token of its own — only its
+# per-device OpenVPN credential).
+#
+#   - WARP routes the runner's egress because api.se-platform.com clamps the
+#     shared GitHub Actions runner IPs (same anti-abuse pattern as Proton), so
+#     every non-norton image build would otherwise occasionally fail the fetch.
+#   - Auth: a SurfEasy API Bearer JWT lives in OpenBao at vpn/norton
+#     (field `discovery_token`), fetched via vault-action with the `tundler`
+#     role bound to this repo's main branch. The namespace comes from the
+#     OPENBAO_VPN_NAMESPACE repo secret so it never appears in this public file.
+#
+# TOKEN NOTE: the SurfEasy JWT is short-lived (~10h), so this workflow is
+# dispatch-only for now — seed a fresh `discovery_token` in OpenBao, then run it
+# manually. Unattended daily runs need an auto-renew step (the SurfEasy renew
+# endpoint auth is still being reversed); until then a cron here would just fail
+# on an expired token. See cmd/norton-updater and ONBOARD_PROTOCOL.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # upload to the GH release
+  id-token: write   # for vault-action JWT auth
+
+jobs:
+  update-norton-servers:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: norton-servers
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Cloudflare WARP
+        uses: ./.github/actions/setup-cloudflare-warp
+
+      - name: Fetch Norton discovery token from OpenBao
+        uses: hashicorp/vault-action@v4
+        with:
+          url: https://bao.elaunira.com
+          method: jwt
+          path: github-actions
+          role: tundler
+          namespace: ${{ secrets.OPENBAO_VPN_NAMESPACE }}
+          jwtGithubAudience: https://github.com/laurentpellegrino
+          secrets: |
+            kv/data/vpn/norton discovery_token | NORTON_DISCOVERY_TOKEN ;
+            kv/data/vpn/norton se_api_key | NORTON_SE_API_KEY
+
+      - name: Build servers.json from discovery
+        env:
+          NORTON_DISCOVERY_TOKEN: ${{ env.NORTON_DISCOVERY_TOKEN }}
+          NORTON_SE_API_KEY: ${{ env.NORTON_SE_API_KEY }}
+        run: |
+          go run ./cmd/norton-updater > /tmp/servers.json
+          n=$(python3 -c "import json;print(len(json.load(open('/tmp/servers.json'))))")
+          echo "built $n servers"
+          if [ "$n" -lt 20 ]; then echo "too few servers, aborting" >&2; exit 1; fi
+
+      - name: Skip when checksum matches current release
+        id: diff
+        run: |
+          mkdir -p /tmp/current
+          if gh release download "$RELEASE_TAG" --pattern servers.json --dir /tmp/current 2>/dev/null; then
+            if cmp -s /tmp/servers.json /tmp/current/servers.json; then
+              echo "unchanged — nothing to upload"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload to release
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" \
+                 --repo "$GITHUB_REPOSITORY" --title "Norton servers" \
+                 --notes "SurfEasy discovery exit catalog, refreshed by update-norton-servers."
+          gh release upload "$RELEASE_TAG" /tmp/servers.json --clobber --repo "$GITHUB_REPOSITORY"

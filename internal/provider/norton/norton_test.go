@@ -258,3 +258,14 @@ func TestCheckEnvelopeSurfacesServerError(t *testing.T) {
 		}
 	}
 }
+
+func TestServersFilePathOverride(t *testing.T) {
+	t.Setenv("NORTON_SERVERS_FILE", "")
+	if got := serversFilePath(); got != defaultServersFile {
+		t.Fatalf("default serversFilePath = %q, want %q", got, defaultServersFile)
+	}
+	t.Setenv("NORTON_SERVERS_FILE", "/tmp/norton-custom.json")
+	if got := serversFilePath(); got != "/tmp/norton-custom.json" {
+		t.Fatalf("overridden serversFilePath = %q", got)
+	}
+}
