@@ -81,8 +81,11 @@ func (c deviceCredential) valid() bool {
 
 // machineIdentity is the device identity the activation service binds a seat to.
 // It must be stable for a given pod so restarts reclaim the same seat rather than
-// burn a new one; it is derived from a pod-stable seed (hostname, or
-// NORTON_MACHINE_ID) so every ordinal of a StatefulSet keeps its own seat.
+// burn a new one; it is derived from a pod-stable seed (POD_NAME, else hostname,
+// else NORTON_MACHINE_ID to pin it) so every ordinal of a StatefulSet keeps its
+// own seat. On a multi-seat plan this is the whole seat model: ordinal N owns one
+// seat and re-activates it idempotently, so keeping replicas <= the plan's seat
+// limit means seats never leak and no account-gated seat transfer is ever needed.
 type machineIdentity struct {
 	endpointID  string // canonical UUID form
 	fingerprint string // first eight bytes, uppercase hex
@@ -153,8 +156,16 @@ func formatUUID(b []byte) string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", s[0:8], s[8:12], s[12:16], s[16:20], s[20:32])
 }
 
-// defaultMachineSeed is the pod-stable seed for the machine identity.
+// defaultMachineSeed is the pod-stable seed for the machine identity. It prefers
+// POD_NAME (the StatefulSet downward-API name, e.g. tundler-tunnel-norton-0) so a
+// pod keeps the same seat across restarts and each ordinal binds its own seat;
+// os.Hostname() is the same value inside a pod and covers local runs, and the
+// static string is a last resort. Same convention as the tunnelbear/hidemyass
+// per-pod device identities.
 func defaultMachineSeed() string {
+	if p := strings.TrimSpace(os.Getenv("POD_NAME")); p != "" {
+		return p
+	}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return h
 	}

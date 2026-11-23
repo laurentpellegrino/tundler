@@ -77,6 +77,31 @@ func TestMachineIdentityStableAndWellFormed(t *testing.T) {
 	}
 }
 
+func TestDefaultMachineSeedPrefersPodName(t *testing.T) {
+	t.Setenv("POD_NAME", "tundler-tunnel-norton-3")
+	if got := defaultMachineSeed(); got != "tundler-tunnel-norton-3" {
+		t.Fatalf("defaultMachineSeed = %q, want the POD_NAME", got)
+	}
+	// Each ordinal's seat identity is distinct and stable, so a restart of the
+	// same pod reclaims its own seat rather than burning a new one.
+	t.Setenv("NORTON_MACHINE_ID", "")
+	t.Setenv("POD_NAME", "tundler-tunnel-norton-0")
+	first := machineIdentityFor(defaultMachineSeed())
+	t.Setenv("POD_NAME", "tundler-tunnel-norton-0")
+	if again := machineIdentityFor(defaultMachineSeed()); again != first {
+		t.Fatalf("same pod must map to the same seat identity: %+v vs %+v", first, again)
+	}
+	t.Setenv("POD_NAME", "tundler-tunnel-norton-1")
+	if other := machineIdentityFor(defaultMachineSeed()); other == first {
+		t.Fatal("different ordinals must map to different seat identities")
+	}
+
+	t.Setenv("POD_NAME", "")
+	if got := defaultMachineSeed(); got == "" {
+		t.Fatal("defaultMachineSeed must fall back to a non-empty seed without POD_NAME")
+	}
+}
+
 func TestExtractVPNPassage(t *testing.T) {
 	body := []byte(`{"data":[[
 		{"Job":"APPLYPRODUCTINSTANCE","Data":{"productInstance":"x"}},
