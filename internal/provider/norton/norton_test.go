@@ -209,3 +209,27 @@ func TestActiveLocationRoundTripAndDisconnect(t *testing.T) {
 		t.Fatal("Disconnect left the owned process running")
 	}
 }
+
+func TestCheckEnvelopeSurfacesServerError(t *testing.T) {
+	errBody := []byte(`{"error":{"code":-500,"type":"","message":"","additionalinfo":{"header":"Server error","content":"We're working to resolve an issue that prevents us from completing your request. <br>Try again later."}},"success":false}`)
+	err := checkEnvelope(errBody)
+	if err == nil {
+		t.Fatal("expected an error for the -500 envelope, got nil")
+	}
+	if !strings.Contains(err.Error(), "-500") || !strings.Contains(err.Error(), "Server error") || !strings.Contains(err.Error(), "Try again later.") {
+		t.Fatalf("error should carry the code and server message: %v", err)
+	}
+	if strings.Contains(err.Error(), "<br>") {
+		t.Fatalf("error should strip the <br> markup: %v", err)
+	}
+
+	for _, ok := range [][]byte{
+		[]byte(`{"success":true,"data":{"KeyLicense":{"Psn":"TFTW84QH8BW2"}}}`),
+		[]byte(`{"data":{"foo":"bar"}}`),
+		[]byte(`<!DOCTYPE html>`),
+	} {
+		if err := checkEnvelope(ok); err != nil {
+			t.Fatalf("unexpected error for %q: %v", ok, err)
+		}
+	}
+}

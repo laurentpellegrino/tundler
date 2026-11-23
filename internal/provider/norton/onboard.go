@@ -305,10 +305,7 @@ func (c *onboardClient) registerMachine(ctx context.Context, mid machineIdentity
 		"B2Bs":                      string(b2bs),
 		"ClientData":                newUUID(),
 	}
-	var out struct {
-		Error any `json:"error"`
-	}
-	if err := c.postJSON(ctx, "/ccapi/mine/save", payload, &out); err != nil {
+	if err := c.postJSON(ctx, "/ccapi/mine/save", payload, nil); err != nil {
 		return fmt.Errorf("norton onboard: register machine: %w", err)
 	}
 	return nil
@@ -332,10 +329,7 @@ func (c *onboardClient) verifyKey(ctx context.Context, key string) (string, erro
 }
 
 func (c *onboardClient) registerNewKey(ctx context.Context, key string) error {
-	var out struct {
-		Success bool `json:"success"`
-	}
-	if err := c.postJSON(ctx, "/ccapi/license/registernewkey", map[string]string{"Key": key}, &out); err != nil {
+	if err := c.postJSON(ctx, "/ccapi/license/registernewkey", map[string]string{"Key": key}, nil); err != nil {
 		return fmt.Errorf("norton onboard: register key: %w", err)
 	}
 	return nil
@@ -429,12 +423,66 @@ func (c *onboardClient) postJSON(ctx context.Context, path string, payload, out 
 	if status != http.StatusOK {
 		return fmt.Errorf("status %d", status)
 	}
+	if err := checkEnvelope(body); err != nil {
+		return err
+	}
 	if out != nil {
 		if err := json.Unmarshal(body, out); err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
 	}
 	return nil
+}
+
+// brStripper turns the <br> variants the cloudconnect messages carry into
+// spaces so the surfaced error reads as one line.
+var brStripper = strings.NewReplacer("<br>", " ", "<br/>", " ", "<br />", " ")
+
+// checkEnvelope surfaces the cloudconnect error envelope. Every /ccapi call
+// answers HTTP 200 even when it fails, carrying
+// {"success":false,"error":{"code":...,"additionalinfo":{...}}} (for example
+// code -500 "Server error ... Try again later" when the product context is
+// missing or the key/account cannot be served), so the status code alone never
+// reveals a rejection. Returning the server's own code and message here makes a
+// block report at the step that actually failed instead of surfacing later as a
+// misleading empty result.
+func checkEnvelope(body []byte) error {
+	var env struct {
+		Success *bool `json:"success"`
+		Error   *struct {
+			Code           int `json:"code"`
+			AdditionalInfo struct {
+				Header  string `json:"header"`
+				Content string `json:"content"`
+			} `json:"additionalinfo"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		// Not the common envelope shape; let the caller decode its own body.
+		return nil
+	}
+	if env.Error == nil && (env.Success == nil || *env.Success) {
+		return nil
+	}
+	code := 0
+	msg := ""
+	if env.Error != nil {
+		code = env.Error.Code
+		header := strings.TrimSpace(env.Error.AdditionalInfo.Header)
+		content := strings.TrimSpace(brStripper.Replace(env.Error.AdditionalInfo.Content))
+		switch {
+		case header != "" && content != "":
+			msg = header + ": " + content
+		case header != "":
+			msg = header
+		default:
+			msg = content
+		}
+	}
+	if msg == "" {
+		msg = "request rejected"
+	}
+	return fmt.Errorf("server error %d: %s", code, msg)
 }
 
 // secChUA is the WebView client-hint brand list; the backend's bot checks reject
