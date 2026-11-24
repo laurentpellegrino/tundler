@@ -265,6 +265,13 @@ func (c *onboardClient) openSession(ctx context.Context) error {
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("X-Requested-With", appPackage)
+	// The authoritative product context (pdt/tenant) the server writes into the
+	// CCT.Session cookie is read from these headers on the home GET, not from the
+	// pre-seeded CCT cookie (which the server ignores for these fields). Without
+	// them every /ccapi call fails -500 for lack of product context.
+	req.Header.Set("x-nlok-tenant-id", tenantGUID)
+	req.Header.Set("x-symc-user-agent", "NSV/"+fullVersion+"/Android/12")
+	req.Header.Set("x-nlok-trace-id", c.traceID)
 	req.Header.Set("Sec-Ch-Ua", secChUA)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 	req.Header.Set("Sec-Ch-Ua-Platform", `"Android"`)
@@ -360,6 +367,13 @@ func (c *onboardClient) activate(ctx context.Context, psn string) (deviceCredent
 	}
 	if status != http.StatusOK {
 		return deviceCredential{}, fmt.Errorf("norton onboard: activate: status %d", status)
+	}
+	// activate answers HTTP 200 even on failure, carrying the same error envelope
+	// the other calls use (for example code -5044 when the seat cannot be issued a
+	// credential, or a registration error). Surface it here so the real reason
+	// shows instead of a misleading empty-credential result.
+	if err := checkEnvelope(body); err != nil {
+		return deviceCredential{}, fmt.Errorf("norton onboard: activate: %w", err)
 	}
 	cred, err := extractVPNPassage(body)
 	if err != nil {
