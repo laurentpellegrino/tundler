@@ -9,19 +9,20 @@ name: Update Norton servers
 #   - WARP routes the runner's egress because api.se-platform.com clamps the
 #     shared GitHub Actions runner IPs (same anti-abuse pattern as Proton), so
 #     every non-norton image build would otherwise occasionally fail the fetch.
-#   - Auth: a SurfEasy API Bearer JWT lives in OpenBao at vpn/norton
-#     (field `discovery_token`), fetched via vault-action with the `tundler`
-#     role bound to this repo's main branch. The namespace comes from the
+#   - Auth: the short-lived (~12h) discovery JWT is minted at runtime by
+#     cmd/norton-updater via the cloudconnect silent refresh, authenticated only
+#     by the device identity + license ids seeded in OpenBao at vpn/norton
+#     (fingerprint, endpoint_id, license_psn, license_consumer_id,
+#     license_product_sku, certificate_serial) plus se_api_key — no sign-in, no
+#     session, no seat use. Fetched via vault-action with the `tundler` role bound
+#     to this repo's main branch; the namespace comes from the
 #     OPENBAO_VPN_NAMESPACE repo secret so it never appears in this public file.
-#
-# TOKEN NOTE: the SurfEasy JWT is short-lived (~10h), so this workflow is
-# dispatch-only for now — seed a fresh `discovery_token` in OpenBao, then run it
-# manually. Unattended daily runs need an auto-renew step (the SurfEasy renew
-# endpoint auth is still being reversed); until then a cron here would just fail
-# on an expired token. See cmd/norton-updater and ONBOARD_PROTOCOL.md.
+#     See refresh.go and ONBOARD_PROTOCOL.md.
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '15 6 * * *'   # daily, before the 07:00 UTC image rebuild
 
 permissions:
   contents: write   # upload to the GH release
@@ -44,7 +45,7 @@ jobs:
       - name: Setup Cloudflare WARP
         uses: ./.github/actions/setup-cloudflare-warp
 
-      - name: Fetch Norton discovery token from OpenBao
+      - name: Fetch Norton provisioning seed from OpenBao
         uses: hashicorp/vault-action@v4
         with:
           url: https://bao.elaunira.com
@@ -54,13 +55,23 @@ jobs:
           namespace: ${{ secrets.OPENBAO_VPN_NAMESPACE }}
           jwtGithubAudience: https://github.com/laurentpellegrino
           secrets: |
-            kv/data/vpn/norton discovery_token | NORTON_DISCOVERY_TOKEN ;
-            kv/data/vpn/norton se_api_key | NORTON_SE_API_KEY
+            kv/data/vpn/norton se_api_key | NORTON_SE_API_KEY ;
+            kv/data/vpn/norton fingerprint | NORTON_FINGERPRINT ;
+            kv/data/vpn/norton endpoint_id | NORTON_ENDPOINT_ID ;
+            kv/data/vpn/norton license_psn | NORTON_LICENSE_PSN ;
+            kv/data/vpn/norton license_consumer_id | NORTON_LICENSE_CONSUMER_ID ;
+            kv/data/vpn/norton license_product_sku | NORTON_LICENSE_PRODUCT_SKU ;
+            kv/data/vpn/norton certificate_serial | NORTON_CERTIFICATE_SERIAL
 
       - name: Build servers.json from discovery
         env:
-          NORTON_DISCOVERY_TOKEN: ${{ env.NORTON_DISCOVERY_TOKEN }}
           NORTON_SE_API_KEY: ${{ env.NORTON_SE_API_KEY }}
+          NORTON_FINGERPRINT: ${{ env.NORTON_FINGERPRINT }}
+          NORTON_ENDPOINT_ID: ${{ env.NORTON_ENDPOINT_ID }}
+          NORTON_LICENSE_PSN: ${{ env.NORTON_LICENSE_PSN }}
+          NORTON_LICENSE_CONSUMER_ID: ${{ env.NORTON_LICENSE_CONSUMER_ID }}
+          NORTON_LICENSE_PRODUCT_SKU: ${{ env.NORTON_LICENSE_PRODUCT_SKU }}
+          NORTON_CERTIFICATE_SERIAL: ${{ env.NORTON_CERTIFICATE_SERIAL }}
         run: |
           go run ./cmd/norton-updater > /tmp/servers.json
           n=$(python3 -c "import json;print(len(json.load(open('/tmp/servers.json'))))")

@@ -16,16 +16,20 @@
 //
 // Reads:
 //
-//	NORTON_DISCOVERY_TOKEN       Bearer JWT for the SurfEasy API (required)
+//	NORTON_DISCOVERY_TOKEN       Bearer JWT for the SurfEasy API (optional; if
+//	                             empty, a fresh one is minted via the cloudconnect
+//	                             silent refresh — see refresh.go)
 //	NORTON_SE_API_KEY            SE-Client-API-Key (product id); defaults to the
 //	                             baked nlk401 product key
 //	NORTON_DISCOVERY_COUNTRIES   optional CSV of ISO country codes to limit to
 //	                             (default: every country the catalog lists)
 //
-// NOTE on the token: the JWT is short-lived (~10h). A durable refresh via the
-// SurfEasy renew endpoint is not yet wired (its exact auth is still to be
-// reversed), so for now the token is seeded per run. The runtime tunnel needs
-// NO token — it only reads the baked servers.json plus its device credential.
+// Token lifecycle: the discovery JWT is short-lived (~12h). The backend's renew
+// endpoint is a dead end, but the cloudconnect silent refresh mints a fresh JWT
+// from the static device-identity + license ids with no sign-in, no session and
+// no seat use (refresh.go), so a scheduled job runs unattended. The runtime
+// tunnel needs NO token — it only reads the baked servers.json plus its device
+// credential.
 package main
 
 import (
@@ -152,10 +156,6 @@ func (c *client) discover(ctx context.Context, locationKey string) ([]Server, er
 
 func main() {
 	log.SetFlags(0)
-	token := os.Getenv("NORTON_DISCOVERY_TOKEN")
-	if strings.TrimSpace(token) == "" {
-		log.Fatal("NORTON_DISCOVERY_TOKEN is required (a SurfEasy API Bearer JWT)")
-	}
 	apiKey := os.Getenv("NORTON_SE_API_KEY")
 	if strings.TrimSpace(apiKey) == "" {
 		apiKey = defaultProductID
@@ -169,7 +169,25 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	c := &client{http: &http.Client{Timeout: 30 * time.Second}, token: token, apiKey: apiKey}
+	// Force HTTP/1.1. The cloudconnect silent-refresh endpoint rejects the request
+	// body with a JsonEncodingError when the call is made over HTTP/2 (which Go
+	// negotiates by default); the app and a plain HTTP/1.1 client are accepted.
+	hc := &http.Client{Timeout: 30 * time.Second}
+
+	// The discovery API needs a short-lived Bearer JWT. Prefer a pre-seeded one
+	// (NORTON_DISCOVERY_TOKEN); otherwise mint a fresh one headlessly via the
+	// cloudconnect silent refresh (refresh.go) so a scheduled job can run
+	// unattended.
+	token := strings.TrimSpace(os.Getenv("NORTON_DISCOVERY_TOKEN"))
+	if token == "" {
+		t, err := refreshDiscoveryToken(ctx, hc)
+		if err != nil {
+			log.Fatalf("mint discovery token: %v", err)
+		}
+		token = t
+		log.Printf("norton-updater: minted a fresh discovery token via silent refresh (len %d)", len(token))
+	}
+	c := &client{http: hc, token: token, apiKey: apiKey}
 
 	keys, err := c.geos(ctx)
 	if err != nil {
